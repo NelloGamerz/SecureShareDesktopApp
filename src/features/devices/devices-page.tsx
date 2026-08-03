@@ -5,7 +5,6 @@ import {
   Laptop,
   MoreHorizontal,
   Pencil,
-  QrCode,
   Plus,
   Server,
   Smartphone,
@@ -82,22 +81,22 @@ export function DevicesPage() {
       <PageHeader
         title="Devices"
         description="Manage and monitor every device connected to your workspace."
-        actions={
-          <>
-            <Button variant="outline" size="sm" asChild>
-              <Link to="/devices/pair">
-                <QrCode className="h-4 w-4" />
-                Pair via QR
-              </Link>
-            </Button>
-            <Button size="sm" asChild>
-              <Link to="/devices/register">
-                <Plus className="h-4 w-4" />
-                Register device
-              </Link>
-            </Button>
-          </>
-        }
+        // actions={
+        //   <>
+        //     <Button variant="outline" size="sm" asChild>
+        //       <Link to="/devices/pair">
+        //         <QrCode className="h-4 w-4" />
+        //         Pair via QR
+        //       </Link>
+        //     </Button>
+        //     <Button size="sm" asChild>
+        //       <Link to="/devices/register">
+        //         <Plus className="h-4 w-4" />
+        //         Register device
+        //       </Link>
+        //     </Button>
+        //   </>
+        // }
       />
 
       {/* Health summary */}

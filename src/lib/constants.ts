@@ -5,7 +5,7 @@ import {
   Building2,
   Users,
   CreditCard,
-  Activity,
+  // Activity,
   Settings,
   type LucideIcon,
 } from 'lucide-react';
@@ -58,12 +58,12 @@ export const navItems: NavItem[] = [
     description: 'Plans, invoices and payment methods',
     hideForRestrictedMembers: true,
   },
-  {
-    title: 'Activity',
-    to: '/activity',
-    icon: Activity,
-    description: 'Audit log and activity feed',
-  },
+  // {
+  //   title: 'Activity',
+  //   to: '/activity',
+  //   icon: Activity,
+  //   description: 'Audit log and activity feed',
+  // },
   {
     title: 'Settings',
     to: '/settings',

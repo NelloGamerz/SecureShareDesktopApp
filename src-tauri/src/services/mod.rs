@@ -5,6 +5,7 @@ pub mod keyring_service;
 pub mod cloudflared;
 pub mod generate_device_keypair;
 pub mod local_transfer_file_service;
+pub mod updates_service;
 
 pub use auth_service::AuthService;
 pub use event_service::EventService;

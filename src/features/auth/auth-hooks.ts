@@ -46,8 +46,9 @@ export function useCanAccessMembers() {
   const { data: profile, isLoading } = useCurrentUserProfile();
 
   const isIndividualOwner =
-    profile?.organizationType === "INDIVIDUAL" &&
-    profile.memberRole === "OWNER";
+    profile?.organizationType === "INDIVIDUAL" 
+    // &&
+    // profile.memberRole === "OWNER";
 
   return {
     canAccessMembers: !isIndividualOwner,

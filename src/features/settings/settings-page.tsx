@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { Bell, Lock, Moon, Palette, User } from 'lucide-react';
+import { Moon, Palette, User } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -27,14 +27,14 @@ export function SettingsPage() {
             <User className="h-4 w-4" />
             Profile
           </TabsTrigger>
-          <TabsTrigger value="security" className="gap-2">
+          {/* <TabsTrigger value="security" className="gap-2">
             <Lock className="h-4 w-4" />
             Security
           </TabsTrigger>
           <TabsTrigger value="notifications" className="gap-2">
             <Bell className="h-4 w-4" />
             Notifications
-          </TabsTrigger>
+          </TabsTrigger> */}
           <TabsTrigger value="appearance" className="gap-2">
             <Palette className="h-4 w-4" />
             Appearance

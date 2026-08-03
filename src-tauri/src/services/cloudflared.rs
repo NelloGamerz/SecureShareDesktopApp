@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use tracing::{error, info, warn};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use crate::services::keyring_service::KeyringService;
 // use crate::services::SecureStorage;
 use crate::state::cloudflared_state::Cloudflared;
@@ -25,7 +28,6 @@ impl CloudflaredService {
 
         let token = KeyringService::get_tunnel_token(app)?;
         info!("Tunnel token loaded");
-        info!("Hostname: {}", hostname);
 
         // let path = Self::get_binary_path(app)?;
         let path = match Self::get_binary_path(app) {
@@ -50,15 +52,32 @@ impl CloudflaredService {
 
         info!("Launching cloudflared process...");
 
-        let mut child = Command::new(&path)
+        // let mut child = Command::new(&path)
+        //     .args(["tunnel", "--no-autoupdate", "run", "--token", token.trim()])
+        //     .stdout(Stdio::piped())
+        //     .stderr(Stdio::piped())
+        //     .spawn()
+        //     .map_err(|e| {
+        //         error!("Failed to spawn cloudflared: {}", e);
+        //         e.to_string()
+        //     })?;
+
+        let mut command = Command::new(&path);
+
+        command
             .args(["tunnel", "--no-autoupdate", "run", "--token", token.trim()])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                error!("Failed to spawn cloudflared: {}", e);
-                e.to_string()
-            })?;
+            .stderr(Stdio::piped());
+
+        #[cfg(target_os = "windows")]
+        {
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let mut child = command.spawn().map_err(|e| {
+            error!("Failed to spawn cloudflared: {}", e);
+            e.to_string()
+        })?;
 
         info!("cloudflared process started");
         info!("PID = {}", child.id());
@@ -154,45 +173,6 @@ impl CloudflaredService {
             Ok(false)
         }
     }
-
-    // fn get_binary_path(app: &AppHandle) -> Result<PathBuf, String> {
-    //     let os = env::consts::OS;
-    //     let arch = env::consts::ARCH;
-
-    //     info!("OS = {}", os);
-    //     info!("ARCH = {}", arch);
-
-    //     let relative_path = match (os, arch) {
-    //         ("windows", "x86_64") => "cloudflared/windows-x64/cloudflared.exe",
-
-    //         ("macos", "x86_64") => "cloudflared/macos-x64/cloudflared",
-
-    //         ("macos", "aarch64") => "cloudflared/macos-arm64/cloudflared",
-
-    //         ("linux", "x86_64") => "cloudflared/linux-x64/cloudflared",
-
-    //         ("linux", "aarch64") => "cloudflared/linux-arm64/cloudflared",
-
-    //         _ => return Err(format!("Unsupported platform {} {}", os, arch)),
-    //     };
-
-    //     let path = if cfg!(debug_assertions) {
-    //         std::env::current_dir()
-    //             .map_err(|e| e.to_string())?
-    //             .join("resources")
-    //             .join(relative_path)
-    //     } else {
-    //         app.path()
-    //             .resolve(relative_path, tauri::path::BaseDirectory::Resource)
-    //             .map_err(|e| e.to_string())?
-    //     };
-
-    //     if !path.exists() {
-    //         return Err(format!("cloudflared not found at {:?}", path));
-    //     }
-
-    //     Ok(path)
-    // }
 
     fn get_binary_path(app: &AppHandle) -> Result<PathBuf, String> {
         let os = env::consts::OS;

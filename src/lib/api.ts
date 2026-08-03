@@ -1,6 +1,7 @@
 import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
 import { env } from "@/lib/env";
 import { info, error } from "@tauri-apps/plugin-log";
+import { getDeviceIdentifier } from "@/services/getDeviceInfo";
 
 const api = axios.create({
   baseURL: env.apiBaseUrl,
@@ -47,6 +48,10 @@ api.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
       } else {
         await info("No Clerk token received");
       }
+
+      const deviceIdentifier = await getDeviceIdentifier();
+
+      config.headers["X-Device-Id"] = deviceIdentifier;
     } catch (err) {
       await error(`Failed to get Clerk token: ${String(err)}`);
     }

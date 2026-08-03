@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{models::transfer::TransferStatus, transfer::state::DownloadState};
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct TransferProgress {
     pub transfer_id: String,
     pub uploaded_bytes: u64,

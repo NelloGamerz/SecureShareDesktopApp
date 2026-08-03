@@ -1,6 +1,7 @@
 use crate::services::local_transfer_file_service::LocalTransferFileService;
 use crate::transfer::crypto;
 use crate::transfer::http_client::HttpClient;
+use crate::websocket::WebSocketManager;
 use crate::{
     models::transfer::{TransferMetadata, TransferStatus, TransferStatusResponse},
     transfer::{
@@ -18,26 +19,37 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tauri::AppHandle;
+
+#[derive(Debug)]
+pub enum TransferEvent {
+    Completed(String),
+    Failed(String, String),
+}
+
 #[derive(Clone)]
 pub struct UploadManager {
     transfers: Arc<Mutex<HashMap<String, Arc<UploadState>>>>,
     app: AppHandle,
     upload_root: PathBuf,
     local_files: Arc<LocalTransferFileService>,
+    transfer_events: tokio::sync::mpsc::UnboundedSender<TransferEvent>,
 }
 impl UploadManager {
     pub fn new(
         app: AppHandle,
         upload_root: PathBuf,
         local_files: Arc<LocalTransferFileService>,
+        transfer_events: tokio::sync::mpsc::UnboundedSender<TransferEvent>,
     ) -> Self {
         Self {
             transfers: Arc::new(Mutex::new(HashMap::new())),
             app,
             upload_root,
             local_files,
+            transfer_events,
         }
     }
+
     pub async fn start(&self, metadata: TransferMetadata) -> Result<TransferStatusResponse> {
         if metadata.transfer_id.trim().is_empty() || metadata.endpoint.trim().is_empty()
         // || metadata.file_paths.is_empty()
@@ -168,11 +180,19 @@ impl UploadManager {
                         "transfer-completed",
                         progress::make(&state),
                     );
+
+                    let _ = manager
+                        .transfer_events
+                        .send(TransferEvent::Completed(state.transfer_id.clone()));
                 }
                 Err(e) => {
                     *state.status.lock().expect("status lock poisoned") = TransferStatus::Failed;
                     tracing::error!(transfer_id=%state.transfer_id,error=%e,"transfer failed");
                     events::emit_progress(&manager.app, "transfer-failed", progress::make(&state));
+                    let _ = manager.transfer_events.send(TransferEvent::Failed(
+                        state.transfer_id.clone(),
+                        e.to_string(),
+                    ));
                 }
             }
         });

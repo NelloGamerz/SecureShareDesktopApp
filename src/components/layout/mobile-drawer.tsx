@@ -1,14 +1,29 @@
-import { motion } from 'framer-motion';
-import { NavLink } from 'react-router-dom';
-import { Sheet, SheetContent } from '@/components/ui/sheet';
-import { navItems } from '@/lib/constants';
-import { useUIStore } from '@/store/ui-store';
-import { useIsActive, SidebarBrand } from './sidebar';
-import { cn } from '@/lib/utils';
+import { motion } from "framer-motion";
+import { NavLink } from "react-router-dom";
+import { Sheet, SheetContent } from "@/components/ui/sheet";
+import { navItems } from "@/lib/constants";
+import { useUIStore } from "@/store/ui-store";
+import { useIsActive, SidebarBrand } from "./sidebar";
+import { cn } from "@/lib/utils";
+import {
+  useCanAccessBilling,
+  useCanAccessMembers,
+} from "@/features/auth/auth-hooks";
 
 export function MobileDrawer() {
   const open = useUIStore((s) => s.mobileSidebarOpen);
   const setOpen = useUIStore((s) => s.setMobileSidebarOpen);
+
+  const { canAccessBilling } = useCanAccessBilling();
+  const { canAccessMembers } = useCanAccessMembers();
+
+  const visibleNavItems = navItems.filter((item) => {
+    if (item.to === "/members" && !canAccessMembers) {
+      return false;
+    }
+
+    return !item.hideForRestrictedMembers || canAccessBilling;
+  });
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
@@ -20,7 +35,7 @@ export function MobileDrawer() {
         >
           <SidebarBrand />
           <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
-            {navItems.map((item) => (
+            {visibleNavItems.map((item) => (
               <MobileLink
                 key={item.to}
                 to={item.to}
@@ -46,7 +61,7 @@ function MobileLink({
 }: {
   to: string;
   title: string;
-  icon: typeof navItems[number]['icon'];
+  icon: (typeof navItems)[number]["icon"];
   badge?: string;
   onNavigate: () => void;
 }) {
@@ -58,10 +73,10 @@ function MobileLink({
       to={to}
       onClick={onNavigate}
       className={cn(
-        'flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-colors',
+        "flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-colors",
         active
-          ? 'bg-sidebar-accent text-sidebar-accent-foreground'
-          : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground'
+          ? "bg-sidebar-accent text-sidebar-accent-foreground"
+          : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
       )}
     >
       <Icon className="h-[1.15rem] w-[1.15rem] shrink-0" />

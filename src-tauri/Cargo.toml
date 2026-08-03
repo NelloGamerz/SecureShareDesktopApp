@@ -53,5 +53,6 @@ hkdf = "0.12"
 hex = "0.4"
 tauri-plugin-os = "2"
 tauri-plugin-device = "1"
-windows = "0.62.2"
 sysinfo = "0.37"
+windows = { version = "0.62", features = ["Win32_System_Power"] }
+tauri-plugin-updater = "2"

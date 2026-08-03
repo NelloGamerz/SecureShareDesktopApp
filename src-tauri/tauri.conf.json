@@ -25,13 +25,23 @@
     }
   },
 
+  "plugins": {
+    "updater": {
+      "active": true,
+
+      "endpoints": ["https://your-domain.com/latest.json"],
+
+      "dialog": false,
+
+      "pubkey": "YOUR_PUBLIC_KEY_HERE"
+    }
+  },
+
   "bundle": {
     "active": true,
     "targets": "all",
 
-    "resources": [
-      "resources/cloudflared/windows-x64/cloudflared.exe"
-    ],
+    "resources": ["resources/cloudflared/windows-x64/cloudflared.exe"],
 
     "icon": [
       "icons/32x32.png",

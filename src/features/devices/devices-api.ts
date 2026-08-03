@@ -1,11 +1,13 @@
-import { api } from '@/lib/api';
-import { DeviceType } from '../dashboard/dashboard-api';
+import { api } from "@/lib/api";
+import { DeviceType } from "../dashboard/dashboard-api";
+import { getDeviceInfo } from "@/services/getDeviceInfo";
+import { createDeviceIdentity } from "@/api/tauri";
 
 // --- Types ---
 
-export type DeviceStatus = 'online' | 'idle' | 'offline';
-export type ConnectionType = 'lan' | 'remote';
-export type PairingStatus = 'pending' | 'connected' | 'expired' | 'cancelled';
+export type DeviceStatus = "online" | "idle" | "offline";
+export type ConnectionType = "lan" | "remote";
+export type PairingStatus = "pending" | "connected" | "expired" | "cancelled";
 
 export interface Device {
   id: string;
@@ -37,7 +39,7 @@ export interface DeviceTransfer {
   id: string;
   fileName: string;
   sizeBytes: number;
-  direction: 'in' | 'out';
+  direction: "in" | "out";
   status: string;
   createdAt: string;
 }
@@ -69,12 +71,12 @@ export interface PairingSession {
 // --- API functions ---
 
 export async function fetchDevices(): Promise<Device[]> {
-  const { data } = await api.get<Device[]>('/devices');
+  const { data } = await api.get<Device[]>("/devices");
   return data;
 }
 
 export async function fetchDeviceHealth(): Promise<DeviceHealthSummary> {
-  const { data } = await api.get<DeviceHealthSummary>('/devices/health');
+  const { data } = await api.get<DeviceHealthSummary>("/devices/health");
   return data;
 }
 
@@ -92,8 +94,10 @@ export interface RegisterDeviceInput {
   connectionType?: ConnectionType;
 }
 
-export async function registerDevice(input: RegisterDeviceInput): Promise<Device> {
-  const { data } = await api.post<Device>('/devices/register', input);
+export async function registerDevice(
+  input: RegisterDeviceInput,
+): Promise<Device> {
+  const { data } = await api.post<Device>("/devices/register", input);
   return data;
 }
 
@@ -111,12 +115,16 @@ export interface CreatePairingInput {
   deviceType: DeviceType;
 }
 
-export async function createPairing(input: CreatePairingInput): Promise<PairingSession> {
-  const { data } = await api.post<PairingSession>('/devices/pair', input);
+export async function createPairing(
+  input: CreatePairingInput,
+): Promise<PairingSession> {
+  const { data } = await api.post<PairingSession>("/devices/pair", input);
   return data;
 }
 
-export async function checkPairingStatus(code: string): Promise<PairingSession> {
+export async function checkPairingStatus(
+  code: string,
+): Promise<PairingSession> {
   const { data } = await api.get<PairingSession>(`/devices/pair/${code}`);
   return data;
 }
@@ -131,13 +139,30 @@ export interface ConnectPairingInput {
 
 export async function connectPairing(
   code: string,
-  input: ConnectPairingInput
+  input: ConnectPairingInput,
 ): Promise<PairingSession> {
-  const { data } = await api.post<PairingSession>(`/devices/pair/${code}/connect`, input);
+  const { data } = await api.post<PairingSession>(
+    `/devices/pair/${code}/connect`,
+    input,
+  );
   return data;
 }
 
 export async function cancelPairing(code: string): Promise<PairingSession> {
-  const { data } = await api.post<PairingSession>(`/devices/pair/${code}/cancel`);
+  const { data } = await api.post<PairingSession>(
+    `/devices/pair/${code}/cancel`,
+  );
+  return data;
+}
+
+export async function registerCurrentDevice() {
+  const deviceInfo = await getDeviceInfo();
+  const publicKey = await createDeviceIdentity(); 
+
+  const { data } = await api.post("/devices/register", {
+    ...deviceInfo,
+    publicKey,
+  });
+
   return data;
 }

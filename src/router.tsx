@@ -35,11 +35,11 @@ const DevicesPage = lazy(() =>
   })),
 );
 
-const DeviceDetailPage = lazy(() =>
-  import("@/features/devices/device-detail-page").then((m) => ({
-    default: m.DeviceDetailPage,
-  })),
-);
+// const DeviceDetailPage = lazy(() =>
+//   import("@/features/devices/device-detail-page").then((m) => ({
+//     default: m.DeviceDetailPage,
+//   })),
+// );
 
 // const RegisterDevicePage = lazy(() =>
 //   import("@/features/devices/register-device-page").then((m) => ({
@@ -77,11 +77,11 @@ const BillingPage = lazy(() =>
   })),
 );
 
-const ActivityPage = lazy(() =>
-  import("@/features/activity/activity-page").then((m) => ({
-    default: m.ActivityPage,
-  })),
-);
+// const ActivityPage = lazy(() =>
+//   import("@/features/activity/activity-page").then((m) => ({
+//     default: m.ActivityPage,
+//   })),
+// );
 
 const SettingsPage = lazy(() =>
   import("@/features/settings/settings-page").then((m) => ({
@@ -196,10 +196,10 @@ export const router: RouteObject[] = [
         path: "/devices/pair",
         element: <QrPairingPage />,
       },
-      {
-        path: "/devices/:id",
-        element: <DeviceDetailPage />,
-      },
+      // {
+      //   path: "/devices/:id",
+      //   element: <DeviceDetailPage />,
+      // },
       {
         path: "/organization",
         element: <OrganizationPage />,
@@ -216,10 +216,10 @@ export const router: RouteObject[] = [
         path: "/billing",
         element: <BillingRouteGuard />,
       },
-      {
-        path: "/activity",
-        element: <ActivityPage />,
-      },
+      // {
+      //   path: "/activity",
+      //   element: <ActivityPage />,
+      // },
       {
         path: "/settings",
         element: <SettingsPage />,

@@ -114,31 +114,6 @@ impl WebSocketManager {
             let device_info_for_loop = device_info.clone();
             let mut attempt = 0_u32;
 
-            // loop {
-            //     println!("WEBSOCKET LOOP START - ATTEMPT {}", attempt);
-
-            //     if shutdown.is_cancelled() {
-            //         println!("WEBSOCKET SHUTDOWN REQUESTED");
-
-            //         break;
-            //     }
-
-            //     {
-            //         let mut status_guard = state.write().await;
-
-            //         *status_guard = ConnectionStatus::Connecting;
-            //     }
-
-            //     println!("TRYING WEBSOCKET CONNECTION: {}", config.url);
-
-            //     match WebSocketClient::new(
-            //         config.url.clone(),
-            //         token_for_loop.clone(),
-            //         device_info_for_loop.clone(),
-            //     )
-            //     .connect()
-            //     .await
-
             loop {
                 println!("WEBSOCKET LOOP START - ATTEMPT {}", attempt);
 
@@ -201,97 +176,6 @@ impl WebSocketManager {
                 .connect()
                 .await
                 {
-                    // Ok(socket) => {
-                    //     println!("WEBSOCKET CONNECT SUCCESS");
-
-                    //     let (mut write, read) = socket.split();
-
-                    //     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-
-                    //     println!("WEBSOCKET CHANNEL CREATED");
-
-                    //     let sender_impl = WebSocketSender::new(tx);
-
-                    //     {
-                    //         let mut sender_guard = sender.lock().await;
-
-                    //         *sender_guard = Some(sender_impl.clone());
-                    //     }
-
-                    //     println!("WEBSOCKET SENDER STORED");
-
-                    //     {
-                    //         let mut status_guard = state.write().await;
-
-                    //         *status_guard = ConnectionStatus::Connected;
-                    //     }
-
-                    //     println!("WEBSOCKET STATUS CONNECTED");
-
-                    //     let dispatcher_loop = dispatcher.clone();
-
-                    //     let heartbeat_shutdown = shutdown.clone();
-
-                    //     let heartbeat_sender = Arc::new(sender_impl.clone());
-
-                    //     let heartbeat_interval = config.heartbeat_interval_secs;
-
-                    //     println!("STARTING HEARTBEAT TASK");
-
-                    //     let heartbeat_task = tokio::spawn(async move {
-                    //         println!("HEARTBEAT STARTED");
-
-                    //         if let Err(err) = heartbeat_loop(
-                    //             heartbeat_sender,
-                    //             heartbeat_shutdown,
-                    //             heartbeat_interval,
-                    //         )
-                    //         .await
-                    //         {
-                    //             println!("HEARTBEAT ERROR: {:?}", err);
-                    //         }
-                    //     });
-
-                    //     println!("STARTING RECEIVER TASK");
-
-                    //     let receive_dispatch = tokio::spawn(async move {
-                    //         println!("RECEIVER STARTED");
-
-                    //         if let Err(err) =
-                    //             crate::websocket::receiver::receive_loop(read, dispatcher_loop)
-                    //                 .await
-                    //         {
-                    //             println!("RECEIVER ERROR: {:?}", err);
-                    //         }
-                    //     });
-
-                    //     println!("WAITING FOR OUTGOING MESSAGES");
-
-                    //     while let Some(message) = rx.recv().await {
-                    //         println!("SENDING MESSAGE: {:?}", message);
-
-                    //         if let Err(err) = write.send(message).await {
-                    //             println!("SEND ERROR: {:?}", err);
-
-                    //             break;
-                    //         }
-                    //     }
-
-                    //     println!("MESSAGE LOOP ENDED");
-
-                    //     let _ = receive_dispatch;
-                    //     let _ = heartbeat_task;
-
-                    //     {
-                    //         let mut status_guard = state.write().await;
-
-                    //         *status_guard = ConnectionStatus::Disconnected;
-                    //     }
-
-                    //     println!("WEBSOCKET DISCONNECTED");
-
-                    //     break;
-                    // }
                     Ok(socket) => {
                         println!("WEBSOCKET CONNECT SUCCESS");
 
@@ -358,21 +242,6 @@ impl WebSocketManager {
 
                         println!("STARTING RECEIVER TASK");
 
-                        // let receive_dispatch = tokio::spawn(async move {
-                        //     println!("RECEIVER STARTED");
-
-                        //     if let Err(err) =
-                        //         crate::websocket::receiver::receive_loop(read, dispatcher_loop)
-                        //             .await
-                        //     {
-                        //         println!("RECEIVER ERROR: {:?}", err);
-                        //     }
-                        // });
-
-                        // let receive_dispatch = tokio::spawn(async move {
-                        //     crate::websocket::receiver::receive_loop(read, dispatcher_loop).await
-                        // });
-
                         let receive_dispatch = tokio::spawn(async move {
                             println!("RECEIVER STARTED");
 
@@ -381,14 +250,6 @@ impl WebSocketManager {
 
                         println!("WAITING FOR OUTGOING MESSAGES");
 
-                        // while let Some(message) = rx.recv().await {
-                        //     println!("SENDING MESSAGE: {:?}", message);
-
-                        //     if let Err(err) = write.send(message).await {
-                        //         println!("SEND ERROR: {:?}", err);
-                        //         break;
-                        //     }
-                        // }
 
                         tokio::pin!(receive_dispatch);
                         tokio::pin!(heartbeat_task);

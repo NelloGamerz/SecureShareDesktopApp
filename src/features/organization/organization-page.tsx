@@ -1,13 +1,17 @@
 import { motion } from "framer-motion";
 import {
   Building2,
+  CalendarDays,
   Check,
+  Clock3,
   Globe,
+  HardDrive,
   Mail,
   // MapPin,
   // Phone,
   Pencil,
   Plus,
+  ShieldCheck,
   Trash2,
   UserPlus,
   Users,
@@ -79,7 +83,7 @@ function StatCard({
 }: {
   icon: LucideIcon;
   label: string;
-  value: number;
+  value: number | string;
   index: number;
 }) {
   return (
@@ -93,7 +97,9 @@ function StatCard({
           <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted">
             <Icon className="h-[1.15rem] w-[1.15rem] text-muted-foreground" />
           </div>
-          <p className="mt-4 text-2xl font-semibold tracking-tight">{value}</p>
+          <p className="mt-4 text-2xl font-semibold tracking-tight">
+            {value}
+          </p>
           <p className="mt-0.5 text-sm text-muted-foreground">{label}</p>
         </CardContent>
       </Card>
@@ -115,6 +121,7 @@ export function OrganizationPage() {
   const members = data?.members ?? [];
   // const invitations = data?.invitations ?? [];
   const stats = data?.stats ?? null;
+  const isOrganization = org?.type === "ORGANIZATION";
 
   const { data: profile, isLoading: profileLoading } = useCurrentUserProfile();
   const { canAccessBilling } = useCanAccessBilling();
@@ -177,6 +184,34 @@ export function OrganizationPage() {
   const pendingInvitesCount = invitations.filter(
     (inv) => inv.status === "PENDING",
   ).length;
+
+  // TODO: replace the placeholder personal stats below when the account
+  // metadata endpoint exposes last login, account status, and member since.
+  const personalAccountStats = [
+    {
+      icon: HardDrive,
+      label: "Connected Devices",
+      value: "—",
+    },
+    {
+      icon: Clock3,
+      label: "Last Login",
+      value: "—",
+    },
+    {
+      icon: ShieldCheck,
+      label: "Account Status",
+      value: "—",
+    },
+    {
+      icon: CalendarDays,
+      label: "Member Since",
+      value: "—",
+    },
+  ];
+
+  // TODO: wire this section to the future devices API for personal accounts.
+  const connectedDevices: Array<{ id: string; name: string; detail?: string }> = [];
 
   if (isLoading) {
     return (
@@ -285,10 +320,14 @@ export function OrganizationPage() {
     <PageContainer>
       <PageHeader
         title="Organization"
-        description="Manage your organization's profile, members, and invitations."
+        description={
+          isOrganization
+            ? "Manage your organization's profile, members, and invitations."
+            : "Manage your personal account profile and signed-in devices."
+        }
         actions={
           <>
-            {canAccessBilling && (
+            {isOrganization && canAccessBilling && (
               <Button
                 variant="outline"
                 size="sm"
@@ -298,18 +337,26 @@ export function OrganizationPage() {
                 Invite member
               </Button>
             )}
-            {canAccessBilling && (
-              <Button size="sm" onClick={() => setEditOpen(true)}>
-                <Pencil className="h-4 w-4" />
-                Edit
-              </Button>
-            )}
+            <Button
+              size="sm"
+              onClick={() => {
+                if (isOrganization) {
+                  setEditOpen(true);
+                  return;
+                }
+
+                // TODO: implement a dedicated individual profile edit dialog.
+              }}
+            >
+              <Pencil className="h-4 w-4" />
+              Edit
+            </Button>
           </>
         }
       />
 
       {/* Stats */}
-      {stats && (
+      {isOrganization && stats && (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <StatCard
             icon={Users}
@@ -338,14 +385,29 @@ export function OrganizationPage() {
         </div>
       )}
 
+      {!isOrganization && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {personalAccountStats.map((stat, index) => (
+            <StatCard
+              key={stat.label}
+              icon={stat.icon}
+              label={stat.label}
+              value={stat.value}
+              index={index}
+            />
+          ))}
+        </div>
+      )}
+
       <div className="mt-4 grid gap-6 lg:grid-cols-3">
-        {/* Organization profile */}
         <div className="space-y-6 lg:col-span-2">
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Profile</CardTitle>
               <CardDescription>
-                Organization details and contact information.
+                {isOrganization
+                  ? "Organization details and contact information."
+                  : "Personal account details."}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -366,7 +428,7 @@ export function OrganizationPage() {
                 </div>
               </div>
 
-              {org.type === "ORGANIZATION" && (
+              {isOrganization && (
                 <div className="grid gap-4 sm:grid-cols-2">
                   <DetailRow
                     icon={Building2}
@@ -409,53 +471,97 @@ export function OrganizationPage() {
             </CardContent>
           </Card>
 
-          {/* Members preview */}
-          <Card>
-            <CardHeader className="flex-row items-center justify-between space-y-0">
-              <div>
-                <CardTitle className="text-base">Members</CardTitle>
-                <CardDescription>
-                  {members.length} people in this organization
-                </CardDescription>
-              </div>
-              <Button variant="ghost" size="sm" asChild>
-                <Link to="/members">View all</Link>
-              </Button>
-            </CardHeader>
-            <CardContent className="p-0">
-              <div className="divide-y">
-                {members.slice(0, 5).map((m) => (
-                  <div key={m.id} className="flex items-center gap-3 px-6 py-3">
-                    <Avatar className="h-9 w-9">
-                      <AvatarFallback className="bg-muted text-xs font-medium">
-                        {m.name
-                          .split(" ")
-                          .map((p) => p[0])
-                          .join("")
-                          .slice(0, 2)
-                          .toUpperCase()}
-                      </AvatarFallback>
-                    </Avatar>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium">{m.name}</p>
-                      <p className="truncate text-xs text-muted-foreground">
-                        {m.email}
-                      </p>
+          {isOrganization && (
+            <Card>
+              <CardHeader className="flex-row items-center justify-between space-y-0">
+                <div>
+                  <CardTitle className="text-base">Members</CardTitle>
+                  <CardDescription>
+                    {members.length} people in this organization
+                  </CardDescription>
+                </div>
+                <Button variant="ghost" size="sm" asChild>
+                  <Link to="/members">View all</Link>
+                </Button>
+              </CardHeader>
+              <CardContent className="p-0">
+                <div className="divide-y">
+                  {members.slice(0, 5).map((m) => (
+                    <div key={m.id} className="flex items-center gap-3 px-6 py-3">
+                      <Avatar className="h-9 w-9">
+                        <AvatarFallback className="bg-muted text-xs font-medium">
+                          {m.name
+                            .split(" ")
+                            .map((p) => p[0])
+                            .join("")
+                            .slice(0, 2)
+                            .toUpperCase()}
+                        </AvatarFallback>
+                      </Avatar>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium">{m.name}</p>
+                        <p className="truncate text-xs text-muted-foreground">
+                          {m.email}
+                        </p>
+                      </div>
+                      <Badge
+                        variant={roleVariant[m.role] ?? "default"}
+                        className="capitalize"
+                      >
+                        {m.role}
+                      </Badge>
                     </div>
-                    <Badge
-                      variant={roleVariant[m.role] ?? "default"}
-                      className="capitalize"
-                    >
-                      {m.role}
-                    </Badge>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {!isOrganization && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">Connected Devices</CardTitle>
+                <CardDescription>
+                  Devices currently signed in to your account.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="p-0">
+                {connectedDevices.length === 0 ? (
+                  <div className="px-6 py-8 text-center">
+                    <p className="text-sm text-muted-foreground">
+                      No connected device information available.
+                    </p>
+                    {/* TODO: replace this empty state with the future devices API response once per-account device sessions are exposed. */}
                   </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
+                ) : (
+                  <div className="divide-y">
+                    {connectedDevices.map((device) => (
+                      <div
+                        key={device.id}
+                        className="flex items-center gap-3 px-6 py-3"
+                      >
+                        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted">
+                          <HardDrive className="h-4 w-4 text-muted-foreground" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-medium">
+                            {device.name}
+                          </p>
+                          {device.detail && (
+                            <p className="truncate text-xs text-muted-foreground">
+                              {device.detail}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
         </div>
 
-        {/* Invitation history */}
         <div className="space-y-6">
           {/* <Card>
             <CardHeader>
@@ -501,8 +607,7 @@ export function OrganizationPage() {
             </CardContent>
           </Card> */}
 
-          {/* Danger zone */}
-          {canAccessBilling && (
+          {isOrganization && canAccessBilling && (
             <Card className="border-destructive/30">
               <CardHeader>
                 <CardTitle className="text-base text-destructive">

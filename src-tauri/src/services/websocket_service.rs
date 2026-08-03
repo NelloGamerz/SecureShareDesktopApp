@@ -99,16 +99,45 @@ impl WebSocketService {
         }
     }
 
+    // pub async fn start(&self, device_info: DeviceInfo) -> Result<(), AppError> {
+    //     println!("WEBSOCKET SERVICE START CALLED");
+
+    //     /*
+    //         Only check that the user is authenticated.
+
+    //         Do NOT clone the JWT here.
+    //         The websocket manager must request
+    //         a fresh token for every reconnect.
+    //     */
+    //     let has_token = self.auth_state.token.read().await.is_some();
+
+    //     println!("AUTH TOKEN AVAILABLE: {}", has_token);
+
+    //     if !has_token {
+    //         println!("WEBSOCKET START FAILED: NO AUTH TOKEN");
+
+    //         return Err(AppError::not_authenticated());
+    //     }
+
+    //     println!("CALLING WEBSOCKET STATE START");
+
+    //     let result = self.websocket_state.start(device_info).await;
+
+    //     match &result {
+    //         Ok(_) => {
+    //             println!("WEBSOCKET STATE START SUCCESS");
+    //         }
+
+    //         Err(err) => {
+    //             println!("WEBSOCKET STATE START FAILED: {:?}", err);
+    //         }
+    //     }
+
+    //     result
+    // }
+
     pub async fn start(&self, device_info: DeviceInfo) -> Result<(), AppError> {
         println!("WEBSOCKET SERVICE START CALLED");
-
-        /*
-            Only check that the user is authenticated.
-
-            Do NOT clone the JWT here.
-            The websocket manager must request
-            a fresh token for every reconnect.
-        */
 
         let has_token = self.auth_state.token.read().await.is_some();
 
@@ -124,17 +153,36 @@ impl WebSocketService {
 
         let result = self.websocket_state.start(device_info).await;
 
-        match &result {
+        match result {
             Ok(_) => {
                 println!("WEBSOCKET STATE START SUCCESS");
+
+                /*
+                 * WebSocketManager is now created.
+                 * Attach it to EventDispatcher.
+                 */
+                let manager = {
+                    let guard = self.websocket_state.manager.lock().await;
+                    guard.clone()
+                };
+
+                if let Some(manager) = manager {
+                    self.event_dispatcher.attach_websocket_manager(manager);
+
+                    println!("WEBSOCKET MANAGER ATTACHED TO EVENT DISPATCHER");
+                } else {
+                    println!("WARNING: websocket manager missing after start");
+                }
+
+                Ok(())
             }
 
             Err(err) => {
                 println!("WEBSOCKET STATE START FAILED: {:?}", err);
+
+                Err(err)
             }
         }
-
-        result
     }
 
     pub async fn stop(&self) -> Result<(), AppError> {

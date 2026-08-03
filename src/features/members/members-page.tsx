@@ -83,6 +83,15 @@ function initials(name: string): string {
     .toUpperCase();
 }
 
+function truncateDeviceId(id?: string): string {
+  if (!id) return "Unknown";
+  if (id.length <= 12) return id;
+
+  return `${id.slice(0, 6)}...${id.slice(-4)}`;
+}
+
+
+
 export function MembersPage() {
   const { data: overview } = useOrganizationOverview();
   const { data: members, isLoading, isError, error, refetch } = useMembers();
@@ -402,7 +411,7 @@ export function MembersPage() {
                                         {device.deviceName ?? "Unnamed device"}
                                       </p>
                                       <p className="text-xs text-muted-foreground">
-                                        {device.deviceIdentifier}
+                                        {truncateDeviceId(device.deviceIdentifier)}
                                       </p>
                                     </div>
                                     <Badge variant="outline" className="capitalize">

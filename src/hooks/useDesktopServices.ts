@@ -14,6 +14,7 @@ import {
 } from "@/api/tauri";
 import { useNotificationStore } from "@/store/notification-store";
 import { useCurrentUserProfile } from "@/features/auth/auth-hooks";
+import { registerCurrentDevice } from "@/features/devices/devices-api";
 
 export function useDesktopServices() {
   const { isLoaded, isSignedIn } = useClerkAuth();
@@ -50,6 +51,24 @@ export function useDesktopServices() {
         console.log("[DesktopServices] shouldRun =", shouldRun);
 
         if (shouldRun) {
+          if (profile.currentDeviceRegistered === false) {
+            console.log(
+              "[DesktopServices] Device not registered. Registering...",
+            );
+
+            try {
+              const result = await registerCurrentDevice();
+
+              console.log("[DesktopServices] Device registered:", result);
+            } catch (error) {
+              console.error(
+                "[DesktopServices] Device registration failed:",
+                error,
+              );
+
+              return;
+            }
+          }
           if (!cloudflareRunning) {
             console.log("[DesktopServices] Starting Cloudflared...");
 
@@ -122,7 +141,13 @@ export function useDesktopServices() {
     };
 
     void syncServices();
-  }, [isLoaded, isLoading, isSignedIn, profile?.onboardingCompleted]);
+  }, [
+    isLoaded,
+    isLoading,
+    isSignedIn,
+    profile?.onboardingCompleted,
+    profile?.currentDeviceRegistered,
+  ]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;

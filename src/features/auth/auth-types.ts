@@ -11,4 +11,5 @@ export interface UserProfile {
   onboardingCompleted: boolean;
   memberRole?: MemberRole;
   organizationType?: OrganizationType;
+  currentDeviceRegistered: boolean;
 }

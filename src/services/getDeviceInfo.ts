@@ -4,24 +4,21 @@ import { detectDeviceType } from "@/api/tauri";
 
 export type DeviceType = "DESKTOP" | "MOBILE" | "TABLET" | "LAPTOP" | "UNKNOWN";
 
-export type OperatingSystem =
-  | "WINDOWS"
-  | "MACOS"
-  | "LINUX"
-  | "IOS"
-  | "ANDROID";
+export type OperatingSystem = "WINDOWS" | "MACOS" | "LINUX" | "IOS" | "ANDROID";
 
 export async function getDeviceInfo() {
-  const store = await Store.load("device.json");
+  // const store = await Store.load("device.json");
 
-  let deviceIdentifier = await store.get<string>("deviceIdentifier");
+  // let deviceIdentifier = await store.get<string>("deviceIdentifier");
 
-  if (!deviceIdentifier) {
-    deviceIdentifier = uuidv4();
+  // if (!deviceIdentifier) {
+  //   deviceIdentifier = uuidv4();
 
-    await store.set("deviceIdentifier", deviceIdentifier);
-    await store.save();
-  }
+  //   await store.set("deviceIdentifier", deviceIdentifier);
+  //   await store.save();
+  // }
+
+  const deviceIdentifier = await getDeviceIdentifier();
 
   const detectedType = await detectDeviceType();
   return {
@@ -30,8 +27,23 @@ export async function getDeviceInfo() {
     deviceType: mapDeviceType(detectedType),
     operatingSystem: getOperatingSystem(),
     appVersion: getAppVersion(),
-
   };
+}
+
+export async function getDeviceIdentifier(): Promise<string> {
+  const store = await Store.load("device.json");
+
+  let deviceIdentifier = await store.get<string>("deviceIdentifier");
+
+  if (!deviceIdentifier) {
+    deviceIdentifier = uuidv4();
+
+    await store.set("deviceIdentifier", deviceIdentifier);
+
+    await store.save();
+  }
+
+  return deviceIdentifier;
 }
 
 function mapDeviceType(type: string): DeviceType {
@@ -53,16 +65,13 @@ function mapDeviceType(type: string): DeviceType {
   }
 }
 
-
 function getDeviceName(): string {
   return navigator.platform || "Unknown Desktop";
 }
 
-
 // function getDeviceType(): DeviceType {
 //   return "DESKTOP";
 // }
-
 
 function getOperatingSystem(): OperatingSystem {
   const userAgent = navigator.userAgent.toLowerCase();
@@ -90,7 +99,6 @@ function getOperatingSystem(): OperatingSystem {
 
   return "WINDOWS";
 }
-
 
 function getAppVersion(): string {
   return "1.0.0";

@@ -22,12 +22,14 @@ use tauri_plugin_log::{log, Builder as LogBuilder, Target, TargetKind};
 use commands::auth::{
     clear_all, delete_tunnel_hostname, delete_tunnel_token, get_connection_status,
     get_tunnel_hostname, get_tunnel_token, login, logout, save_tunnel_hostname, save_tunnel_token,
-    send_message, start_websocket, update_auth_token
+    send_message, start_websocket, update_auth_token,
 };
 
 use commands::transfer_commands::{
     cancel_transfer, get_transfer_status, pause_transfer, resume_transfer, start_transfer,
 };
+
+use services::updates_service::handle_pending_update;
 
 use commands::local_transfer_commands::{
     check_local_transfer_exists, delete_local_transfer_file, delete_local_transfer_files,
@@ -95,10 +97,6 @@ pub fn run() {
             } else {
                 AppConfig::production()
             };
-
-            /*
-             * Local SQLite storage
-             */
             let app_data_dir = app.path().app_data_dir()?;
 
             std::fs::create_dir_all(&app_data_dir)?;
@@ -114,19 +112,41 @@ pub fn run() {
                     .await
                     .expect("Failed to connect sqlite database")
             });
-
             let local_transfer_service = Arc::new(tauri::async_runtime::block_on(async {
                 LocalTransferFileService::new(pool).await
             }));
+            let (app_state, rx) =
+                AppState::new(app.handle().clone(), config, local_transfer_service.clone());
+
+            let app_state = Arc::new(app_state);
+
+            let update_app = app.handle().clone();
+            let dispatcher = Arc::clone(&app_state.event_dispatcher);
+
+            // tauri::async_runtime::spawn(async move {
+            //     handle_pending_update(update_app, dispatcher).await;
+            // });
+
+            /*
+             * Local SQLite storage
+             */
 
             /*
              * Application state
              */
-            let app_state = Arc::new(AppState::new(
-                app.handle().clone(),
-                config,
-                local_transfer_service.clone(),
-            ));
+            // let app_state = Arc::new(AppState::new(
+            //     app.handle().clone(),
+            //     config,
+            //     local_transfer_service.clone(),
+            // ));
+
+            /*
+             * Start transfer event listener
+             */
+
+            tauri::async_runtime::spawn(async move {
+                dispatcher.listen_transfer_events(rx).await;
+            });
 
             app.manage(app_state);
 
@@ -144,12 +164,6 @@ pub fn run() {
              * Transfer storage
              */
             let transfer_root = app_data_dir.join("transfers");
-
-            app.manage(Arc::new(transfer::manager::UploadManager::new(
-                app.handle().clone(),
-                transfer_root.clone(),
-                local_transfer_service.clone(),
-            )));
 
             /*
              * Local receiver server
@@ -263,6 +277,29 @@ pub fn run() {
             update_auth_token,
             detect_device_type
         ])
+        // .run(tauri::generate_context!())
+        // .expect("error while running tauri application");
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let state = window.state::<Cloudflared>();
+
+                {
+                    let mut guard = match state.process.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+
+                    if let Some(mut child) = guard.take() {
+                        tracing::info!("Stopping cloudflared...");
+
+                        let _ = child.kill();
+                        let _ = child.wait();
+
+                        tracing::info!("cloudflared stopped");
+                    }
+                } // <-- guard is dropped here
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

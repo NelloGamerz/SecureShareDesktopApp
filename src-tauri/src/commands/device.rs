@@ -41,82 +41,83 @@ pub async fn detect_device_type() -> String {
     "UNKNOWN".into()
 }
 
+// #[cfg(target_os = "windows")]
+// fn detect_windows_device_type() -> String {
+
+//     use std::process::Command;
+
+//     let output = Command::new("powershell")
+//         .args([
+//             "-Command",
+//             "Get-CimInstance Win32_Battery"
+//         ])
+//         .output();
+
+//     match output {
+
+//         Ok(result) => {
+
+//             let battery = String::from_utf8_lossy(
+//                 &result.stdout
+//             );
+
+//             if !battery.trim().is_empty() {
+//                 return "LAPTOP".into();
+//             }
+
+//             "DESKTOP".into()
+//         }
+
+//         Err(_) => "UNKNOWN".into()
+//     }
+// }
+
 #[cfg(target_os = "windows")]
 fn detect_windows_device_type() -> String {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 
-    use std::process::Command;
+    let mut status = SYSTEM_POWER_STATUS::default();
 
-    let output = Command::new("powershell")
-        .args([
-            "-Command",
-            "Get-CimInstance Win32_Battery"
-        ])
-        .output();
-
-
-    match output {
-
-        Ok(result) => {
-
-            let battery = String::from_utf8_lossy(
-                &result.stdout
-            );
-
-
-            if !battery.trim().is_empty() {
+    unsafe {
+        if GetSystemPowerStatus(&mut status).is_ok() {
+            // 128 means "no system battery"
+            if status.BatteryFlag != 128 {
                 return "LAPTOP".into();
+            } else {
+                return "DESKTOP".into();
             }
-
-
-            "DESKTOP".into()
         }
-
-
-        Err(_) => "UNKNOWN".into()
     }
+
+    "UNKNOWN".into()
 }
 
 #[cfg(target_os = "macos")]
 fn detect_macos_device_type() -> String {
-
     use std::process::Command;
 
-
     let output = Command::new("sh")
-        .args([
-            "-c",
-            "system_profiler SPPowerDataType"
-        ])
+        .args(["-c", "system_profiler SPPowerDataType"])
         .output();
 
-
     if let Ok(result) = output {
-
-        let text =
-            String::from_utf8_lossy(&result.stdout);
-
+        let text = String::from_utf8_lossy(&result.stdout);
 
         if text.contains("Battery Information") {
             return "LAPTOP".into();
         }
     }
 
-
     "DESKTOP".into()
 }
 
 #[cfg(target_os = "linux")]
 fn detect_linux_device_type() -> String {
-
     use std::path::Path;
 
-
-    if Path::new("/sys/class/power_supply/BAT0")
-        .exists()
-    {
+    if Path::new("/sys/class/power_supply/BAT0").exists() {
         return "LAPTOP".into();
     }
-
 
     "DESKTOP".into()
 }
