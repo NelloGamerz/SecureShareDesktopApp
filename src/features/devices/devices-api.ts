@@ -155,12 +155,27 @@ export async function cancelPairing(code: string): Promise<PairingSession> {
   return data;
 }
 
+// export async function registerCurrentDevice() {
+//   const deviceInfo = await getDeviceInfo();
+//   const publicKey = await createDeviceIdentity(); 
+
+//   const { data } = await api.post("/devices/register", {
+//     ...deviceInfo,
+//     publicKey,
+//   });
+
+//   return data;
+// }
+
+
 export async function registerCurrentDevice() {
   const deviceInfo = await getDeviceInfo();
-  const publicKey = await createDeviceIdentity(); 
+  const publicKey = await createDeviceIdentity();
 
   const { data } = await api.post("/devices/register", {
-    ...deviceInfo,
+    device: {
+      ...deviceInfo,
+    },
     publicKey,
   });
 

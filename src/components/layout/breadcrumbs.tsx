@@ -3,18 +3,19 @@ import { Link, useLocation } from 'react-router-dom';
 import { ChevronRight } from 'lucide-react';
 import { navItems } from '@/lib/constants';
 import { cn } from '@/lib/utils';
+import { useOrganizationOverview } from '@/features/organization/organization-hooks';
 
 const routeLabels: Record<string, string> = Object.fromEntries(
   navItems.map((n) => [n.to, n.title])
 );
 
-function buildCrumbs(pathname: string) {
+function buildCrumbs(pathname: string, resolvedRouteLabels: Record<string, string>) {
   const segments = pathname.split('/').filter(Boolean);
   const crumbs: { label: string; to: string }[] = [];
   let acc = '';
   for (const seg of segments) {
     acc += `/${seg}`;
-    const label = routeLabels[acc];
+    const label = resolvedRouteLabels[acc];
     if (label) {
       crumbs.push({ label, to: acc });
     } else {
@@ -30,7 +31,15 @@ function buildCrumbs(pathname: string) {
 
 export function Breadcrumbs({ className }: { className?: string }) {
   const { pathname } = useLocation();
-  const crumbs = buildCrumbs(pathname);
+  const { data: organizationOverview } = useOrganizationOverview();
+  const resolvedRouteLabels = {
+    ...routeLabels,
+    '/organization':
+      organizationOverview?.organization?.type === 'INDIVIDUAL'
+        ? 'Workspace'
+        : 'Organization',
+  };
+  const crumbs = buildCrumbs(pathname, resolvedRouteLabels);
 
   if (crumbs.length === 0) return null;
 

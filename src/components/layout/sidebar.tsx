@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useCanAccessBilling, useCanAccessMembers } from '@/features/auth/auth-hooks';
+import { useOrganizationOverview } from '@/features/organization/organization-hooks';
 import { APP_NAME, navItems } from '@/lib/constants';
 import { useUIStore } from '@/store/ui-store';
 import { cn } from '@/lib/utils';
@@ -16,14 +17,24 @@ export function Sidebar() {
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
   const { canAccessBilling } = useCanAccessBilling();
   const { canAccessMembers } = useCanAccessMembers();
+  const { data: organizationOverview } = useOrganizationOverview();
 
-  const visibleNavItems = navItems.filter((item) => {
-    if (item.to === '/members' && !canAccessMembers) {
-      return false;
-    }
+  const organizationLabel =
+    organizationOverview?.organization?.type === 'INDIVIDUAL'
+      ? 'Workspace'
+      : 'Organization';
 
-    return !item.hideForRestrictedMembers || canAccessBilling;
-  });
+  const visibleNavItems = navItems
+    .map((item) =>
+      item.to === '/organization' ? { ...item, title: organizationLabel } : item
+    )
+    .filter((item) => {
+      if (item.to === '/members' && !canAccessMembers) {
+        return false;
+      }
+
+      return !item.hideForRestrictedMembers || canAccessBilling;
+    });
 
   return (
     <aside

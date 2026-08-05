@@ -26,7 +26,8 @@ export interface Organization {
   contact_phone: string | null;
   city: string | null;
   country: string | null;
-  created_at: string;
+  status: MemberStatus;
+  last_active_at: string;
 }
 
 export interface MemberDevice {
@@ -72,6 +73,8 @@ export interface OrgStats {
   pendingInvites: number;
   owners: number;
   admins: number;
+  totalDevices: number;
+  joinedAt: string;
 }
 
 export interface OrganizationOverview {

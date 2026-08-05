@@ -1,6 +1,18 @@
 import { motion } from 'framer-motion';
-import { Check, Crown, Download, ShieldCheck, Sparkles, Zap } from 'lucide-react';
+import {
+  Check,
+  CheckCircle2,
+  CircleAlert,
+  Crown,
+  Download,
+  Loader2,
+  ShieldCheck,
+  Sparkles,
+  XCircle,
+  Zap,
+} from 'lucide-react';
 import { useState } from 'react';
+import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -9,7 +21,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { PageContainer, PageHeader } from '@/components/layout/page-header';
 import { useCurrentUserProfile } from '@/features/auth/auth-hooks';
 import { useBillingInvoices, useBillingUsageSummary } from './billing-hooks';
-import type { BillingInvoice } from './billing-api';
+import { createRazorpayOrder, verifyRazorpayPayment, type BillingInvoice } from './billing-api';
 
 type BillingCycle = 'monthly' | 'yearly';
 
@@ -30,7 +42,7 @@ function formatCurrency(value?: number | string) {
   return String(value);
 }
 
-function formatDate(value?: string) {
+export function formatDate(value?: string) {
   if (!value) {
     return '—';
   }
@@ -92,9 +104,35 @@ const teamFeatures = [
   'Priority support',
 ];
 
+function loadRazorpayCheckout() {
+  return new Promise<void>((resolve, reject) => {
+    if (window.Razorpay) {
+      resolve();
+      return;
+    }
+
+    const existingScript = document.getElementById('razorpay-checkout-script');
+    if (existingScript) {
+      existingScript.addEventListener('load', () => resolve(), { once: true });
+      existingScript.addEventListener('error', () => reject(new Error('Unable to load Razorpay Checkout.')), { once: true });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.id = 'razorpay-checkout-script';
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('Unable to load Razorpay Checkout.'));
+    document.body.appendChild(script);
+  });
+}
+
 export function BillingPage() {
   const { data: profile, isLoading } = useCurrentUserProfile();
   const [billingCycle, setBillingCycle] = useState<BillingCycle>('monthly');
+  const [isCheckingOut, setIsCheckingOut] = useState(false);
+  const [checkoutStatus, setCheckoutStatus] = useState<'idle' | 'success' | 'error' | 'cancelled'>('idle');
 
   const { data: usageSummary = {}, isLoading: isUsageLoading } = useBillingUsageSummary();
   const { data: invoices = [], isLoading: isInvoicesLoading } = useBillingInvoices();
@@ -107,6 +145,94 @@ export function BillingPage() {
   const isRestricted = !isIndividualOwner && !isOrganizationOwner;
   const normalizedInvoices = invoices.map(normalizeInvoice);
   const normalizedUsageSummary = usageSummary ?? {};
+
+  const handleRazorpayCheckout = async () => {
+    // if (!isIndividualOwner) {
+    //   toast.error('Razorpay checkout is only available for the individual owner account.');
+    //   return;
+    // }
+
+    setIsCheckingOut(true);
+    setCheckoutStatus('idle');
+
+    try {
+      const amountInPaise = billingCycle === 'monthly' ? 29900 : 299000;
+      const order = await createRazorpayOrder({
+        billingCycle,
+        planType: 'individual',
+        amount: amountInPaise,
+        currency: 'INR',
+        description: billingCycle === 'monthly' ? 'Individual Pro Monthly Plan' : 'Individual Pro Yearly Plan',
+      });
+
+      if (!order.orderId || !order.keyId) {
+        throw new Error('The backend did not return a valid Razorpay order payload.');
+      }
+
+      await loadRazorpayCheckout();
+
+      if (!window.Razorpay) {
+        throw new Error('Razorpay Checkout did not initialize in the Tauri WebView.');
+      }
+
+      const razorpay = new window.Razorpay({
+        key: order.keyId,
+        amount: order.amount ?? amountInPaise,
+        currency: order.currency ?? 'INR',
+        name: 'Startup Server',
+        description: billingCycle === 'monthly' ? 'Individual Pro Monthly Plan' : 'Individual Pro Yearly Plan',
+        order_id: order.orderId,
+        image: undefined,
+        handler: async (response) => {
+          try {
+            const verification = await verifyRazorpayPayment({
+              orderId: response.razorpay_order_id ?? order.orderId ?? '',
+              paymentId: response.razorpay_payment_id ?? '',
+              signature: response.razorpay_signature ?? '',
+              billingCycle,
+              planType: 'individual',
+            });
+
+            if (verification.success) {
+              setCheckoutStatus('success');
+              toast.success(verification.message ?? 'Subscription activated successfully.');
+            } else {
+              setCheckoutStatus('error');
+              toast.error(verification.message ?? 'Payment verification failed. Please contact support.');
+            }
+          } catch (error) {
+            setCheckoutStatus('error');
+            const message = error instanceof Error ? error.message : 'Unable to verify the Razorpay payment.';
+            toast.error(message);
+          }
+        },
+        modal: {
+          ondismiss: () => {
+            setCheckoutStatus('cancelled');
+            toast.warning('Payment cancelled. No charges were made.');
+          },
+        },
+        prefill: {
+          name: profile?.firstName ?? undefined,
+        },
+        notes: {
+          billingCycle,
+          planType: 'individual',
+        },
+        theme: {
+          color: '#7c3aed',
+        },
+      });
+
+      razorpay.open();
+    } catch (error) {
+      setCheckoutStatus('error');
+      const message = error instanceof Error ? error.message : 'Unable to start the Razorpay checkout flow.';
+      toast.error(message);
+    } finally {
+      setIsCheckingOut(false);
+    }
+  };
 
   if (isLoading) {
     return (
@@ -191,7 +317,9 @@ export function BillingPage() {
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <Button variant="outline" size="sm">Manage billing</Button>
-                    <Button size="sm">Upgrade / Downgrade</Button>
+                    <Button size="sm" onClick={handleRazorpayCheckout} disabled={isCheckingOut}>
+                      {isCheckingOut ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Upgrade / Downgrade'}
+                    </Button>
                   </div>
                 </div>
               </CardContent>
@@ -217,6 +345,19 @@ export function BillingPage() {
               </Button>
             </div>
           </div>
+
+          {checkoutStatus !== 'idle' && (
+            <div className="mb-4 flex items-center gap-2 rounded-lg border p-3 text-sm">
+              {checkoutStatus === 'success' && <CheckCircle2 className="h-4 w-4 text-emerald-500" />}
+              {checkoutStatus === 'error' && <CircleAlert className="h-4 w-4 text-destructive" />}
+              {checkoutStatus === 'cancelled' && <XCircle className="h-4 w-4 text-amber-500" />}
+              <span>
+                {checkoutStatus === 'success' && 'Razorpay payment verified successfully.'}
+                {checkoutStatus === 'error' && 'Razorpay payment could not be verified. Please retry or contact support.'}
+                {checkoutStatus === 'cancelled' && 'The payment window was closed before completion.'}
+              </span>
+            </div>
+          )}
 
           <div className="grid gap-4 lg:grid-cols-2">
             <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }}>
@@ -267,7 +408,9 @@ export function BillingPage() {
                       <span className="text-muted-foreground">{feature}</span>
                     </div>
                   ))}
-                  <Button className="mt-3 w-full">Current plan</Button>
+                  <Button className="mt-3 w-full" onClick={handleRazorpayCheckout} disabled={isCheckingOut}>
+                    {isCheckingOut ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Pay with Razorpay'}
+                  </Button>
                 </CardContent>
               </Card>
             </motion.div>

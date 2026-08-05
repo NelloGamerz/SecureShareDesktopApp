@@ -11,7 +11,10 @@ export type TransferStatus =
   | "CANCELLED"
   | "UPLOADING"
   | "DOWNLOADING"
-  | "PAUSED";
+  | "PAUSED"
+  | "CONNECTING"
+  | "WAITING_SENDER"
+  | "HANDSHAKING";
 
 export type TransferAction = "ACCEPT" | "REJECT" | "CANCEL";
 

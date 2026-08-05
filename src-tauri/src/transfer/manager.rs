@@ -1,7 +1,6 @@
 use crate::services::local_transfer_file_service::LocalTransferFileService;
 use crate::transfer::crypto;
 use crate::transfer::http_client::HttpClient;
-use crate::websocket::WebSocketManager;
 use crate::{
     models::transfer::{TransferMetadata, TransferStatus, TransferStatusResponse},
     transfer::{

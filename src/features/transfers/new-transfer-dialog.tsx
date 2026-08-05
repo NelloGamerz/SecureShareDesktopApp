@@ -35,7 +35,9 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 import type { Device, OrganizationMember } from "@/features/devices/devices-api";
-import { useMyDevices, useOrganizationMembers } from "@/features/devices/devices-hooks";
+import { useDevices, useOrganizationMembers } from "@/features/devices/devices-hooks";
+
+import { useCurrentUserProfile } from "@/features/auth/auth-hooks";
 
 import { cn } from "@/lib/utils";
 
@@ -468,17 +470,20 @@ export function NewTransferDialog({
   const [currentDeviceIdentifier, setCurrentDeviceIdentifier] =
     React.useState<string>();
 
+  const { data: profile } = useCurrentUserProfile();
+  const isIndividualWorkspace = profile?.organizationType === "INDIVIDUAL";
+
   const {
     data: myDevices,
     isLoading: myDevicesLoading,
     isError: myDevicesError,
-  } = useMyDevices();
+  } = useDevices();
 
   const {
     data: members,
     isLoading: membersLoading,
     isError: membersError,
-  } = useOrganizationMembers();
+  } = useOrganizationMembers({ enabled: !isIndividualWorkspace });
 
   const createTransfer = useCreateTransfer();
 
@@ -504,6 +509,11 @@ export function NewTransferDialog({
 
     return filteredMembers.filter((member) => member.devices.length > 0);
   }, [currentDeviceIdentifier, members]);
+
+  const showMembersSection = !isIndividualWorkspace;
+  const showMembersError = showMembersSection && membersError;
+  const showMembersLoading = showMembersSection && membersLoading;
+  const showMembersEmptyState = showMembersSection && availableMembers.length === 0;
 
   const selectedDevice = React.useMemo(() => {
     const combinedDevices = [
@@ -824,7 +834,7 @@ export function NewTransferDialog({
                 2. Choose destination
               </p>
 
-              {(myDevicesLoading || membersLoading) && (
+              {(myDevicesLoading || showMembersLoading) && (
                 <div
                   className="
                         flex
@@ -841,7 +851,7 @@ export function NewTransferDialog({
                 </div>
               )}
 
-              {!myDevicesLoading && !membersLoading && (
+              {!myDevicesLoading && !showMembersLoading && (
                 <div className="space-y-4">
                   <MyDevicesSection
                     devices={availableMyDevices}
@@ -850,16 +860,18 @@ export function NewTransferDialog({
                     disabled={submitting}
                   />
 
-                  <MembersSection
-                    members={availableMembers}
-                    selectedDeviceId={receiverId}
-                    onSelectDevice={setReceiverId}
-                    disabled={submitting}
-                  />
+                  {showMembersSection && (
+                    <MembersSection
+                      members={availableMembers}
+                      selectedDeviceId={receiverId}
+                      onSelectDevice={setReceiverId}
+                      disabled={submitting}
+                    />
+                  )}
 
-                  {!myDevicesError && !membersError &&
+                  {!myDevicesError && !showMembersError &&
                     availableMyDevices.length === 0 &&
-                    availableMembers.length === 0 && (
+                    showMembersEmptyState && (
                       <div className="flex h-24 items-center justify-center rounded-md border text-sm text-muted-foreground">
                         No other devices available for transfer.
                       </div>
@@ -867,7 +879,7 @@ export function NewTransferDialog({
                 </div>
               )}
 
-              {(myDevicesError || membersError) && (
+              {(myDevicesError || showMembersError) && (
                 <div className="rounded-md border border-destructive/20 bg-destructive/5 p-3 text-sm text-destructive">
                   We couldn't load device options right now. Please try again shortly.
                 </div>

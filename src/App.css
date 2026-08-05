@@ -1,1 +1,14 @@
 /* App-level styles intentionally minimal; styling lives in Tailwind utility classes. */
+@keyframes indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+
+  100% {
+    transform: translateX(420%);
+  }
+}
+
+.animate-indeterminate {
+  animation: indeterminate 1.2s linear infinite;
+}

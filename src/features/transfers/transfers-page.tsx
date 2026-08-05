@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
-  Download,
+  // Download,
   MoreHorizontal,
   Plus,
   Check,
@@ -14,7 +14,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useTransferRequestStore } from "@/store/transfer-request-store";
-import { useTransferControls, useTransferProgressListener } from "./transfers-hooks";
+import {
+  useTransferControls,
+  useTransferProgressListener,
+} from "./transfers-hooks";
 
 import {
   Table,
@@ -37,13 +40,29 @@ import { NewTransferDialog } from "./new-transfer-dialog";
 import { useTransfers, useTransferAction } from "./transfers-hooks";
 import { Progress } from "@/components/ui/progress";
 
+// const statusVariant: Record<
+//   string,
+//   "default" | "secondary" | "success" | "destructive"
+// > = {
+//   COMPLETED: "success",
+//   IN_PROGRESS: "secondary",
+//   PENDING: "default",
+//   FAILED: "destructive",
+//   CANCELLED: "destructive",
+// };
+
 const statusVariant: Record<
   string,
   "default" | "secondary" | "success" | "destructive"
 > = {
-  COMPLETED: "success",
-  IN_PROGRESS: "secondary",
   PENDING: "default",
+  CONNECTING: "secondary",
+  WAITING_SENDER: "secondary",
+  HANDSHAKING: "secondary",
+  IN_PROGRESS: "secondary",
+  UPLOADING: "secondary",
+  DOWNLOADING: "secondary",
+  COMPLETED: "success",
   FAILED: "destructive",
   CANCELLED: "destructive",
 };
@@ -62,6 +81,20 @@ function formatFileSize(size: number) {
   }
 
   return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+const preparingStatus: Record<string, string> = {
+  CONNECTING: "Connecting...",
+  WAITING_SENDER: "Waiting for sender...",
+  HANDSHAKING: "Establishing secure connection...",
+};
+
+function IndeterminateProgress() {
+  return (
+    <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
+      <div className="absolute h-full w-1/3 animate-indeterminate rounded-full bg-primary" />
+    </div>
+  );
 }
 
 export function TransfersPage() {
@@ -218,7 +251,18 @@ export function TransfersPage() {
                       ? (t.uploadedBytes / t.totalBytes) * 100
                       : 0;
 
+                  const isPreparing =
+                    t.status === "CONNECTING" ||
+                    t.status === "WAITING_SENDER" ||
+                    t.status === "HANDSHAKING";
+
+                  // const showProgress =
+                  //   t.status === "UPLOADING" ||
+                  //   t.status === "DOWNLOADING" ||
+                  //   t.status === "IN_PROGRESS";
+
                   const showProgress =
+                    isPreparing ||
                     t.status === "UPLOADING" ||
                     t.status === "DOWNLOADING" ||
                     t.status === "IN_PROGRESS";
@@ -250,7 +294,7 @@ export function TransfersPage() {
                               {formatFileSize(t.fileSize)}
                             </p>
 
-                            {showProgress && (
+                            {/* {showProgress && (
                               <div className="mt-3 space-y-1.5">
                                 <Progress value={progress} className="h-1.5" />
 
@@ -262,6 +306,40 @@ export function TransfersPage() {
 
                                   <span>{Math.round(progress)}%</span>
                                 </div>
+                              </div>
+                            )} */}
+                            {showProgress && (
+                              <div className="mt-3 space-y-1.5">
+                                {isPreparing ? (
+                                  <>
+                                    <IndeterminateProgress />
+
+                                    <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                                      <span>
+                                        {preparingStatus[t.status] ??
+                                          "Preparing transfer..."}
+                                      </span>
+
+                                      <span className="animate-pulse">•••</span>
+                                    </div>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Progress
+                                      value={progress}
+                                      className="h-1.5"
+                                    />
+
+                                    <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                                      <span>
+                                        {formatFileSize(t.uploadedBytes)} /{" "}
+                                        {formatFileSize(t.totalBytes)}
+                                      </span>
+
+                                      <span>{Math.round(progress)}%</span>
+                                    </div>
+                                  </>
+                                )}
                               </div>
                             )}
                           </div>
@@ -313,10 +391,10 @@ export function TransfersPage() {
                           </DropdownMenuTrigger>
 
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem>
+                            {/* <DropdownMenuItem>
                               <Download className="mr-2 h-4 w-4" />
                               Download
-                            </DropdownMenuItem>
+                            </DropdownMenuItem> */}
 
                             {/* {!t.sentByMe && t.status === "PENDING" && (
                               <>
@@ -331,32 +409,33 @@ export function TransfersPage() {
                                 </DropdownMenuItem>
                               </>
                             )} */}
-                            {!t.sentByMe && t.status === "PENDING" && (
-                              <>
-                                <DropdownMenuItem
-                                  onClick={() => {
-                                    console.log("Accept transfer:", t.id);
+                            {t.senderDeviceId != t.receiverDeviceId &&
+                              t.status === "PENDING" && (
+                                <>
+                                  <DropdownMenuItem
+                                    onClick={() => {
+                                      console.log("Accept transfer:", t.id);
 
-                                    handleTransferAction(t.id, "ACCEPT");
-                                  }}
-                                >
-                                  <Check className="mr-2 h-4 w-4 text-green-600" />
-                                  Accept
-                                </DropdownMenuItem>
+                                      handleTransferAction(t.id, "ACCEPT");
+                                    }}
+                                  >
+                                    <Check className="mr-2 h-4 w-4 text-green-600" />
+                                    Accept
+                                  </DropdownMenuItem>
 
-                                <DropdownMenuItem
-                                  className="text-destructive"
-                                  onClick={() => {
-                                    console.log("Reject transfer:", t.id);
+                                  <DropdownMenuItem
+                                    className="text-destructive"
+                                    onClick={() => {
+                                      console.log("Reject transfer:", t.id);
 
-                                    handleTransferAction(t.id, "REJECT");
-                                  }}
-                                >
-                                  <X className="mr-2 h-4 w-4" />
-                                  Reject
-                                </DropdownMenuItem>
-                              </>
-                            )}
+                                      handleTransferAction(t.id, "REJECT");
+                                    }}
+                                  >
+                                    <X className="mr-2 h-4 w-4" />
+                                    Reject
+                                  </DropdownMenuItem>
+                                </>
+                              )}
 
                             {t.status === "UPLOADING" && (
                               <DropdownMenuItem
@@ -384,7 +463,7 @@ export function TransfersPage() {
                               </DropdownMenuItem>
                             )}
 
-                            <DropdownMenuItem
+                            {/* <DropdownMenuItem
                               className="text-destructive"
                               onClick={() =>
                                 controls.mutate({
@@ -394,7 +473,7 @@ export function TransfersPage() {
                               }
                             >
                               Cancel
-                            </DropdownMenuItem>
+                            </DropdownMenuItem> */}
 
                             {t.sentByMe && t.status === "PENDING" && (
                               <DropdownMenuItem

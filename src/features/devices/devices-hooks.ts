@@ -51,13 +51,14 @@ export function useMyDevices() {
   });
 }
 
-export function useOrganizationMembers() {
+export function useOrganizationMembers(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ORGANIZATION_MEMBERS_KEY,
     queryFn: async () => {
       const { data } = await api.get<OrganizationMember[]>('/members');
       return data;
     },
+    enabled: options?.enabled ?? true,
     staleTime: 30_000,
   });
 }

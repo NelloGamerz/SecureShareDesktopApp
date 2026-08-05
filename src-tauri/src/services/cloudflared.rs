@@ -1,3 +1,4 @@
+use crate::utils::config::AppConfig;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -183,7 +184,7 @@ impl CloudflaredService {
         info!("ARCH: {}", arch);
 
         let relative_path = match (os, arch) {
-            ("windows", "x86_64") => "resources/cloudflared/windows-x64/cloudflared.exe",
+            ("windows", "x86_64") => "cloudflared/windows-x64/cloudflared.exe",
             ("macos", "x86_64") => "cloudflared/macos-x64/cloudflared",
             ("macos", "aarch64") => "cloudflared/macos-arm64/cloudflared",
             ("linux", "x86_64") => "cloudflared/linux-x64/cloudflared",
@@ -193,21 +194,39 @@ impl CloudflaredService {
 
         info!("Expected relative resource path: {}", relative_path);
 
-        let path = if cfg!(debug_assertions) {
-            info!("Running in DEBUG mode");
+        let config = if cfg!(debug_assertions) {
+            AppConfig::development()
+        } else {
+            AppConfig::production()
+        };
+
+        // let path = if cfg!(debug_assertions) {
+        //     info!("Running in DEBUG mode");
+        let path = if config.environment == "development" {
+            info!("Running in DEVELOPMENT");
 
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             info!("Current working directory: {:?}", cwd);
 
             cwd.join("resources").join(relative_path)
         } else {
-            info!("Running in RELEASE mode");
+            // info!("Running in RELEASE mode");
 
-            let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+            // let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
 
-            info!("Resource directory: {:?}", resource_dir);
+            // info!("Resource directory: {:?}", resource_dir);
 
-            resource_dir.join(relative_path)
+            // resource_dir.join(relative_path)
+            info!("Running in PRODUCTION");
+
+            // resources/cloudflared/windows-x64/cloudflared.exe
+            let exe_dir = std::env::current_exe()
+                .map_err(|e| e.to_string())?
+                .parent()
+                .ok_or("Failed to get executable directory")?
+                .to_path_buf();
+
+            exe_dir.join("resources").join(relative_path)
         };
 
         info!("Looking for cloudflared binary at:");

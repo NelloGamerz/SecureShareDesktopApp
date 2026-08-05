@@ -25,6 +25,59 @@ export type BillingInvoice = {
 export type BillingInvoicesResponse = BillingInvoice[] | { invoices?: BillingInvoice[]; data?: BillingInvoice[]; items?: BillingInvoice[] };
 export type BillingUsageResponse = BillingUsageSummary | { usage?: BillingUsageSummary; data?: BillingUsageSummary; summary?: BillingUsageSummary };
 
+export type RazorpayOrderPayload = {
+  billingCycle: 'monthly' | 'yearly';
+  planType?: 'individual' | 'team';
+  amount?: number;
+  currency?: string;
+  description?: string;
+};
+
+export type RazorpayOrderResponse = {
+  id?: string;
+  orderId?: string;
+  keyId?: string;
+  key?: string;
+  amount?: number;
+  currency?: string;
+  receipt?: string;
+  status?: string;
+  notes?: Record<string, string>;
+};
+
+export type RazorpayVerificationPayload = {
+  orderId: string;
+  paymentId: string;
+  signature: string;
+  billingCycle?: 'monthly' | 'yearly';
+  planType?: 'individual' | 'team';
+};
+
+export type RazorpayVerificationResponse = {
+  success: boolean;
+  message?: string;
+  status?: string;
+};
+
+export async function createRazorpayOrder(payload: RazorpayOrderPayload): Promise<RazorpayOrderResponse> {
+  const { data } = await api.post<RazorpayOrderResponse>('/billing/razorpay/order', payload);
+  return {
+    id: data.id ?? data.orderId,
+    orderId: data.orderId ?? data.id,
+    keyId: data.keyId ?? data.key,
+    amount: data.amount,
+    currency: data.currency,
+    receipt: data.receipt,
+    status: data.status,
+    notes: data.notes,
+  };
+}
+
+export async function verifyRazorpayPayment(payload: RazorpayVerificationPayload): Promise<RazorpayVerificationResponse> {
+  const { data } = await api.post<RazorpayVerificationResponse>('/billing/razorpay/verify', payload);
+  return data;
+}
+
 export async function fetchBillingUsageSummary(): Promise<BillingUsageSummary> {
   const endpoints = ['/billing/usage-summary', '/billing/usage', '/billing/summary'];
 

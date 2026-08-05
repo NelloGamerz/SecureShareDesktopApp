@@ -3,7 +3,6 @@ import {
   Building2,
   CalendarDays,
   Check,
-  Clock3,
   Globe,
   HardDrive,
   Mail,
@@ -12,7 +11,6 @@ import {
   Pencil,
   Plus,
   ShieldCheck,
-  Trash2,
   UserPlus,
   Users,
   // X,
@@ -57,6 +55,8 @@ import type {
   MemberRole,
 } from "./organization-api";
 import { useCanAccessBilling, useCurrentUserProfile } from "../auth/auth-hooks";
+import { useMyDevices } from "@/features/devices/devices-hooks";
+import { formatDate } from "../billing/billing-page";
 // import { formatRelativeTime } from "@/lib/format";
 
 const roleVariant: Record<MemberRole, "default" | "secondary"> = {
@@ -124,6 +124,7 @@ export function OrganizationPage() {
   const isOrganization = org?.type === "ORGANIZATION";
 
   const { data: profile, isLoading: profileLoading } = useCurrentUserProfile();
+  const { data: myDevices = [] } = useMyDevices();
   const { canAccessBilling } = useCanAccessBilling();
   const navigate = useNavigate();
 
@@ -185,33 +186,25 @@ export function OrganizationPage() {
     (inv) => inv.status === "PENDING",
   ).length;
 
-  // TODO: replace the placeholder personal stats below when the account
-  // metadata endpoint exposes last login, account status, and member since.
   const personalAccountStats = [
     {
       icon: HardDrive,
       label: "Connected Devices",
-      value: "—",
-    },
-    {
-      icon: Clock3,
-      label: "Last Login",
-      value: "—",
+      value: myDevices.length,
     },
     {
       icon: ShieldCheck,
       label: "Account Status",
-      value: "—",
+      value: org?.status || "Unknown",
     },
     {
       icon: CalendarDays,
       label: "Member Since",
-      value: "—",
+      value: formatDate(stats?.joinedAt),
     },
   ];
 
-  // TODO: wire this section to the future devices API for personal accounts.
-  const connectedDevices: Array<{ id: string; name: string; detail?: string }> = [];
+  const connectedDevices = myDevices;
 
   if (isLoading) {
     return (
@@ -319,7 +312,7 @@ export function OrganizationPage() {
   return (
     <PageContainer>
       <PageHeader
-        title="Organization"
+        title={isOrganization ? "Organization" : "Workspace"}
         description={
           isOrganization
             ? "Manage your organization's profile, members, and invitations."
@@ -399,57 +392,56 @@ export function OrganizationPage() {
         </div>
       )}
 
-      <div className="mt-4 grid gap-6 lg:grid-cols-3">
-        <div className="space-y-6 lg:col-span-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Profile</CardTitle>
-              <CardDescription>
-                {isOrganization
-                  ? "Organization details and contact information."
-                  : "Personal account details."}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Profile</CardTitle>
+            <CardDescription>
+              {isOrganization
+                ? "Organization details and contact information."
+                : "Personal account details."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center gap-4">
               <div className="flex items-center gap-4">
-                <div className="flex items-center gap-4">
-                  <Avatar className="h-14 w-14 rounded-2xl">
-                    <AvatarFallback className="rounded-2xl bg-primary text-primary-foreground">
-                      <Building2 className="h-7 w-7" />
-                    </AvatarFallback>
-                  </Avatar>
+                <Avatar className="h-14 w-14 rounded-2xl">
+                  <AvatarFallback className="rounded-2xl bg-primary text-primary-foreground">
+                    <Building2 className="h-7 w-7" />
+                  </AvatarFallback>
+                </Avatar>
 
-                  <div>
-                    <h2 className="text-lg font-semibold">{org.name}</h2>
-                    <Badge variant="secondary" className="mt-1 capitalize">
-                      {org.type.toLowerCase()}
-                    </Badge>
-                  </div>
+                <div>
+                  <h2 className="text-lg font-semibold">{org.name}</h2>
+                  <Badge variant="secondary" className="mt-1 capitalize">
+                    {org.type.toLowerCase()}
+                  </Badge>
                 </div>
               </div>
+            </div>
 
-              {isOrganization && (
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <DetailRow
-                    icon={Building2}
-                    label="Organization"
-                    value={org.name}
-                  />
+            {isOrganization && (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <DetailRow
+                  icon={Building2}
+                  label="Organization"
+                  value={org.name}
+                />
 
-                  <DetailRow
-                    icon={Globe}
-                    label="Industry"
-                    value={org.industry}
-                  />
+                <DetailRow
+                  icon={Globe}
+                  label="Industry"
+                  value={org.industry}
+                />
 
-                  <DetailRow
-                    icon={Users}
-                    label="Team size"
-                    value={org.team_size?.toString()}
-                  />
+                <DetailRow
+                  icon={Users}
+                  label="Team size"
+                  value={org.team_size?.toString()}
+                />
 
-                  {/* Uncomment if available */}
-                  {/* <DetailRow
+                {/* Uncomment if available */}
+                {/* <DetailRow
       icon={MapPin}
       label="Location"
       value={[org.city, org.country].filter(Boolean).join(", ")}
@@ -466,172 +458,163 @@ export function OrganizationPage() {
       label="Contact email"
       value={org.contact_email}
     /> */}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {isOrganization ? (
+          <Card>
+            <CardHeader className="flex-row items-center justify-between space-y-0">
+              <div>
+                <CardTitle className="text-base">Members</CardTitle>
+                <CardDescription>
+                  {members.length} people in this organization
+                </CardDescription>
+              </div>
+              <Button variant="ghost" size="sm" asChild>
+                <Link to="/members">View all</Link>
+              </Button>
+            </CardHeader>
+            <CardContent className="p-0">
+              <div className="divide-y">
+                {members.slice(0, 5).map((m) => (
+                  <div key={m.id} className="flex items-center gap-3 px-6 py-3">
+                    <Avatar className="h-9 w-9">
+                      <AvatarFallback className="bg-muted text-xs font-medium">
+                        {m.name
+                          .split(" ")
+                          .map((p) => p[0])
+                          .join("")
+                          .slice(0, 2)
+                          .toUpperCase()}
+                      </AvatarFallback>
+                    </Avatar>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium">{m.name}</p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {m.email}
+                      </p>
+                    </div>
+                    <Badge
+                      variant={roleVariant[m.role] ?? "default"}
+                      className="capitalize"
+                    >
+                      {m.role}
+                    </Badge>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Connected Devices</CardTitle>
+              <CardDescription>
+                Devices currently signed in to your account.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="p-0">
+              {connectedDevices.length === 0 ? (
+                <div className="px-6 py-8 text-center">
+                  <p className="text-sm text-muted-foreground">
+                    No connected device information available.
+                  </p>
+                </div>
+              ) : (
+                <div className="divide-y">
+                  {connectedDevices.map((device) => (
+                    <div
+                      key={device.id}
+                      className="flex items-center gap-3 px-6 py-3"
+                    >
+                      <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted">
+                        <HardDrive className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium">
+                          {device.deviceName}
+                        </p>
+                        <p className="truncate text-xs text-muted-foreground">
+                          {device.operatingSystem} · {device.status}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
             </CardContent>
           </Card>
-
-          {isOrganization && (
-            <Card>
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-base">Members</CardTitle>
-                  <CardDescription>
-                    {members.length} people in this organization
-                  </CardDescription>
-                </div>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/members">View all</Link>
-                </Button>
-              </CardHeader>
-              <CardContent className="p-0">
-                <div className="divide-y">
-                  {members.slice(0, 5).map((m) => (
-                    <div key={m.id} className="flex items-center gap-3 px-6 py-3">
-                      <Avatar className="h-9 w-9">
-                        <AvatarFallback className="bg-muted text-xs font-medium">
-                          {m.name
-                            .split(" ")
-                            .map((p) => p[0])
-                            .join("")
-                            .slice(0, 2)
-                            .toUpperCase()}
-                        </AvatarFallback>
-                      </Avatar>
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">{m.name}</p>
-                        <p className="truncate text-xs text-muted-foreground">
-                          {m.email}
-                        </p>
-                      </div>
-                      <Badge
-                        variant={roleVariant[m.role] ?? "default"}
-                        className="capitalize"
-                      >
-                        {m.role}
-                      </Badge>
-                    </div>
+        )}
+        {/* <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Invitation history</CardTitle>
+            <CardDescription>
+              Track sent invitations and their status.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="p-0">
+            {invitationsLoading ? (
+              <div className="space-y-2 p-6">
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+              </div>
+            ) : invitations.length === 0 ? (
+              <p className="px-6 py-8 text-center text-sm text-muted-foreground">
+                No invitations sent yet.
+              </p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Email</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead className="w-20">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {invitations.map((inv) => (
+                    <InvitationRow
+                      key={inv.id}
+                      invitation={inv}
+                      onAccept={() => handleAccept(inv.id, inv.email)}
+                      onReject={() => handleReject(inv.id, inv.email)}
+                      acceptLoading={respondMutation.isPending}
+                      rejectLoading={respondMutation.isPending}
+                    />
                   ))}
-                </div>
-              </CardContent>
-            </Card>
-          )}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card> */}
 
-          {!isOrganization && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Connected Devices</CardTitle>
-                <CardDescription>
-                  Devices currently signed in to your account.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="p-0">
-                {connectedDevices.length === 0 ? (
-                  <div className="px-6 py-8 text-center">
-                    <p className="text-sm text-muted-foreground">
-                      No connected device information available.
-                    </p>
-                    {/* TODO: replace this empty state with the future devices API response once per-account device sessions are exposed. */}
-                  </div>
-                ) : (
-                  <div className="divide-y">
-                    {connectedDevices.map((device) => (
-                      <div
-                        key={device.id}
-                        className="flex items-center gap-3 px-6 py-3"
-                      >
-                        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted">
-                          <HardDrive className="h-4 w-4 text-muted-foreground" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm font-medium">
-                            {device.name}
-                          </p>
-                          {device.detail && (
-                            <p className="truncate text-xs text-muted-foreground">
-                              {device.detail}
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          )}
-        </div>
-
-        <div className="space-y-6">
-          {/* <Card>
+        {/* {isOrganization && canAccessBilling && (
+          <Card className="border-destructive/30">
             <CardHeader>
-              <CardTitle className="text-base">Invitation history</CardTitle>
-              <CardDescription>
-                Track sent invitations and their status.
-              </CardDescription>
+              <CardTitle className="text-base text-destructive">
+                Danger zone
+              </CardTitle>
             </CardHeader>
-            <CardContent className="p-0">
-              {invitationsLoading ? (
-                <div className="space-y-2 p-6">
-                  <Skeleton className="h-10 w-full" />
-                  <Skeleton className="h-10 w-full" />
-                  <Skeleton className="h-10 w-full" />
-                </div>
-              ) : invitations.length === 0 ? (
-                <p className="px-6 py-8 text-center text-sm text-muted-foreground">
-                  No invitations sent yet.
-                </p>
-              ) : (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Email</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead className="w-20">Actions</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {invitations.map((inv) => (
-                      <InvitationRow
-                        key={inv.id}
-                        invitation={inv}
-                        onAccept={() => handleAccept(inv.id, inv.email)}
-                        onReject={() => handleReject(inv.id, inv.email)}
-                        acceptLoading={respondMutation.isPending}
-                        rejectLoading={respondMutation.isPending}
-                      />
-                    ))}
-                  </TableBody>
-                </Table>
-              )}
+            <CardContent>
+              <p className="text-xs text-muted-foreground">
+                Deleting your organization is permanent and removes all members
+                and invitations.
+              </p>
+              <Button
+                variant="destructive"
+                size="sm"
+                className="mt-3"
+                onClick={() => setDeleteOpen(true)}
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete organization
+              </Button>
             </CardContent>
-          </Card> */}
-
-          {isOrganization && canAccessBilling && (
-            <Card className="border-destructive/30">
-              <CardHeader>
-                <CardTitle className="text-base text-destructive">
-                  Danger zone
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <p className="text-xs text-muted-foreground">
-                  Deleting your organization is permanent and removes all members
-                  and invitations.
-                </p>
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  className="mt-3"
-                  onClick={() => setDeleteOpen(true)}
-                >
-                  <Trash2 className="h-4 w-4" />
-                  Delete organization
-                </Button>
-              </CardContent>
-            </Card>
-          )}
-        </div>
+          </Card>
+        )} */}
       </div>
 
       {/* Dialogs */}

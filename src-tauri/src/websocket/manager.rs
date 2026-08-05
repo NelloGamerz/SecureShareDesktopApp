@@ -49,7 +49,8 @@ pub struct WebSocketManager {
         Mutex<Option<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>,
     >,
     pub sender: Arc<Mutex<Option<WebSocketSender>>>,
-    pub shutdown: CancellationToken,
+    // pub shutdown: CancellationToken,
+    pub shutdown: Arc<Mutex<CancellationToken>>,
     pub status: Arc<RwLock<ConnectionStatus>>,
     pub reconnect_attempt: Arc<Mutex<u32>>,
     pub task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -67,7 +68,8 @@ impl WebSocketManager {
             event_dispatcher,
             connection: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
-            shutdown: CancellationToken::new(),
+            // shutdown: CancellationToken::new(),
+            shutdown: Arc::new(Mutex::new(CancellationToken::new())),
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             reconnect_attempt: Arc::new(Mutex::new(0)),
             task_handle: Arc::new(Mutex::new(None)),
@@ -96,7 +98,16 @@ impl WebSocketManager {
 
         // let shutdown = CancellationToken::new();
 
-        let shutdown = self.shutdown.clone();
+        // let shutdown = self.shutdown.clone();
+        let shutdown = {
+            let mut guard = self.shutdown.lock().await;
+
+            if guard.is_cancelled() {
+                *guard = CancellationToken::new();
+            }
+
+            guard.clone()
+        };
         let config = self.config.clone();
         let connection = self.connection.clone();
         let sender = self.sender.clone();
@@ -118,7 +129,7 @@ impl WebSocketManager {
                 println!("WEBSOCKET LOOP START - ATTEMPT {}", attempt);
 
                 if shutdown.is_cancelled() {
-                    println!("WEBSOCKET SHUTDOWN REQUESTED");
+                    println!("SHUTDOWN DURING INTERNET WAIT");
                     break;
                 }
 
@@ -153,11 +164,22 @@ impl WebSocketManager {
 
                 println!("TOKEN AVAILABLE IN LOOP: {}", token.is_some());
 
+                // let token = match token {
+                //     Some(token) => token,
+                //     None => {
+                //         println!("NO TOKEN AVAILABLE");
+                //         break;
+                //     }
+                // };
+
                 let token = match token {
                     Some(token) => token,
                     None => {
-                        println!("NO TOKEN AVAILABLE");
-                        break;
+                        println!("NO TOKEN AVAILABLE - WAITING");
+
+                        sleep(std::time::Duration::from_secs(5)).await;
+
+                        continue;
                     }
                 };
 
@@ -250,7 +272,6 @@ impl WebSocketManager {
 
                         println!("WAITING FOR OUTGOING MESSAGES");
 
-
                         tokio::pin!(receive_dispatch);
                         tokio::pin!(heartbeat_task);
 
@@ -322,6 +343,11 @@ impl WebSocketManager {
 
                         attempt += 1;
 
+                        if shutdown.is_cancelled() {
+                            println!("NOT RECONNECTING BECAUSE SHUTDOWN WAS REQUESTED");
+                            break;
+                        }
+
                         {
                             let mut reconnect_guard = reconnect_attempt.lock().await;
                             *reconnect_guard = attempt;
@@ -392,7 +418,11 @@ impl WebSocketManager {
 
     pub async fn stop(&self) -> Result<(), AppError> {
         tracing::info!(target: "websocket", event = "stop_requested", "websocket manager stop requested");
-        self.shutdown.cancel();
+        // self.shutdown.cancel();
+        {
+            let guard = self.shutdown.lock().await;
+            guard.cancel();
+        }
         if let Some(handle) = self.task_handle.lock().await.take() {
             let _ = handle.await;
         }

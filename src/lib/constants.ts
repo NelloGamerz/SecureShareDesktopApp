@@ -37,7 +37,6 @@ export const navItems: NavItem[] = [
     to: '/transfers',
     icon: ArrowLeftRight,
     description: 'File transfer history and status',
-    badge: 'New',
   },
   {
     title: 'Devices',
