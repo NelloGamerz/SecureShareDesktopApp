@@ -2,8 +2,6 @@ export const env = {
   clerkPublishableKey: import.meta.env.VITE_CLERK_PUBLISHABLE_KEY ?? '',
   apiBaseUrl: import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000',
   appName: import.meta.env.VITE_APP_NAME ?? 'Helix',
-  supabaseUrl: import.meta.env.VITE_SUPABASE_URL ?? '',
-  supabaseAnonKey: import.meta.env.VITE_SUPABASE_ANON_KEY ?? '',
 } as const;
 
 export const isClerkConfigured = Boolean(
