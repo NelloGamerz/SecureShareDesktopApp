@@ -72,6 +72,26 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Check frontend env
+        shell: bash
+        run: |
+          echo "CLERK KEY EXISTS:"
+          if [ -z "$VITE_CLERK_PUBLISHABLE_KEY" ]; then
+            echo "MISSING"
+          else
+            echo "FOUND"
+          fi
+
+          echo "API URL:"
+          echo "$VITE_API_BASE_URL"
+
+          echo "APP NAME:"
+          echo "$VITE_APP_NAME"
+        env:
+          VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+          VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
+
       - name: Build frontend
         run: npm run build
         env:
