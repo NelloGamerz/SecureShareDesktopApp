@@ -28,19 +28,45 @@ jobs:
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      RUSTC_WRAPPER: sccache
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Node + npm cache
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
+      # Rust toolchain
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # Rust compiler cache
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Cargo registry + build cache
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cache Tauri CLI binary
+      - name: Cache Cargo bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-bin-tauri
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-latest'
@@ -56,11 +82,14 @@ jobs:
         run: npm ci
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2"
+        shell: bash
+        run: |
+          if ! command -v cargo-tauri >/dev/null 2>&1; then
+            cargo install tauri-cli --version "^2"
+          fi
 
       - name: Build Tauri app
-        run: |
-          cargo tauri build --config src-tauri/${{ matrix.config }}
+        run: cargo tauri build --config src-tauri/${{ matrix.config }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
