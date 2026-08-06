@@ -21,8 +21,9 @@ use tauri_plugin_log::{log, Builder as LogBuilder, Target, TargetKind};
 
 use commands::auth::{
     clear_all, delete_tunnel_hostname, delete_tunnel_token, get_connection_status,
-    get_tunnel_hostname, get_tunnel_token, login, logout, save_tunnel_hostname, save_tunnel_token,
-    send_message, start_websocket, update_auth_token,
+    get_default_download_location, get_tunnel_hostname, get_tunnel_token, login, logout,
+    save_tunnel_hostname, save_tunnel_token, send_message, set_default_download_location,
+    start_websocket, update_auth_token,
 };
 
 use commands::transfer_commands::{
@@ -256,6 +257,8 @@ pub fn run() {
             save_tunnel_token,
             get_tunnel_token,
             delete_tunnel_token,
+            get_default_download_location,
+            set_default_download_location,
             start_transfer,
             pause_transfer,
             resume_transfer,

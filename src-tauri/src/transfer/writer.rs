@@ -10,6 +10,7 @@ use axum::{
     Json,
 };
 use tauri::Manager as _;
+use tauri_plugin_store::StoreExt;
 
 use crate::services::keyring_service::KeyringService;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -23,6 +24,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use sysinfo::{Disks, System};
 
 use std::sync::atomic::Ordering;
 use tokio::fs;
@@ -61,6 +63,45 @@ fn header(headers: &HeaderMap, name: &str) -> Result<String, (StatusCode, String
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
         .ok_or((StatusCode::BAD_REQUEST, format!("missing {name}")))
+}
+
+fn resolve_download_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let store = app
+        .store("settings.json")
+        .map_err(|error| format!("failed to open settings store: {error}"))?;
+
+    if let Some(value) = store.get("default_download_location") {
+        if let Some(path) = value.as_str() {
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+
+    app.path()
+        .download_dir()
+        .map_err(|error| format!("failed to resolve Downloads folder: {error}"))
+}
+
+
+fn check_receiver_storage(path: &Path, _required_bytes: u64) -> Result<u64, String> {
+    let path = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    };
+
+    let disks = Disks::new_with_refreshed_list();
+
+    for disk in disks.list() {
+        if path.starts_with(disk.mount_point()) {
+            return Ok(disk.available_space());
+        }
+    }
+
+    Err("unable to determine receiver storage availability".into())
 }
 
 pub async fn start_transfer(
@@ -109,6 +150,97 @@ pub async fn start_transfer(
         transfer_id = %request.transfer_id,
         "sender public key decoded"
     );
+
+    if state
+        .downloads
+        .read()
+        .await
+        .contains_key(&request.transfer_id)
+    {
+        tracing::warn!(
+            transfer_id = %request.transfer_id,
+            "duplicate transfer request rejected"
+        );
+
+        let duplicate = Arc::new(DownloadState {
+            transfer_id: request.transfer_id.clone(),
+            total_bytes: request.file_size,
+            received_bytes: AtomicU64::new(0),
+            total_chunks: 0,
+            received_chunks: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            started_at: std::time::Instant::now(),
+            status: Mutex::new(TransferStatus::Failed),
+        });
+
+        events::emit_progress(
+            &state.app,
+            "transfer-failed",
+            progress::make_download(&duplicate),
+        );
+
+        return Err((
+            StatusCode::CONFLICT,
+            format!("transfer {} is already active", request.transfer_id),
+        ));
+    }
+
+    let destination_root = resolve_download_root(&state.app).map_err(|e| {
+        tracing::error!(
+            transfer_id = %request.transfer_id,
+            error = %e,
+            "failed to resolve receiver download root"
+        );
+
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
+
+    let available_space =
+        check_receiver_storage(&destination_root, request.file_size).map_err(|e| {
+            tracing::error!(
+                transfer_id = %request.transfer_id,
+                error = %e,
+                "failed to determine receiver storage availability"
+            );
+
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+
+    if available_space < request.file_size {
+        tracing::warn!(
+            transfer_id = %request.transfer_id,
+            required_bytes = request.file_size,
+            available_bytes = available_space,
+            "receiver does not have enough free storage"
+        );
+
+        let insufficient = Arc::new(DownloadState {
+            transfer_id: request.transfer_id.clone(),
+            total_bytes: request.file_size,
+            received_bytes: AtomicU64::new(0),
+            total_chunks: 0,
+            received_chunks: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            started_at: std::time::Instant::now(),
+            status: Mutex::new(TransferStatus::Failed),
+        });
+
+        events::emit_progress(
+            &state.app,
+            "transfer-failed",
+            progress::make_download(&insufficient),
+        );
+
+        return Err((
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!(
+                "insufficient storage for receiver: requires {} bytes, has {} bytes available",
+                request.file_size, available_space
+            ),
+        ));
+    }
 
     /*
      * Load receiver private key
@@ -190,7 +322,7 @@ pub async fn start_transfer(
     let download = Arc::new(DownloadState {
         transfer_id: request.transfer_id.clone(),
 
-        total_bytes: 0,
+        total_bytes: request.file_size,
         received_bytes: AtomicU64::new(0),
 
         total_chunks: 0,
@@ -597,12 +729,8 @@ pub async fn receive(
             "all chunks received"
         );
 
-        let downloads = state.app.path().download_dir().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to locate Downloads folder: {e}"),
-            )
-        })?;
+        let downloads = resolve_download_root(&state.app)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         let destination = downloads.join(relative_path);
         merger::merge(&parts, &destination, total)

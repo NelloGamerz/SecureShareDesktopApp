@@ -1,5 +1,7 @@
 import { motion } from 'framer-motion';
-import { Moon, Palette, User } from 'lucide-react';
+import { Download, Moon, Palette, User } from 'lucide-react';
+import { open } from '@tauri-apps/plugin-dialog';
+import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -11,11 +13,34 @@ import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { PageContainer, PageHeader } from '@/components/layout/page-header';
 import { useUIStore } from '@/store/ui-store';
 import { useCurrentUser } from '@/providers/auth-guard';
+import { getDefaultDownloadLocation, setDefaultDownloadLocation } from '@/api/tauri';
 
 export function SettingsPage() {
   const theme = useUIStore((s) => s.theme);
   const toggleTheme = useUIStore((s) => s.toggleTheme);
   const user = useCurrentUser();
+  const [downloadLocation, setDownloadLocation] = useState<string>('');
+
+  useEffect(() => {
+    void getDefaultDownloadLocation().then((path) => setDownloadLocation(path)).catch(() => {
+      setDownloadLocation('');
+    });
+  }, []);
+
+  const handleChooseDownloadLocation = async () => {
+    const selectedPath = await open({
+      directory: true,
+      multiple: false,
+      title: 'Choose default download location',
+    });
+
+    if (!selectedPath) {
+      return;
+    }
+
+    await setDefaultDownloadLocation(selectedPath);
+    setDownloadLocation(selectedPath);
+  };
 
   return (
     <PageContainer>
@@ -76,8 +101,28 @@ export function SettingsPage() {
                   <Label htmlFor="email">Email</Label>
                   <Input id="email" type="email" defaultValue={user.email} />
                 </div>
-                <div className="flex justify-end">
+                {/* <div className="flex justify-end">
                   <Button size="sm">Save changes</Button>
+                </div> */}
+              </CardContent>
+            </Card>
+
+            <Card className="mt-6 max-w-2xl">
+              <CardHeader>
+                <CardTitle className="text-base">Default download location</CardTitle>
+                <CardDescription>
+                  Choose where transfers should be saved by default. If you leave this unset, the Windows Downloads folder is used.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-center gap-3 rounded-md border bg-muted/30 p-3 text-sm">
+                  <Download className="h-4 w-4 text-muted-foreground" />
+                  <span className="truncate">{downloadLocation || 'Downloads'}</span>
+                </div>
+                <div className="flex justify-end">
+                  <Button variant="outline" size="sm" onClick={handleChooseDownloadLocation}>
+                    Choose folder
+                  </Button>
                 </div>
               </CardContent>
             </Card>

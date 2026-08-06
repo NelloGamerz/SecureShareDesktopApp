@@ -114,12 +114,15 @@ impl UploadManager {
             "sender transfer key fingerprint"
         );
 
+        let total_bytes = files.iter().map(|f| f.size).sum();
+
         client
             .start_transfer(
                 &metadata.endpoint,
                 &metadata.auth_token,
                 &metadata.transfer_id,
                 &crypto::encode_public_key(&ephemeral.public_key),
+                total_bytes,
             )
             .await?;
         let state = Arc::new(UploadState {
@@ -128,7 +131,7 @@ impl UploadManager {
             sender_ephemeral_public_key: ephemeral.public_key,
             endpoint: metadata.endpoint.clone(),
             network_type: metadata.network_type.clone(),
-            total_bytes: files.iter().map(|f| f.size).sum(),
+            total_bytes,
             uploaded_bytes: 0.into(),
             total_chunks: jobs.len() as u64,
             uploaded_chunks: 0.into(),

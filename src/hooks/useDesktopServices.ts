@@ -15,6 +15,7 @@ import {
 import { useNotificationStore } from "@/store/notification-store";
 import { useCurrentUserProfile } from "@/features/auth/auth-hooks";
 import { registerCurrentDevice } from "@/features/devices/devices-api";
+import { useTransferRequestStore } from "@/store/transfer-request-store";
 
 export function useDesktopServices() {
   const { isLoaded, isSignedIn } = useClerkAuth();
@@ -155,6 +156,9 @@ export function useDesktopServices() {
     const setupTransferListener = async () => {
       unlisten = await onTransferRequest((request) => {
         console.log("Transfer event received", request);
+
+        useTransferRequestStore.getState().addRequest(request);
+
         useNotificationStore.getState().addNotification({
           id: crypto.randomUUID(),
           kind: "transfer",

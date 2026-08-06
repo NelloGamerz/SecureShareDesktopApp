@@ -104,8 +104,31 @@ export function onTransferEvent(
 export function onTransferRequest(
   callback: (request: TransferRequestPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<TransferRequestPayload>("transfer-request", ({ payload }) => {
-    callback(payload);
+  return listen<{
+    transferId?: string;
+    transfer_id?: string;
+    senderDeviceId?: string;
+    sender_device_id?: string;
+    receiverDeviceId?: string;
+    receiver_device_id?: string;
+    fileName?: string;
+    file_name?: string;
+    fileSize?: number;
+    file_size?: number;
+    id?: string;
+  }>("transfer-request", ({ payload }) => {
+    const normalizedRequest: TransferRequestPayload = {
+      id: payload.id ?? payload.transferId ?? payload.transfer_id ?? "",
+      transfer_id: payload.transferId ?? payload.transfer_id ?? payload.id ?? "",
+      sender_device_id:
+        payload.senderDeviceId ?? payload.sender_device_id ?? "",
+      receiver_device_id:
+        payload.receiverDeviceId ?? payload.receiver_device_id ?? "",
+      file_name: payload.fileName ?? payload.file_name ?? "",
+      file_size: payload.fileSize ?? payload.file_size ?? 0,
+    };
+
+    callback(normalizedRequest);
   });
 }
 
@@ -165,4 +188,12 @@ export async function cancelTransfer(id: string) {
 
 export async function detectDeviceType(): Promise<string> {
   return invoke<string>("detect_device_type");
+}
+
+export async function getDefaultDownloadLocation(): Promise<string> {
+  return invoke<string>("get_default_download_location");
+}
+
+export async function setDefaultDownloadLocation(path: string) {
+  return invoke<void>("set_default_download_location", { path });
 }

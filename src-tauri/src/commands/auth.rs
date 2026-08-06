@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
+use serde_json::json;
 use tauri::Emitter;
-// use tauri::State;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_store::StoreExt;
 
 use crate::app::AppState;
 use crate::error::AppError;
@@ -10,6 +11,31 @@ use crate::models::ConnectionStatus;
 use crate::models::DeviceInfo;
 use crate::services::keyring_service::KeyringService;
 // use crate::services::SecureStorage;
+
+const DEFAULT_DOWNLOAD_LOCATION_KEY: &str = "default_download_location";
+
+fn default_download_dir(app: &AppHandle) -> Result<String, String> {
+    app.path()
+        .download_dir()
+        .map(|path: std::path::PathBuf| path.to_string_lossy().to_string())
+        .map_err(|error| format!("failed to resolve downloads folder: {error}"))
+}
+
+fn resolve_download_location(app: &AppHandle) -> Result<String, String> {
+    let store = app.store("settings.json").map_err(|error| {
+        format!("failed to open settings store: {error}")
+    })?;
+
+    if let Some(value) = store.get(DEFAULT_DOWNLOAD_LOCATION_KEY) {
+        if let Some(path) = value.as_str() {
+            if !path.is_empty() {
+                return Ok(path.to_string());
+            }
+        }
+    }
+
+    default_download_dir(app)
+}
 
 #[tauri::command]
 pub async fn login(
@@ -108,6 +134,38 @@ pub fn get_tunnel_hostname(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 pub fn delete_tunnel_hostname(app: AppHandle) -> Result<(), String> {
     KeyringService::delete_hostname(&app)
+}
+
+#[tauri::command]
+pub fn get_default_download_location(app: AppHandle) -> Result<String, String> {
+    resolve_download_location(&app)
+}
+
+#[tauri::command]
+pub fn set_default_download_location(app: AppHandle, path: String) -> Result<(), String> {
+    let destination = if path.trim().is_empty() {
+        default_download_dir(&app)?
+    } else {
+        path
+    };
+
+    let resolved = PathBuf::from(&destination);
+    std::fs::create_dir_all(&resolved).map_err(|error| {
+        format!("failed to create download directory: {error}")
+    })?;
+
+    let store = app.store("settings.json").map_err(|error| {
+        format!("failed to open settings store: {error}")
+    })?;
+    store.set(
+        DEFAULT_DOWNLOAD_LOCATION_KEY.to_string(),
+        json!(resolved.to_string_lossy().to_string()),
+    );
+    store.save().map_err(|error| {
+        format!("failed to persist download location: {error}")
+    })?;
+
+    Ok(())
 }
 
 #[tauri::command]

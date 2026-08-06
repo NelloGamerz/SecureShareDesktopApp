@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct StartTransferRequest {
     pub transfer_id: String,
     pub sender_ephemeral_public_key: String,
+    pub file_size: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,6 +41,7 @@ impl HttpClient {
         token: &str,
         transfer_id: &str,
         sender_ephemeral_public_key: &str,
+        file_size: u64,
     ) -> Result<()> {
         let base = Self::normalize_endpoint(endpoint);
         let url = format!("{base}/transfer/start");
@@ -47,6 +49,7 @@ impl HttpClient {
         let request = StartTransferRequest {
             transfer_id: transfer_id.to_owned(),
             sender_ephemeral_public_key: sender_ephemeral_public_key.to_owned(),
+            file_size,
         };
 
         let response = self
