@@ -163,17 +163,16 @@ jobs:
 
 
 
-      - name: Configure AWS for Cloudflare R2
+      - name: Configure Cloudflare R2 credentials
 
-        uses: aws-actions/configure-aws-credentials@v4
+        run: |
 
-        with:
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> $GITHUB_ENV
 
-          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
 
-          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          echo "AWS_DEFAULT_REGION=auto" >> $GITHUB_ENV
 
-          aws-region: us-east-1
 
 
       - name: Upload versioned release files to R2
