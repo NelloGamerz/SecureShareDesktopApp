@@ -173,8 +173,7 @@ jobs:
 
           aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
-          aws-region: auto
-
+          aws-region: us-east-1
 
 
       - name: Upload versioned release files to R2
