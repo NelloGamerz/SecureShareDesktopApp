@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "com.karan.server-frontend",
+  "bundle": {
+    "resources": [
+      "resources/cloudflared/linux-x64/cloudflared"
+    ]
+  }
+}
