@@ -60,8 +60,7 @@ jobs:
 
       - name: Build Tauri app
         run: |
-          cargo tauri build \
-            --config src-tauri/${{ matrix.config }}
+          cargo tauri build --config src-tauri/${{ matrix.config }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
