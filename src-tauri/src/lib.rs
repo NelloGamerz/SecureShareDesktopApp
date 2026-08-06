@@ -123,10 +123,11 @@ pub fn run() {
 
             let update_app = app.handle().clone();
             let dispatcher = Arc::clone(&app_state.event_dispatcher);
+            let dispatcher2 = Arc::clone(&app_state.event_dispatcher);
 
-            // tauri::async_runtime::spawn(async move {
-            //     handle_pending_update(update_app, dispatcher).await;
-            // });
+            tauri::async_runtime::spawn(async move {
+                handle_pending_update(update_app, dispatcher).await;
+            });
 
             /*
              * Local SQLite storage
@@ -146,7 +147,7 @@ pub fn run() {
              */
 
             tauri::async_runtime::spawn(async move {
-                dispatcher.listen_transfer_events(rx).await;
+                dispatcher2.listen_transfer_events(rx).await;
             });
 
             app.manage(app_state);
