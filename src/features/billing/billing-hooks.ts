@@ -9,10 +9,9 @@ export function useBillingUsageSummary() {
   });
 }
 
-export function useBillingInvoices() {
+export function useBillingInvoices(page = 0, size = 10) {
   return useQuery({
-    queryKey: ['billing', 'invoices'],
-    queryFn: fetchBillingInvoices,
-    staleTime: 30_000,
+    queryKey: ['billing-invoices', page, size],
+    queryFn: () => fetchBillingInvoices(page, size),
   });
 }

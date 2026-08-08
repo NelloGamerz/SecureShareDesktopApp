@@ -6,6 +6,8 @@ export type OrganizationSize = "1-5" | "6-20" | "21-50" | "51-100" | "100+";
 
 export type DeviceType = "DESKTOP" | "MOBILE" | "TABLET" | "LAPTOP" | "UNKNOWN";
 
+export type PlanType = "FREE" | "FREE_TRIAL" | "INDIVIDUAL_PRO" | "ENTERPRISE" | "STARTER" | "BUSINESS" | "ORGANIZATION";
+
 export type Industry =
   | "SOFTWARE"
   | "VIDEO_EDITING"
