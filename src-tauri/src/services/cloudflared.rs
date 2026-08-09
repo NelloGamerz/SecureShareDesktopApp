@@ -279,7 +279,7 @@ impl CloudflaredService {
             e.to_string()
         })?;
         info!("Tauri resource directory: {:?}", resource_dir);
-        let path = resource_dir.join(relative_path);
+        let path = resource_dir.join("resources").join(relative_path);
         info!("Looking for cloudflared binary at:");
         info!("{:?}", path);
         match std::fs::canonicalize(&path) {
