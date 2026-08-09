@@ -92,20 +92,6 @@ jobs:
           VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
           VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
 
-      # - name: Build frontend
-      #   run: npm run build
-      #   env:
-      #     VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
-      #     VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
-      #     VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
-
-      # - name: Verify frontend output
-      #   shell: bash
-      #   run: |
-      #     echo "Checking dist folder"
-      #     ls -la dist
-      #     find dist -maxdepth 2 -type f
-
       - name: Build Tauri App
         uses: tauri-apps/tauri-action@v0
         env:
@@ -183,7 +169,7 @@ jobs:
         run: |
 
           aws s3 cp release/ \
-          s3://${{ secrets.R2_BUCKET_NAME }}/releases/${{ github.ref_name }}/ \
+          s3://${{ secrets.R2_BUCKET }}/releases/${{ github.ref_name }}/ \
           --recursive \
           --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
 
@@ -194,5 +180,5 @@ jobs:
         run: |
 
           aws s3 cp release/latest.json \
-          s3://${{ secrets.R2_BUCKET_NAME }}/latest.json \
+          s3://${{ secrets.R2_BUCKET }}/latest.json \
           --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
