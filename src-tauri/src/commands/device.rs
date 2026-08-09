@@ -41,37 +41,6 @@ pub async fn detect_device_type() -> String {
     "UNKNOWN".into()
 }
 
-// #[cfg(target_os = "windows")]
-// fn detect_windows_device_type() -> String {
-
-//     use std::process::Command;
-
-//     let output = Command::new("powershell")
-//         .args([
-//             "-Command",
-//             "Get-CimInstance Win32_Battery"
-//         ])
-//         .output();
-
-//     match output {
-
-//         Ok(result) => {
-
-//             let battery = String::from_utf8_lossy(
-//                 &result.stdout
-//             );
-
-//             if !battery.trim().is_empty() {
-//                 return "LAPTOP".into();
-//             }
-
-//             "DESKTOP".into()
-//         }
-
-//         Err(_) => "UNKNOWN".into()
-//     }
-// }
-
 #[cfg(target_os = "windows")]
 fn detect_windows_device_type() -> String {
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
