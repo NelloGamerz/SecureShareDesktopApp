@@ -191,7 +191,7 @@ export function SettingsPage() {
             <Card className="max-w-2xl">
               <CardHeader>
                 <CardTitle className="text-base">Appearance</CardTitle>
-                <CardDescription>Customize how Helix looks on your device.</CardDescription>
+                <CardDescription>Customize how VilSend looks on your device.</CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="flex items-center justify-between">

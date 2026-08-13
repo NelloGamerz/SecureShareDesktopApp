@@ -43,7 +43,7 @@ export const useUIStore = create<UIState>()(
       setTheme: (theme) => set({ theme }),
     }),
     {
-      name: "helix-ui",
+      name: "vilsend-ui",
       partialize: (s) => ({
         sidebarCollapsed: s.sidebarCollapsed,
         theme: s.theme,

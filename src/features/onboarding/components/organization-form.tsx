@@ -147,7 +147,7 @@ export function OrganizationForm({ defaults, onChange }: OrganizationFormProps) 
           />
         </div>
 
-        <FormField
+        {/* <FormField
           control={form.control}
           name="workspaceSlug"
           render={({ field }) => (
@@ -169,7 +169,7 @@ export function OrganizationForm({ defaults, onChange }: OrganizationFormProps) 
               <FormMessage />
             </FormItem>
           )}
-        />
+        /> */}
       </form>
     </Form>
   );

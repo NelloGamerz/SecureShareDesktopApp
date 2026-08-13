@@ -71,5 +71,5 @@ export const navItems: NavItem[] = [
   },
 ];
 
-export const APP_NAME = 'Helix';
+export const APP_NAME = 'VilSend';
 export const APP_TAGLINE = 'Secure Transfer & Device Management';

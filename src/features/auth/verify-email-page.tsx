@@ -32,7 +32,7 @@ export function VerifyEmailPage() {
         <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-primary-foreground">
           <ArrowLeftRight className="h-5 w-5" />
         </div>
-        <span className="text-lg font-semibold tracking-tight">Helix</span>
+        <span className="text-lg font-semibold tracking-tight">VilSend</span>
       </Link>
 
       {verified ? (

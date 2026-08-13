@@ -232,20 +232,20 @@ pub fn run() {
                 }
             }
 
-            match KeyringService::get_device_private_key(app.handle()) {
-                Ok(private_key) => {
-                    tracing::info!(
-                        device_private_key = %private_key,
-                        "Loaded device private key"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "Device private key not found"
-                    );
-                }
-            }
+            // match KeyringService::get_device_private_key(app.handle()) {
+            //     Ok(private_key) => {
+            //         tracing::info!(
+            //             device_private_key = %private_key,
+            //             "Loaded device private key"
+            //         );
+            //     }
+            //     Err(err) => {
+            //         tracing::warn!(
+            //             error = %err,
+            //             "Device private key not found"
+            //         );
+            //     }
+            // }
 
             Ok(())
         })

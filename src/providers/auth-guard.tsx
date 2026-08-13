@@ -40,7 +40,7 @@ export function useCurrentUser() {
       isLoaded: true,
       isSignedIn: true,
       name: 'Demo User',
-      email: 'demo@helix.io',
+      email: 'demo@vilsend.io',
       imageUrl: '',
       initials: 'DU',
     } as const;

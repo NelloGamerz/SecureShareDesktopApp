@@ -210,7 +210,7 @@ export function OnboardingPage() {
 
   const stepTitle =
     [
-      "How will you use SecureShare?",
+      "How will you use VilSend?",
       isOrg ? "Tell us about your organization" : "Name your workspace",
       "Invite your team",
       "Review and create",
@@ -234,11 +234,11 @@ export function OnboardingPage() {
             <ShieldCheck className="h-5 w-5" />
           </div>
           <span className="text-base font-semibold tracking-tight">
-            SecureShare
+            VilSend
           </span>
         </div>
       }
-      title="Welcome to SecureShare"
+      title="Welcome to VilSend"
       subtitle="Let's set up your workspace."
       footer={
         success ? null : (

@@ -105,7 +105,7 @@ function RootRedirect() {
   const { isLoaded, isSignedIn } = useCurrentUser();
 
   if (!isLoaded) {
-    return <LoadingScreen label="Starting Helix…" />;
+    return <LoadingScreen label="Starting VilSend…" />;
   }
 
   return <Navigate to={isSignedIn ? "/organization" : "/sign-in"} replace />;

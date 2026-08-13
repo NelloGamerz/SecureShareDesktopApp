@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "server-frontend",
+  "productName": "VilSend",
   "version": "0.2.6",
-  "identifier": "com.karan.server-frontend",
+  "identifier": "in.vilsend.app",
 
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -14,7 +14,7 @@
   "app": {
     "windows": [
       {
-        "title": "server-frontend",
+        "title": "VilSend",
         "width": 800,
         "height": 600,
         "devtools": true
@@ -29,7 +29,7 @@
     "updater": {
       "active": true,
 
-      "endpoints": ["https://your-domain.com/latest.json"],
+      "endpoints": ["https://update.vilsend.in/latest.json"],
 
       "dialog": false,
 

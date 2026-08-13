@@ -106,6 +106,12 @@ export function TransfersPage() {
 
   const requests = useTransferRequestStore((state) => state.requests);
 
+  const uniqueRequests = React.useMemo(() => {
+    return Array.from(
+      new Map(requests.map((request) => [request.id, request])).values(),
+    );
+  }, [requests]);
+
   // const removeRequest = useTransferRequestStore((state) => state.removeRequest);
   useTransferProgressListener();
 
@@ -137,14 +143,14 @@ export function TransfersPage() {
         }
       />
 
-      {requests.length > 0 && (
+      {uniqueRequests.length > 0 && (
         <Card className="mb-4">
           <CardContent className="space-y-3 p-4">
             <h3 className="text-sm font-semibold">
               Incoming transfer requests
             </h3>
 
-            {requests.map((request) => (
+            {uniqueRequests.map((request) => (
               <div
                 key={request.id}
                 className="flex items-center justify-between rounded-lg border p-3"

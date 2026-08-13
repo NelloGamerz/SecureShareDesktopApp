@@ -883,7 +883,7 @@ export function QrPairingPage() {
               </CardHeader>
               <CardContent className="space-y-3">
                 {[
-                  'Open the Helix app on the device you want to pair',
+                  'Open the VilSend app on the device you want to pair',
                   'Go to Settings and tap "Pair new workspace"',
                   'Point the camera at this QR code',
                   'Confirm the connection on both devices',

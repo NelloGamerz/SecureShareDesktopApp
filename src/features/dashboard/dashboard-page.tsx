@@ -105,7 +105,7 @@ export function DashboardPage() {
 
         {isEmpty && (
           <p className="mt-6 text-center text-sm text-muted-foreground">
-            {import.meta.env.VITE_APP_NAME ?? "Helix"} is ready — start by
+            {import.meta.env.VITE_APP_NAME ?? "VilSend"} is ready — start by
             adding a device or creating a transfer.
           </p>
         )}

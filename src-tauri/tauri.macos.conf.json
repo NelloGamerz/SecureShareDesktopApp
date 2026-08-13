@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "identifier": "com.karan.server-frontend",
+  "identifier": "in.vilsend.app",
   "bundle": {
     "resources": [
       "resources/cloudflared/macos-x64/cloudflared"

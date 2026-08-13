@@ -4754,51 +4754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server-frontend"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "axum",
- "base64 0.22.1",
- "ed25519-dalek",
- "futures-util",
- "hex",
- "hkdf",
- "iota_stronghold",
- "keyring",
- "rand 0.8.7",
- "rand_core 0.6.4",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-device",
- "tauri-plugin-dialog",
- "tauri-plugin-fs",
- "tauri-plugin-log",
- "tauri-plugin-opener",
- "tauri-plugin-os",
- "tauri-plugin-secure-storage",
- "tauri-plugin-store",
- "tauri-plugin-stronghold",
- "tauri-plugin-updater",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "windows 0.62.2",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "servo_arc"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6584,6 +6539,51 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vilsend"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "iota_stronghold",
+ "keyring",
+ "rand 0.8.7",
+ "rand_core 0.6.4",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-device",
+ "tauri-plugin-dialog",
+ "tauri-plugin-fs",
+ "tauri-plugin-log",
+ "tauri-plugin-opener",
+ "tauri-plugin-os",
+ "tauri-plugin-secure-storage",
+ "tauri-plugin-store",
+ "tauri-plugin-stronghold",
+ "tauri-plugin-updater",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.62.2",
+ "x25519-dalek",
+ "zeroize",
+]
 
 [[package]]
 name = "vswhom"

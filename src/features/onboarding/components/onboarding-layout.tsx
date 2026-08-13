@@ -27,7 +27,7 @@ export function OnboardingLayout({
               <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-primary-foreground">
                 <ShieldCheck className="h-5 w-5" />
               </div>
-              <span className="text-base font-semibold tracking-tight">SecureShare</span>
+              <span className="text-base font-semibold tracking-tight">VilSend</span>
             </div>
           )}
         </div>

@@ -49,47 +49,6 @@ impl EventDispatcher {
         self.emit("transfer-request", payload).await
     }
 
-    // pub async fn emit_server_event(&self, event: ServerEvent) -> Result<(), AppError> {
-    //     let payload = serde_json::to_value(event).map_err(AppError::from)?;
-
-    //     self.emit("server-event", payload).await
-    // }
-
-    // pub async fn emit_payload(&self, payload: Value) -> Result<(), AppError> {
-    //     if let Some(message_type) = payload.get("type").and_then(|v| v.as_str()) {
-    //         match message_type {
-    //             "start_transfer" => {
-    //                 self.handle_start_transfer(payload.clone()).await?;
-    //             }
-
-    //             "cancel_transfer" => {
-    //                 if let Some(id) = payload.get("transfer_id").and_then(|v| v.as_str()) {
-    //                     self.upload_manager.cancel(id).await.map_err(|e| {
-    //                         AppError::internal(format!("cancel transfer failed: {e}"))
-    //                     })?;
-    //                 }
-    //             }
-
-    //             _ => {
-    //                 tracing::debug!("Ignoring command: {:?}", message_type);
-    //             }
-    //         }
-    //     }
-
-    //     self.emit("websocket-message", payload).await
-    // }
-
-    // async fn handle_start_transfer(&self, payload: Value) -> Result<(), AppError> {
-    //     let metadata: TransferMetadata = serde_json::from_value(payload).map_err(AppError::from)?;
-
-    //     self.upload_manager
-    //         .start(metadata)
-    //         .await
-    //         .map_err(|e| AppError::internal(format!("upload start failed: {e}")))?;
-
-    //     Ok(())
-    // }
-
     async fn emit(&self, event_name: &str, payload: Value) -> Result<(), AppError> {
         if let Some(handle) = self.app_handle.lock().ok().and_then(|guard| guard.clone()) {
             handle.emit(event_name, payload).map_err(AppError::from)?;
@@ -201,23 +160,6 @@ impl EventDispatcher {
         }))
         .await
     }
-
-    // pub async fn listen_transfer_events(
-    //     self: Arc<Self>,
-    //     mut rx: tokio::sync::mpsc::UnboundedReceiver<TransferEvent>,
-    // ) {
-    //     while let Some(event) = rx.recv().await {
-    //         match event {
-    //             TransferEvent::Completed(id) => {
-    //                 let _ = self.notify_transfer_completed(&id).await;
-    //             }
-
-    //             TransferEvent::Failed(id, reason) => {
-    //                 let _ = self.notify_transfer_failed(&id, &reason).await;
-    //             }
-    //         }
-    //     }
-    // }
 
     pub async fn listen_transfer_events(
         self: Arc<Self>,

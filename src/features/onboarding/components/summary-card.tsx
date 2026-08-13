@@ -45,9 +45,9 @@ export function SummaryCard({ form }: SummaryCardProps) {
           <>
             <Row icon={Users} label="Team size" value={form.organizationSize || '—'} />
             <Row icon={Building2} label="Industry" value={industryLabels[form.industry] ?? '—'} />
-            {form.workspaceSlug && (
-              <Row icon={Sparkles} label="Slug" value={`secureshare.app/${form.workspaceSlug}`} />
-            )}
+            {/* {form.workspaceSlug && (
+              <Row icon={Sparkles} label="Slug" value={`vilsend.app/${form.workspaceSlug}`} />
+            )} */}
           </>
         )}
         <Row icon={Calendar} label="Seats" value="Free Trial" />
