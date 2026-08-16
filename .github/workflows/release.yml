@@ -122,13 +122,119 @@ jobs:
 
           args: --config src-tauri/${{ matrix.config }}
 
+  # build-windows-store:
+  #   runs-on: windows-latest
+
+  #   env:
+  #     TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  #     TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+  #     RUSTC_WRAPPER: sccache
+
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+
+  #     - name: Setup Node
+  #       uses: actions/setup-node@v4
+  #       with:
+  #         node-version: 22
+  #         cache: npm
+
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+
+  #     - name: Add target for MSIX bundle
+  #       run: |
+  #         rustup target add x86_64-pc-windows-msvc
+
+  #     - name: Setup sccache
+  #       uses: mozilla-actions/sccache-action@v0.0.9
+
+  #     - name: Cache Rust
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: |
+  #           ~/.cargo/registry
+  #           ~/.cargo/git
+  #           src-tauri/target
+
+  #         key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}-store
+
+  #         restore-keys: |
+  #           ${{ runner.os }}-cargo-
+
+  #     - name: Install frontend dependencies
+  #       run: npm ci
+
+  #     - name: Check frontend env
+  #       shell: bash
+  #       run: |
+  #         echo "CLERK KEY EXISTS:"
+  #         if [ -z "$VITE_CLERK_PUBLISHABLE_KEY" ]; then
+  #           echo "MISSING"
+  #         else
+  #           echo "FOUND"
+  #         fi
+
+  #         echo "API URL:"
+  #         echo "$VITE_API_BASE_URL"
+
+  #         echo "APP NAME:"
+  #         echo "$VITE_APP_NAME"
+
+  #       env:
+  #         VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
+  #         VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+  #         VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
+
+  #     - name: Compute MSIX version
+  #       shell: bash
+  #       run: |
+  #         # Extract version from tauri.conf.json
+  #         VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+  #         echo "Base version: $VERSION"
+
+  #         # Convert to MSIX format (add .0 if not already four-part)
+  #         if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  #           MSIX_VERSION="$VERSION"
+  #         else
+  #           MSIX_VERSION="${VERSION}.0"
+  #         fi
+
+  #         echo "MSIX version: $MSIX_VERSION"
+  #         echo "MSIX_VERSION=$MSIX_VERSION" >> $GITHUB_ENV
+
+  #     - name: Build Tauri App for Microsoft Store
+  #       shell: bash
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #         TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  #         TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+  #         VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
+  #         VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+  #         VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
+  #       run: |
+  #         npm run tauri -- build \
+  #           --config src-tauri/tauri.windows.store.conf.json \
+  #           --no-bundle
+
+  #     - name: Verify build output
+  #       shell: bash
+  #       run: |
+  #         echo "Build output directory contents:"
+  #         find src-tauri/target/release -name "*.msi" -o -name "*.msix" 2>/dev/null | head -20
+
+  #     - name: Upload Store MSI/MSIX as artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: windows-store-msix
+  #         path: src-tauri/target/release/bundle/msi/
+  #         if-no-files-found: warn
 
   build-windows-store:
     runs-on: windows-latest
 
     env:
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       RUSTC_WRAPPER: sccache
 
     steps:
@@ -143,10 +249,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Add target for MSIX bundle
-        run: |
-          rustup target add x86_64-pc-windows-msvc
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -167,71 +269,43 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Check frontend env
-        shell: bash
-        run: |
-          echo "CLERK KEY EXISTS:"
-          if [ -z "$VITE_CLERK_PUBLISHABLE_KEY" ]; then
-            echo "MISSING"
-          else
-            echo "FOUND"
-          fi
-
-          echo "API URL:"
-          echo "$VITE_API_BASE_URL"
-
-          echo "APP NAME:"
-          echo "$VITE_APP_NAME"
-
-        env:
-          VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
-          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
-          VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
-
-      - name: Compute MSIX version
-        shell: bash
-        run: |
-          # Extract version from tauri.conf.json
-          VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "Base version: $VERSION"
-          
-          # Convert to MSIX format (add .0 if not already four-part)
-          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            MSIX_VERSION="$VERSION"
-          else
-            MSIX_VERSION="${VERSION}.0"
-          fi
-          
-          echo "MSIX version: $MSIX_VERSION"
-          echo "MSIX_VERSION=$MSIX_VERSION" >> $GITHUB_ENV
-
       - name: Build Tauri App for Microsoft Store
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
           VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
           VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
         run: |
           npm run tauri -- build \
             --config src-tauri/tauri.windows.store.conf.json \
-            --bundle \
-            --no-default-features
+            --no-bundle
 
-      - name: Verify build output
+      - name: Verify Tauri executable
         shell: bash
         run: |
-          echo "Build output directory contents:"
-          find src-tauri/target/release -name "*.msi" -o -name "*.msix" 2>/dev/null | head -20
+          echo "Searching for VilSend.exe..."
 
-      - name: Upload Store MSI/MSIX as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-store-msix
-          path: src-tauri/target/release/bundle/msi/
-          if-no-files-found: warn
+          find src-tauri/target \
+            -type f \
+            -name "VilSend.exe" \
+            -print
+
+          if ! find src-tauri/target \
+            -type f \
+            -name "VilSend.exe" \
+            -print -quit | grep -q .; then
+
+            echo "ERROR: VilSend.exe was not found"
+            exit 1
+          fi
+
+      - name: Show build output
+        shell: bash
+        run: |
+          find src-tauri/target/release \
+            -maxdepth 3 \
+            -type f \
+            -print
 
   publish-windows-store:
     needs: build-windows-store
@@ -265,7 +339,6 @@ jobs:
           echo "   - MS_STORE_CLIENT_SECRET"
           echo "3. Change 'if' condition to 'if: github.event_name == \"push\"'"
           echo "4. Update this step with actual Partner Center submission"
-
 
   upload-updater:
     needs: release
