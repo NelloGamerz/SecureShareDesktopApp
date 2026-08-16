@@ -217,7 +217,7 @@ jobs:
         run: |
           npm run tauri -- build \
             --config src-tauri/tauri.windows.store.conf.json \
-            --bundle msi \
+            --bundle \
             --no-default-features
 
       - name: Verify build output
