@@ -300,48 +300,48 @@ jobs:
       #     fi
 
       - name: Inspect Tauri build output
-  shell: pwsh
-  run: |
-    Write-Host "=== Tauri target/release ==="
+          shell: pwsh
+          run: |
+            Write-Host "=== Tauri target/release ==="
 
-    if (-not (Test-Path "src-tauri/target/release")) {
-      Write-Error "src-tauri/target/release does not exist."
-      exit 1
-    }
+            if (-not (Test-Path "src-tauri/target/release")) {
+              Write-Error "src-tauri/target/release does not exist."
+              exit 1
+            }
 
-    Get-ChildItem `
-      "src-tauri/target/release" `
-      -Recurse `
-      -File |
-      Select-Object FullName, Length |
-      Format-Table -AutoSize
+            Get-ChildItem `
+              "src-tauri/target/release" `
+              -Recurse `
+              -File |
+              Select-Object FullName, Length |
+              Format-Table -AutoSize
 
-    Write-Host ""
-    Write-Host "=== EXE files ==="
+            Write-Host ""
+            Write-Host "=== EXE files ==="
 
-    $exes = Get-ChildItem `
-      "src-tauri/target/release" `
-      -Filter "*.exe" `
-      -Recurse `
-      -File
+            $exes = Get-ChildItem `
+              "src-tauri/target/release" `
+              -Filter "*.exe" `
+              -Recurse `
+              -File
 
-    if (-not $exes) {
-      Write-Error "No executable was generated."
-      exit 1
-    }
+            if (-not $exes) {
+              Write-Error "No executable was generated."
+              exit 1
+            }
 
-    foreach ($exe in $exes) {
-      Write-Host "EXE: $($exe.FullName)"
-      Write-Host "SIZE: $($exe.Length)"
-    }
+            foreach ($exe in $exes) {
+              Write-Host "EXE: $($exe.FullName)"
+              Write-Host "SIZE: $($exe.Length)"
+            }
 
-      - name: Show build output
-        shell: bash
-        run: |
-          find src-tauri/target/release \
-            -maxdepth 3 \
-            -type f \
-            -print
+              - name: Show build output
+                shell: bash
+                run: |
+                  find src-tauri/target/release \
+                    -maxdepth 3 \
+                    -type f \
+                    -print
 
   publish-windows-store:
     needs: build-windows-store
