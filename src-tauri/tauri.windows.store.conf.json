@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "in.vilsend.app",
+  "plugins": {
+    "updater": {
+      "active": false
+    }
+  },
+  "bundle": {
+    "resources": [
+      "resources/cloudflared/windows-x64/cloudflared.exe"
+    ],
+    "windows": [
+      {
+        "wix": null,
+        "nsis": null,
+        "signCommand": null
+      }
+    ]
+  }
+}

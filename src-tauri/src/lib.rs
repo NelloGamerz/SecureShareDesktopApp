@@ -30,6 +30,7 @@ use commands::transfer_commands::{
     cancel_transfer, get_transfer_status, pause_transfer, resume_transfer, start_transfer,
 };
 
+#[cfg(feature = "enable-updater")]
 use services::updates_service::handle_pending_update;
 
 use commands::local_transfer_commands::{
@@ -121,13 +122,17 @@ pub fn run() {
 
             let app_state = Arc::new(app_state);
 
-            let update_app = app.handle().clone();
-            let dispatcher = Arc::clone(&app_state.event_dispatcher);
-            let dispatcher2 = Arc::clone(&app_state.event_dispatcher);
+            #[cfg(feature = "enable-updater")]
+            {
+                let update_app = app.handle().clone();
+                let dispatcher = Arc::clone(&app_state.event_dispatcher);
 
-            tauri::async_runtime::spawn(async move {
-                handle_pending_update(update_app, dispatcher).await;
-            });
+                tauri::async_runtime::spawn(async move {
+                    handle_pending_update(update_app, dispatcher).await;
+                });
+            }
+
+            let dispatcher2 = Arc::clone(&app_state.event_dispatcher);
 
             /*
              * Local SQLite storage
@@ -217,20 +222,20 @@ pub fn run() {
             /*
              * Debug: Print stored device identity
              */
-            match KeyringService::get_device_public_key(app.handle()) {
-                Ok(public_key) => {
-                    tracing::info!(
-                        device_public_key = %public_key,
-                        "Loaded device public key"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "Device public key not found"
-                    );
-                }
-            }
+            // match KeyringService::get_device_public_key(app.handle()) {
+            //     Ok(public_key) => {
+            //         tracing::info!(
+            //             device_public_key = %public_key,
+            //             "Loaded device public key"
+            //         );
+            //     }
+            //     Err(err) => {
+            //         tracing::warn!(
+            //             error = %err,
+            //             "Device public key not found"
+            //         );
+            //     }
+            // }
 
             // match KeyringService::get_device_private_key(app.handle()) {
             //     Ok(private_key) => {
