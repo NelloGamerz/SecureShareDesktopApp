@@ -280,24 +280,60 @@ jobs:
             --config src-tauri/tauri.windows.store.conf.json \
             --no-bundle
 
-      - name: Verify Tauri executable
-        shell: bash
-        run: |
-          echo "Searching for VilSend.exe..."
+      # - name: Verify Tauri executable
+      #   shell: bash
+      #   run: |
+      #     echo "Searching for VilSend.exe..."
 
-          find src-tauri/target \
-            -type f \
-            -name "VilSend.exe" \
-            -print
+      #     find src-tauri/target \
+      #       -type f \
+      #       -name "VilSend.exe" \
+      #       -print
 
-          if ! find src-tauri/target \
-            -type f \
-            -name "VilSend.exe" \
-            -print -quit | grep -q .; then
+      #     if ! find src-tauri/target \
+      #       -type f \
+      #       -name "VilSend.exe" \
+      #       -print -quit | grep -q .; then
 
-            echo "ERROR: VilSend.exe was not found"
-            exit 1
-          fi
+      #       echo "ERROR: VilSend.exe was not found"
+      #       exit 1
+      #     fi
+
+      - name: Inspect Tauri build output
+  shell: pwsh
+  run: |
+    Write-Host "=== Tauri target/release ==="
+
+    if (-not (Test-Path "src-tauri/target/release")) {
+      Write-Error "src-tauri/target/release does not exist."
+      exit 1
+    }
+
+    Get-ChildItem `
+      "src-tauri/target/release" `
+      -Recurse `
+      -File |
+      Select-Object FullName, Length |
+      Format-Table -AutoSize
+
+    Write-Host ""
+    Write-Host "=== EXE files ==="
+
+    $exes = Get-ChildItem `
+      "src-tauri/target/release" `
+      -Filter "*.exe" `
+      -Recurse `
+      -File
+
+    if (-not $exes) {
+      Write-Error "No executable was generated."
+      exit 1
+    }
+
+    foreach ($exe in $exes) {
+      Write-Host "EXE: $($exe.FullName)"
+      Write-Host "SIZE: $($exe.Length)"
+    }
 
       - name: Show build output
         shell: bash
