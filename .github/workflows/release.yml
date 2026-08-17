@@ -796,7 +796,7 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    if: ${{ false }}
+    # if: ${{ false }}
 
     steps:
       - name: Publish to Microsoft Store
