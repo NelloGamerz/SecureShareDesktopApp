@@ -1,4 +1,4 @@
-import { Building2, Calendar, Mail, Sparkles, User, Users } from 'lucide-react';
+import { Building2, Calendar, Sparkles, User, Users } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { OnboardingFormState } from '../onboarding-types';
 
@@ -45,18 +45,13 @@ export function SummaryCard({ form }: SummaryCardProps) {
           <>
             <Row icon={Users} label="Team size" value={form.organizationSize || '—'} />
             <Row icon={Building2} label="Industry" value={industryLabels[form.industry] ?? '—'} />
+            <Row icon={Calendar} label="Seats" value="3" />
+            <Row icon={Calendar} label="Trial" value="14 days" />
             {/* {form.workspaceSlug && (
               <Row icon={Sparkles} label="Slug" value={`vilsend.app/${form.workspaceSlug}`} />
             )} */}
           </>
         )}
-        <Row icon={Calendar} label="Seats" value="Free Trial" />
-        <Row icon={Calendar} label="Trial" value="14 days" />
-        <Row
-          icon={Mail}
-          label="Invitations"
-          value={form.invites.length > 0 ? String(form.invites.length) : '0'}
-        />
       </div>
     </div>
   );

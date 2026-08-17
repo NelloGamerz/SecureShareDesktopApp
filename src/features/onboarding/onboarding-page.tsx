@@ -23,7 +23,6 @@ import { LoadingButton } from "./components/loading-button";
 import { UsageSelectionCards } from "./components/selection-card";
 import { WorkspaceForm } from "./components/workspace-form";
 import { OrganizationForm } from "./components/organization-form";
-import { InviteMembers } from "./components/invite-members";
 import { SummaryCard } from "./components/summary-card";
 import { SuccessScreen } from "./components/success-screen";
 import { getDeviceInfo } from "@/services/getDeviceInfo";
@@ -59,11 +58,8 @@ export function OnboardingPage() {
 
   const isOrg = form.organizationType === "ORGANIZATION";
   const steps = useMemo(
-    () =>
-      isOrg
-        ? ["Usage", "Details", "Invite", "Review"]
-        : ["Usage", "Details", "Review"],
-    [isOrg],
+    () => ["Usage", "Details", "Review"],
+    [],
   );
   const finalStepIndex = steps.length - 1;
   const [success, setSuccess] = useState(false);
@@ -88,7 +84,6 @@ export function OnboardingPage() {
   const canAdvance = (() => {
     if (step === 0) return form.organizationType !== null;
     if (step === 1) return isOrg ? orgValid : individualValid;
-    if (step === 2 && isOrg) return true; // invites are skippable
     return true;
   })();
 
@@ -212,7 +207,6 @@ export function OnboardingPage() {
     [
       "How will you use VilSend?",
       isOrg ? "Tell us about your organization" : "Name your workspace",
-      "Invite your team",
       "Review and create",
     ][step] ?? "";
 
@@ -222,7 +216,6 @@ export function OnboardingPage() {
       isOrg
         ? "This information shapes your workspace."
         : "Pick a name for your personal space.",
-      "Invite teammates now or skip this step.",
       "Confirm your setup before we create the workspace.",
     ][step] ?? "";
 
@@ -312,14 +305,6 @@ export function OnboardingPage() {
                 />
               )}
 
-              {/* Step 3 (org only): invite teammates */}
-              {step === 2 && isOrg && (
-                <InviteMembers
-                  invites={form.invites}
-                  onChange={(invites) => updateForm({ invites })}
-                />
-              )}
-
               {/* Final step: summary + terms + submit */}
               {step === finalStepIndex && (
                 <div className="space-y-5">
@@ -339,13 +324,25 @@ export function OnboardingPage() {
                     />
                     <span className="text-sm text-muted-foreground">
                       I agree to the{" "}
-                      <span className="font-medium text-foreground">
+                      <a
+                        href="https://www.vilsend.in/terms"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium text-foreground underline-offset-4 hover:underline"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         Terms of Service
-                      </span>{" "}
+                      </a>{" "}
                       and{" "}
-                      <span className="font-medium text-foreground">
+                      <a
+                        href="https://www.vilsend.in/privacy"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium text-foreground underline-offset-4 hover:underline"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         Privacy Policy
-                      </span>
+                      </a>
                       .
                     </span>
                   </label>
