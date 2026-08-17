@@ -9,8 +9,15 @@
   },
 
   "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
     "resources": [
       "resources/cloudflared/windows-x64/cloudflared.exe"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      }
+    }
   }
 }
