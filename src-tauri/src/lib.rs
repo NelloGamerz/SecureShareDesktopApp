@@ -94,6 +94,19 @@ pub fn run() {
             /*
              * Application config
              */
+
+            // #[cfg(debug_assertions)]
+            // {
+            //     if let Some(window) = app.get_webview_window("main") {
+            //         window.open_devtools();
+            //     }
+            // }
+
+            let window = app
+                .get_webview_window("main")
+                .expect("main window not found");
+
+            window.open_devtools();
             let config = if cfg!(debug_assertions) {
                 AppConfig::development()
             } else {

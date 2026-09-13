@@ -125,8 +125,255 @@ jobs:
 
           args: --config src-tauri/${{ matrix.config }}
 
+  # # ============================================================
+  # # MICROSOFT STORE BUILD
+  # # ============================================================
+  # build-windows-store:
+  #   runs-on: windows-latest
+
+  #   env:
+  #     RUSTC_WRAPPER: sccache
+
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+
+  #     - name: Setup Node
+  #       uses: actions/setup-node@v4
+  #       with:
+  #         node-version: 22
+  #         cache: npm
+
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+
+  #     - name: Setup sccache
+  #       uses: mozilla-actions/sccache-action@v0.0.9
+
+  #     - name: Cache Rust
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: |
+  #           ~/.cargo/registry
+  #           ~/.cargo/git
+  #           src-tauri/target
+
+  #         key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}-store
+
+  #         restore-keys: |
+  #           ${{ runner.os }}-cargo-
+
+  #     - name: Install frontend dependencies
+  #       run: npm ci
+
+  #     - name: Build Windows Store installer
+  #       shell: bash
+  #       env:
+  #         VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
+  #         VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+  #         VITE_APP_NAME: ${{ secrets.VITE_APP_NAME }}
+
+  #       run: |
+  #         npm run tauri -- build \
+  #           --config src-tauri/tauri.windows.store.conf.json
+
+  #     - name: Inspect Windows Store installers
+  #       shell: pwsh
+  #       run: |
+  #         Write-Host "=== Windows bundle output ==="
+
+  #         if (-not (Test-Path "src-tauri/target/release/bundle")) {
+  #           Write-Error "Tauri bundle directory does not exist."
+  #           exit 1
+  #         }
+
+  #         Get-ChildItem `
+  #           "src-tauri/target/release/bundle" `
+  #           -Recurse `
+  #           -File |
+  #           Select-Object FullName, Length |
+  #           Format-Table -AutoSize
+
+  #     - name: Find MSI installer
+  #       shell: pwsh
+  #       run: |
+  #         Write-Host "=== MSI files ==="
+
+  #         $msis = Get-ChildItem `
+  #           "src-tauri/target/release/bundle" `
+  #           -Filter "*.msi" `
+  #           -Recurse `
+  #           -File
+
+  #         if (-not $msis) {
+  #           Write-Error "No MSI installer was generated."
+  #           exit 1
+  #         }
+
+  #         foreach ($msi in $msis) {
+  #           Write-Host "MSI: $($msi.FullName)"
+  #           Write-Host "SIZE: $($msi.Length)"
+  #         }
+
+  #     - name: Prepare Microsoft Store artifact
+  #       shell: pwsh
+  #       run: |
+  #         New-Item -ItemType Directory -Force -Path store-package | Out-Null
+
+  #         $msis = Get-ChildItem `
+  #           "src-tauri/target/release/bundle" `
+  #           -Filter "*.msi" `
+  #           -Recurse `
+  #           -File
+
+  #         if ($msis.Count -ne 1) {
+  #           Write-Error "Expected exactly one MSI, found $($msis.Count)."
+  #           $msis | ForEach-Object {
+  #             Write-Host $_.FullName
+  #           }
+  #           exit 1
+  #         }
+
+  #         $msi = $msis[0]
+
+  #         Copy-Item `
+  #           $msi.FullName `
+  #           "store-package\$($msi.Name)"
+
+  #         Write-Host "Prepared Microsoft Store package:"
+  #         Get-ChildItem store-package
+
+  #     - name: Upload Microsoft Store package
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: windows-store-msi
+  #         path: store-package/*.msi
+  #         if-no-files-found: error
+  #         retention-days: 30
+
+  # # ============================================================
+  # # UPLOAD MICROSOFT STORE MSI TO R2
+  # # ============================================================
+  # upload-windows-store-to-r2:
+  #   needs: build-windows-store
+
+  #   runs-on: ubuntu-latest
+
+  #   steps:
+  #     - name: Download Microsoft Store MSI artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: windows-store-msi
+  #         path: ./store-package/
+
+  #     - name: Display Store package
+  #       run: |
+  #         echo "Microsoft Store package:"
+  #         echo "--------------------------------"
+
+  #         ls -lah store-package/
+
+  #         echo "--------------------------------"
+
+  #     - name: Verify exactly one MSI
+  #       shell: bash
+  #       run: |
+  #         MSI_COUNT=$(find store-package -maxdepth 1 -type f -name "*.msi" | wc -l)
+
+  #         if [ "$MSI_COUNT" -ne 1 ]; then
+  #           echo "ERROR: Expected exactly one MSI."
+  #           echo "Found: $MSI_COUNT"
+  #           find store-package -maxdepth 1 -type f -print
+  #           exit 1
+  #         fi
+
+  #         echo "Exactly one MSI found."
+
+  #     - name: Configure Cloudflare R2 credentials
+  #       run: |
+  #         echo "AWS_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
+  #         echo "AWS_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+  #         echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
+
+  #     - name: Configure R2 endpoint
+  #       run: |
+  #         echo "R2_ENDPOINT=https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" >> "$GITHUB_ENV"
+
+  #     - name: Upload Microsoft Store MSI to R2
+  #       shell: bash
+  #       run: |
+  #         MSI_FILE=$(find store-package -maxdepth 1 -type f -name "*.msi" | head -n 1)
+  #         MSI_NAME=$(basename "$MSI_FILE")
+
+  #         echo "MSI file:"
+  #         echo "$MSI_FILE"
+
+  #         echo ""
+  #         echo "MSI name:"
+  #         echo "$MSI_NAME"
+
+  #         echo ""
+  #         echo "Release tag:"
+  #         echo "${{ github.ref_name }}"
+
+  #         echo ""
+  #         echo "Uploading to:"
+  #         echo "s3://${{ secrets.R2_BUCKET }}/store/${{ github.ref_name }}/${MSI_NAME}"
+
+  #         aws s3 cp \
+  #           "$MSI_FILE" \
+  #           "s3://${{ secrets.R2_BUCKET }}/store/${{ github.ref_name }}/${MSI_NAME}" \
+  #           --content-type "application/x-msi" \
+  #           --cache-control "public, max-age=31536000, immutable" \
+  #           --endpoint-url "$R2_ENDPOINT"
+
+  #         echo ""
+  #         echo "Microsoft Store MSI uploaded successfully."
+
+  #     - name: Show Microsoft Store URL
+  #       shell: bash
+  #       run: |
+  #         MSI_FILE=$(find store-package -maxdepth 1 -type f -name "*.msi" | head -n 1)
+  #         MSI_NAME=$(basename "$MSI_FILE")
+
+  #         echo ""
+  #         echo "============================================================"
+  #         echo "MICROSOFT STORE MSI"
+  #         echo "============================================================"
+  #         echo ""
+  #         echo "https://update.vilsend.in/store/${{ github.ref_name }}/${MSI_NAME}"
+  #         echo ""
+  #         echo "============================================================"
+
+  # # ============================================================
+  # # MICROSOFT STORE PUBLISHING
+  # # DISABLED UNTIL PARTNER CENTER IS CONFIGURED
+  # # ============================================================
+  # publish-windows-store:
+  #   needs: upload-windows-store-to-r2
+
+  #   runs-on: ubuntu-latest
+
+  #   # if: ${{ false }}
+
+  #   steps:
+  #     - name: Publish to Microsoft Store
+  #       run: |
+  #         echo "Microsoft Store publishing is currently disabled."
+  #         echo ""
+  #         echo "Required GitHub secrets:"
+  #         echo "  MS_STORE_TENANT_ID"
+  #         echo "  MS_STORE_CLIENT_ID"
+  #         echo "  MS_STORE_CLIENT_SECRET"
+
   # ============================================================
-  # MICROSOFT STORE BUILD
+  # MICROSOFT STORE MSIX BUILD
+  #
+  # Creates an UNSIGNED MSIX.
+  #
+  # The MSIX is intended to be manually uploaded to
+  # Microsoft Partner Center, where Microsoft handles
+  # Store signing/distribution.
   # ============================================================
   build-windows-store:
     runs-on: windows-latest
@@ -166,7 +413,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build Windows Store installer
+      # ------------------------------------------------------------
+      # BUILD TAURI APPLICATION
+      # ------------------------------------------------------------
+      - name: Build Windows application
         shell: bash
         env:
           VITE_CLERK_PUBLISHABLE_KEY: ${{ secrets.VITE_CLERK_PUBLISHABLE_KEY }}
@@ -175,84 +425,410 @@ jobs:
 
         run: |
           npm run tauri -- build \
-            --config src-tauri/tauri.windows.store.conf.json
+            --config src-tauri/tauri.windows.store.conf.json \
+            --no-bundle
 
-      - name: Inspect Windows Store installers
+      # ------------------------------------------------------------
+      # VERIFY EXE
+      # ------------------------------------------------------------
+      - name: Find VilSend executable
         shell: pwsh
         run: |
-          Write-Host "=== Windows bundle output ==="
+          Write-Host "=== Searching for VilSend.exe ==="
 
-          if (-not (Test-Path "src-tauri/target/release/bundle")) {
-            Write-Error "Tauri bundle directory does not exist."
+          $exe = Get-ChildItem `
+            "src-tauri/target/release" `
+            -Filter "VilSend.exe" `
+            -Recurse `
+            -File |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Error "VilSend.exe was not found."
             exit 1
           }
 
+          Write-Host ""
+          Write-Host "Found:"
+          Write-Host $exe.FullName
+          Write-Host ""
+          Write-Host "Size:"
+          Write-Host "$($exe.Length) bytes"
+
+          "VILSEND_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # GET VERSION FROM GIT TAG
+      #
+      # v1.2.3 -> 1.2.3.0
+      # ------------------------------------------------------------
+      - name: Calculate MSIX version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+
+          if (-not $tag.StartsWith("v")) {
+            Write-Error "Release tag must start with v. Example: v1.2.3"
+            exit 1
+          }
+
+          $version = $tag.Substring(1)
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Release tag must use semantic versioning such as v1.2.3"
+            exit 1
+          }
+
+          $msixVersion = "$version.0"
+
+          Write-Host "Git tag:"
+          Write-Host $tag
+
+          Write-Host ""
+          Write-Host "MSIX version:"
+          Write-Host $msixVersion
+
+          "MSIX_VERSION=$msixVersion" >> $env:GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # PREPARE MSIX DIRECTORY
+      # ------------------------------------------------------------
+      - name: Prepare MSIX package directory
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $PWD "msix-package"
+          $assetsRoot = Join-Path $packageRoot "Assets"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $packageRoot | Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $assetsRoot | Out-Null
+
+          Write-Host "MSIX package directory:"
+          Write-Host $packageRoot
+
+          "MSIX_PACKAGE_ROOT=$packageRoot" >> $env:GITHUB_ENV
+          "MSIX_ASSETS_ROOT=$assetsRoot" >> $env:GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # COPY APPLICATION
+      # ------------------------------------------------------------
+      - name: Copy VilSend executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:VILSEND_EXE")) {
+            Write-Error "VilSend.exe does not exist."
+            exit 1
+          }
+
+          Copy-Item `
+            "$env:VILSEND_EXE" `
+            "$env:MSIX_PACKAGE_ROOT\VilSend.exe" `
+            -Force
+
+          Write-Host "Copied VilSend.exe"
+
+      # ------------------------------------------------------------
+      # COPY APP MANIFEST
+      # ------------------------------------------------------------
+      - name: Prepare AppxManifest.xml
+        shell: pwsh
+        run: |
+          $manifestSource = "src-tauri\AppManifest.xml"
+          $manifestDestination = "$env:MSIX_PACKAGE_ROOT\AppxManifest.xml"
+
+          if (-not (Test-Path $manifestSource)) {
+            Write-Error "AppManifest.xml was not found at:"
+            Write-Error $manifestSource
+            exit 1
+          }
+
+          Copy-Item `
+            $manifestSource `
+            $manifestDestination `
+            -Force
+
+          Write-Host "Copied AppManifest.xml"
+
+          # Update the package version from the Git tag.
+          [xml]$manifest = Get-Content `
+            $manifestDestination
+
+          $identity = $manifest.Package.Identity
+
+          if (-not $identity) {
+            Write-Error "Could not find Package/Identity in AppManifest.xml"
+            exit 1
+          }
+
+          $identity.Version = "$env:MSIX_VERSION"
+
+          $manifest.Save(
+            (Resolve-Path $manifestDestination)
+          )
+
+          Write-Host ""
+          Write-Host "Updated MSIX version to:"
+          Write-Host $env:MSIX_VERSION
+
+      # ------------------------------------------------------------
+      # COPY STORE ICONS
+      #
+      # Adjust these source filenames if your icon directory
+      # uses different names.
+      # ------------------------------------------------------------
+      - name: Prepare MSIX Store assets
+        shell: pwsh
+        run: |
+          $iconRoot = "src-tauri\icons"
+          $assetsRoot = "$env:MSIX_ASSETS_ROOT"
+
+          if (-not (Test-Path $iconRoot)) {
+            Write-Error "Icon directory not found:"
+            Write-Error $iconRoot
+            exit 1
+          }
+
+          Write-Host "Available icons:"
+          Get-ChildItem $iconRoot -File |
+            Select-Object Name, Length |
+            Format-Table -AutoSize
+
+          # --------------------------------------------------------
+          # StoreLogo.png
+          # --------------------------------------------------------
+          $storeLogoCandidates = @(
+            "store-logo.png",
+            "StoreLogo.png",
+            "store_logo.png"
+          )
+
+          $storeLogo = $null
+
+          foreach ($candidate in $storeLogoCandidates) {
+            $candidatePath = Join-Path $iconRoot $candidate
+
+            if (Test-Path $candidatePath) {
+              $storeLogo = $candidatePath
+              break
+            }
+          }
+
+          # --------------------------------------------------------
+          # Square150x150Logo.png
+          # --------------------------------------------------------
+          $square150Candidates = @(
+            "Square150x150Logo.png",
+            "square150x150Logo.png",
+            "150x150.png",
+            "icon-150.png"
+          )
+
+          $square150 = $null
+
+          foreach ($candidate in $square150Candidates) {
+            $candidatePath = Join-Path $iconRoot $candidate
+
+            if (Test-Path $candidatePath) {
+              $square150 = $candidatePath
+              break
+            }
+          }
+
+          # --------------------------------------------------------
+          # Square44x44Logo.png
+          # --------------------------------------------------------
+          $square44Candidates = @(
+            "Square44x44Logo.png",
+            "square44x44Logo.png",
+            "44x44.png",
+            "icon-44.png"
+          )
+
+          $square44 = $null
+
+          foreach ($candidate in $square44Candidates) {
+            $candidatePath = Join-Path $iconRoot $candidate
+
+            if (Test-Path $candidatePath) {
+              $square44 = $candidatePath
+              break
+            }
+          }
+
+          if (-not $storeLogo) {
+            Write-Error "StoreLogo.png was not found in src-tauri/icons."
+            exit 1
+          }
+
+          if (-not $square150) {
+            Write-Error "Square150x150Logo.png was not found in src-tauri/icons."
+            exit 1
+          }
+
+          if (-not $square44) {
+            Write-Error "Square44x44Logo.png was not found in src-tauri/icons."
+            exit 1
+          }
+
+          Copy-Item `
+            $storeLogo `
+            "$assetsRoot\StoreLogo.png" `
+            -Force
+
+          Copy-Item `
+            $square150 `
+            "$assetsRoot\Square150x150Logo.png" `
+            -Force
+
+          Copy-Item `
+            $square44 `
+            "$assetsRoot\Square44x44Logo.png" `
+            -Force
+
+          Write-Host ""
+          Write-Host "MSIX assets prepared:"
+          Get-ChildItem $assetsRoot |
+            Select-Object Name, Length |
+            Format-Table -AutoSize
+
+      # ------------------------------------------------------------
+      # SHOW PACKAGE CONTENT
+      # ------------------------------------------------------------
+      - name: Inspect MSIX package contents
+        shell: pwsh
+        run: |
+          Write-Host "=== MSIX PACKAGE ==="
+          Write-Host ""
+
           Get-ChildItem `
-            "src-tauri/target/release/bundle" `
+            "$env:MSIX_PACKAGE_ROOT" `
             -Recurse `
             -File |
             Select-Object FullName, Length |
             Format-Table -AutoSize
 
-      - name: Find MSI installer
+      # ------------------------------------------------------------
+      # MAKEAPPX
+      #
+      # IMPORTANT:
+      # NO SIGNING HAPPENS HERE.
+      # ------------------------------------------------------------
+      - name: Create unsigned MSIX
         shell: pwsh
         run: |
-          Write-Host "=== MSI files ==="
+          $makeAppx = Get-Command MakeAppx.exe `
+            -ErrorAction SilentlyContinue
 
-          $msis = Get-ChildItem `
-            "src-tauri/target/release/bundle" `
-            -Filter "*.msi" `
-            -Recurse `
-            -File
+          if (-not $makeAppx) {
+            $makeAppxCandidates = @(
+              "$env:ProgramFiles(x86)\Windows Kits\10\App Certification Kit\MakeAppx.exe",
+              "$env:ProgramFiles(x86)\Windows Kits\10\bin\x64\MakeAppx.exe",
+              "$env:ProgramFiles(x86)\Windows Kits\10\bin\10.0.26100.0\x64\MakeAppx.exe"
+            )
 
-          if (-not $msis) {
-            Write-Error "No MSI installer was generated."
-            exit 1
-          }
-
-          foreach ($msi in $msis) {
-            Write-Host "MSI: $($msi.FullName)"
-            Write-Host "SIZE: $($msi.Length)"
-          }
-
-      - name: Prepare Microsoft Store artifact
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path store-package | Out-Null
-
-          $msis = Get-ChildItem `
-            "src-tauri/target/release/bundle" `
-            -Filter "*.msi" `
-            -Recurse `
-            -File
-
-          if ($msis.Count -ne 1) {
-            Write-Error "Expected exactly one MSI, found $($msis.Count)."
-            $msis | ForEach-Object {
-              Write-Host $_.FullName
+            foreach ($candidate in $makeAppxCandidates) {
+              if (Test-Path $candidate) {
+                $makeAppx = Get-Item $candidate
+                break
+              }
             }
+          }
+
+          if (-not $makeAppx) {
+            Write-Error "MakeAppx.exe was not found."
             exit 1
           }
 
-          $msi = $msis[0]
+          Write-Host "Using MakeAppx:"
+          Write-Host $makeAppx.Source
 
-          Copy-Item `
-            $msi.FullName `
-            "store-package\$($msi.Name)"
+          $output = Join-Path `
+            $PWD `
+            "store-package\VilSend_$env:MSIX_VERSION`_x64.msix"
 
-          Write-Host "Prepared Microsoft Store package:"
-          Get-ChildItem store-package
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "store-package" | Out-Null
 
-      - name: Upload Microsoft Store package
+          & $makeAppx.Source pack `
+            /d "$env:MSIX_PACKAGE_ROOT" `
+            /p "$output" `
+            /o
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "MakeAppx failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+          if (-not (Test-Path $output)) {
+            Write-Error "MSIX was not created."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "UNSIGNED MSIX CREATED"
+          Write-Host "============================================"
+          Write-Host ""
+          Write-Host $output
+          Write-Host ""
+
+          Get-Item $output |
+            Select-Object FullName, Length |
+            Format-List
+
+      # ------------------------------------------------------------
+      # VERIFY MSIX
+      # ------------------------------------------------------------
+      - name: Verify MSIX package
+        shell: pwsh
+        run: |
+          $msix = Get-ChildItem `
+            "store-package" `
+            -Filter "*.msix" `
+            -File
+
+          if ($msix.Count -ne 1) {
+            Write-Error "Expected exactly one MSIX. Found $($msix.Count)."
+
+            $msix |
+              ForEach-Object {
+                Write-Host $_.FullName
+              }
+
+            exit 1
+          }
+
+          Write-Host "Exactly one MSIX found:"
+          Write-Host $msix[0].FullName
+
+          # Make sure we didn't accidentally produce a signed package.
+          Write-Host ""
+          Write-Host "MSIX package:"
+          Get-Item $msix[0].FullName |
+            Select-Object Name, Length |
+            Format-List
+
+      # ------------------------------------------------------------
+      # UPLOAD GITHUB ARTIFACT
+      # ------------------------------------------------------------
+      - name: Upload Microsoft Store MSIX
         uses: actions/upload-artifact@v4
         with:
-          name: windows-store-msi
-          path: store-package/*.msi
+          name: windows-store-msix
+          path: store-package/*.msix
           if-no-files-found: error
           retention-days: 30
 
   # ============================================================
-  # UPLOAD MICROSOFT STORE MSI TO R2
+  # UPLOAD MICROSOFT STORE MSIX TO R2
   # ============================================================
   upload-windows-store-to-r2:
     needs: build-windows-store
@@ -260,34 +836,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download Microsoft Store MSI artifact
+      - name: Download Microsoft Store MSIX artifact
         uses: actions/download-artifact@v4
         with:
-          name: windows-store-msi
+          name: windows-store-msix
           path: ./store-package/
 
       - name: Display Store package
         run: |
-          echo "Microsoft Store package:"
+          echo "Microsoft Store MSIX package:"
           echo "--------------------------------"
 
           ls -lah store-package/
 
           echo "--------------------------------"
 
-      - name: Verify exactly one MSI
+      - name: Verify exactly one MSIX
         shell: bash
         run: |
-          MSI_COUNT=$(find store-package -maxdepth 1 -type f -name "*.msi" | wc -l)
+          MSIX_COUNT=$(find store-package \
+            -maxdepth 1 \
+            -type f \
+            -name "*.msix" |
+            wc -l)
 
-          if [ "$MSI_COUNT" -ne 1 ]; then
-            echo "ERROR: Expected exactly one MSI."
-            echo "Found: $MSI_COUNT"
-            find store-package -maxdepth 1 -type f -print
+          if [ "$MSIX_COUNT" -ne 1 ]; then
+            echo "ERROR: Expected exactly one MSIX."
+            echo "Found: $MSIX_COUNT"
+
+            find store-package \
+              -maxdepth 1 \
+              -type f \
+              -print
+
             exit 1
           fi
 
-          echo "Exactly one MSI found."
+          echo "Exactly one MSIX found."
 
       - name: Configure Cloudflare R2 credentials
         run: |
@@ -299,18 +884,23 @@ jobs:
         run: |
           echo "R2_ENDPOINT=https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" >> "$GITHUB_ENV"
 
-      - name: Upload Microsoft Store MSI to R2
+      - name: Upload Microsoft Store MSIX to R2
         shell: bash
         run: |
-          MSI_FILE=$(find store-package -maxdepth 1 -type f -name "*.msi" | head -n 1)
-          MSI_NAME=$(basename "$MSI_FILE")
+          MSIX_FILE=$(find store-package \
+            -maxdepth 1 \
+            -type f \
+            -name "*.msix" |
+            head -n 1)
 
-          echo "MSI file:"
-          echo "$MSI_FILE"
+          MSIX_NAME=$(basename "$MSIX_FILE")
+
+          echo "MSIX file:"
+          echo "$MSIX_FILE"
 
           echo ""
-          echo "MSI name:"
-          echo "$MSI_NAME"
+          echo "MSIX name:"
+          echo "$MSIX_NAME"
 
           echo ""
           echo "Release tag:"
@@ -318,53 +908,50 @@ jobs:
 
           echo ""
           echo "Uploading to:"
-          echo "s3://${{ secrets.R2_BUCKET }}/store/${{ github.ref_name }}/${MSI_NAME}"
+          echo "s3://${{ secrets.R2_BUCKET }}/store/${{ github.ref_name }}/${MSIX_NAME}"
 
           aws s3 cp \
-            "$MSI_FILE" \
-            "s3://${{ secrets.R2_BUCKET }}/store/${{ github.ref_name }}/${MSI_NAME}" \
-            --content-type "application/x-msi" \
+            "$MSIX_FILE" \
+            "s3://${{ secrets.R2_BUCKET }}/store/${{ github.ref_name }}/${MSIX_NAME}" \
+            --content-type "application/msix" \
             --cache-control "public, max-age=31536000, immutable" \
             --endpoint-url "$R2_ENDPOINT"
 
           echo ""
-          echo "Microsoft Store MSI uploaded successfully."
+          echo "Microsoft Store MSIX uploaded successfully."
 
-      - name: Show Microsoft Store URL
+      - name: Show Microsoft Store MSIX URL
         shell: bash
         run: |
-          MSI_FILE=$(find store-package -maxdepth 1 -type f -name "*.msi" | head -n 1)
-          MSI_NAME=$(basename "$MSI_FILE")
+          MSIX_FILE=$(find store-package \
+            -maxdepth 1 \
+            -type f \
+            -name "*.msix" |
+            head -n 1)
+
+          MSIX_NAME=$(basename "$MSIX_FILE")
 
           echo ""
           echo "============================================================"
-          echo "MICROSOFT STORE MSI"
+          echo "MICROSOFT STORE MSIX"
           echo "============================================================"
           echo ""
-          echo "https://update.vilsend.in/store/${{ github.ref_name }}/${MSI_NAME}"
+          echo "Filename:"
+          echo "$MSIX_NAME"
+          echo ""
+          echo "Download URL:"
+          echo "https://update.vilsend.in/store/${{ github.ref_name }}/${MSIX_NAME}"
           echo ""
           echo "============================================================"
-
-  # ============================================================
-  # MICROSOFT STORE PUBLISHING
-  # DISABLED UNTIL PARTNER CENTER IS CONFIGURED
-  # ============================================================
-  publish-windows-store:
-    needs: upload-windows-store-to-r2
-
-    runs-on: ubuntu-latest
-
-    # if: ${{ false }}
-
-    steps:
-      - name: Publish to Microsoft Store
-        run: |
-          echo "Microsoft Store publishing is currently disabled."
           echo ""
-          echo "Required GitHub secrets:"
-          echo "  MS_STORE_TENANT_ID"
-          echo "  MS_STORE_CLIENT_ID"
-          echo "  MS_STORE_CLIENT_SECRET"
+          echo "This MSIX is UNSIGNED."
+          echo ""
+          echo "Download it and submit it manually through"
+          echo "Microsoft Partner Center."
+          echo ""
+          echo "Microsoft Store will handle Store signing."
+          echo ""
+          echo "============================================================"
 
   # ============================================================
   # NORMAL TAURI UPDATER / R2 UPLOAD

@@ -1,11 +1,12 @@
-import { ClerkProvider } from '@clerk/clerk-react';
-import type { ReactNode } from 'react';
-import { env, isClerkConfigured } from '@/lib/env';
-import { AxiosProvider } from '@/providers/axios-provider';
-import { QueryProvider } from '@/providers/query-provider';
-import { ThemeProvider } from '@/providers/theme-provider';
-import { AuthProvider } from '@/contexts/auth-context';
-import { WebSocketProvider } from '@/contexts/websocket-context';
+import { ClerkProvider } from "@clerk/clerk-react";
+import type { ReactNode } from "react";
+import { env, isClerkConfigured } from "@/lib/env";
+import { AxiosProvider } from "@/providers/axios-provider";
+import { QueryProvider } from "@/providers/query-provider";
+import { ThemeProvider } from "@/providers/theme-provider";
+import { AuthProvider } from "@/contexts/auth-context";
+import { WebSocketProvider } from "@/contexts/websocket-context";
+import { ClerkDebug } from "@/providers/ClerkDebug";
 
 /**
  * Top-level provider stack.
@@ -20,6 +21,7 @@ export function AppProviders({ children }: { children: ReactNode }) {
   if (isClerkConfigured) {
     return (
       <ClerkProvider publishableKey={env.clerkPublishableKey}>
+        <ClerkDebug />
         <AxiosProvider>
           <QueryProvider>
             <ThemeProvider>
