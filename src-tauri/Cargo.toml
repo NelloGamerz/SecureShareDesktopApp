@@ -55,8 +55,13 @@ tauri-plugin-os = "2"
 tauri-plugin-device = "1"
 sysinfo = "0.37"
 tauri-plugin-updater = "2"
-tauri-plugin-clerk = "0.1.1"
 tauri-plugin-http = "2.6.0"
+tauri-plugin-deep-link = "2"
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+# Forwards `vilsend://` deep links (and argv) from a second process into the
+# already-running instance so an in-flight OAuth flow can complete.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Power"] }

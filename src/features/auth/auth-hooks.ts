@@ -10,12 +10,15 @@ export const PROFILE_KEY = ["auth", "user-profile"] as const;
  * Global hook — the current user's profile + onboarding state.
  * Used by the auth guard, the onboarding page, the sidebar user menu, etc.
  */
-export function useCurrentUserProfile() {
+export function useCurrentUserProfile(options?: { enabled?: boolean }) {
   return useQuery<UserProfile>({
     queryKey: PROFILE_KEY,
     queryFn: fetchCurrentUser,
     staleTime: 60_000,
     retry: 1,
+    // Callers on unauthenticated screens (sign-in, sign-up) must pass
+    // `enabled: false` so the request is not issued before a session exists.
+    enabled: options?.enabled ?? true,
   });
 }
 

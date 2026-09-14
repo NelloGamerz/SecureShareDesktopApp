@@ -1,29 +1,20 @@
-import { SignIn } from '@clerk/clerk-react';
+import { useAuth } from '@/contexts/auth-context';
+import { BrowserAuthPanel } from './browser-auth-panel';
 
 export function SignInPage() {
+  const { signIn } = useAuth();
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50 dark:bg-slate-950 p-4">
-      <SignIn
-        signUpUrl="/sign-up"
-        fallbackRedirectUrl="/onboarding"
-        appearance={{
-          elements: {
-            rootBox: "w-full max-w-md",
-            card: "rounded-2xl shadow-xl border border-slate-200 dark:border-slate-800",
-            headerTitle: "text-2xl font-bold",
-            headerSubtitle: "text-slate-600 dark:text-slate-400",
-            formFieldInput:
-              "border-slate-200 dark:border-slate-700",
-            socialButtonsBlockButton:
-              "border-slate-200 dark:border-slate-700",
-            formButtonPrimary:
-              "bg-indigo-600 hover:bg-indigo-700",
-            footerActionLink:
-              "text-indigo-600 dark:text-indigo-400",
-          },
-        }}
-      />
-    </div>
+    <BrowserAuthPanel
+      title="Welcome back"
+      subtitle="Sign in to continue to your workspace and devices."
+      actionLabel="Continue in browser"
+      pendingLabel="Waiting for you to finish in your browser…"
+      footerText="Don't have an account?"
+      footerLinkLabel="Create one"
+      footerLinkTo="/sign-up"
+      onAuthenticate={() => void signIn()}
+    />
   );
 }
 

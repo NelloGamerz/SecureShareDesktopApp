@@ -1,63 +1,29 @@
-// import { useAuth } from '@clerk/clerk-react';
-// import { useEffect, type ReactNode } from 'react';
-// import { setTokenGetter } from '@/lib/api';
-
-// /**
-//  * Bridges Clerk's session token into the shared axios instance.
-//  * Mount once inside <ClerkProvider>. Every axios request will then
-//  * automatically carry a fresh Bearer JWT.
-//  */
-// export function AxiosProvider({ children }: { children: ReactNode }) {
-//   const { getToken, isSignedIn } = useAuth();
-
-//   useEffect(() => {
-//     setTokenGetter(async () => {
-//       if (!isSignedIn) return null;
-//       try {
-//         return await getToken();
-//       } catch {
-//         return null;
-//       }
-//     });
-//   }, [getToken, isSignedIn]);
-
-//   return <>{children}</>;
-// }
-
-
-import { useAuth } from '@clerk/clerk-react';
 import { useEffect, type ReactNode } from 'react';
+import { getAuthToken } from '@/api/tauri';
 import { setTokenGetter } from '@/lib/api';
-import { info, error } from '@tauri-apps/plugin-log';
 
+/**
+ * Bridges the desktop session token into the shared axios instance.
+ *
+ * The token lives in the Rust `AuthState`, not in React, so this getter asks
+ * the Tauri layer for it on every request. That keeps `Authorization` current
+ * without a polling timer: `get_auth_token` returns the stored token and
+ * refreshes it when it is close to expiry.
+ */
 export function AxiosProvider({ children }: { children: ReactNode }) {
-  const { getToken, isSignedIn, isLoaded } = useAuth();
-
   useEffect(() => {
-    if (!isLoaded) return;
-
-    info(`Clerk loaded: ${isLoaded}`);
-    info(`Clerk signed in: ${!!isSignedIn}`);
-
     setTokenGetter(async () => {
-      if (!isSignedIn) {
-        await info("Clerk user is not signed in");
-        return null;
-      }
-
       try {
-        const token = await getToken();
-
-        await info(`Token exists: ${!!token}`);
-        await info(`Token length: ${token?.length ?? 0}`);
-
-        return token;
-      } catch (err) {
-        await error(`getToken failed: ${String(err)}`);
+        return await getAuthToken();
+      } catch {
+        // No session, or the refresh failed and Rust cleared it. Either way the
+        // request goes out unauthenticated and a 401 is surfaced normally.
         return null;
       }
     });
-  }, [getToken, isSignedIn, isLoaded]);
+
+    return () => setTokenGetter(() => Promise.resolve(null));
+  }, []);
 
   return <>{children}</>;
 }

@@ -4,6 +4,12 @@ use thiserror::Error;
 pub enum AppError {
     #[error("not authenticated")]
     NotAuthenticated,
+    /// A user-facing authentication failure.
+    ///
+    /// Rendered verbatim in the UI, so the message must already be safe to show
+    /// and must never contain tokens, authorization codes, or client secrets.
+    #[error("{0}")]
+    Auth(String),
     #[error("not connected")]
     NotConnected,
     #[error("internal error: {0}")]
@@ -19,6 +25,10 @@ pub enum AppError {
 impl AppError {
     pub fn not_authenticated() -> Self {
         Self::NotAuthenticated
+    }
+
+    pub fn auth(message: impl Into<String>) -> Self {
+        Self::Auth(message.into())
     }
 
     pub fn not_connected() -> Self {

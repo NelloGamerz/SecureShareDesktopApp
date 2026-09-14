@@ -1,6 +1,6 @@
 import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
 import { env } from "@/lib/env";
-import { info, error } from "@tauri-apps/plugin-log";
+import { error } from "@tauri-apps/plugin-log";
 import { getDeviceIdentifier } from "@/services/getDeviceInfo";
 
 const api = axios.create({
@@ -13,50 +13,31 @@ const api = axios.create({
 
 let tokenGetter: (() => Promise<string | null>) | null = null;
 
-/** Called once from the AxiosProvider to wire Clerk's getToken into axios. */
+/**
+ * Called once from `AxiosProvider` to wire the desktop session token into
+ * axios. The getter reads from the Rust `AuthState`, so it always returns the
+ * current token and refreshes it when it is near expiry.
+ */
 export function setTokenGetter(getter: () => Promise<string | null>) {
   tokenGetter = getter;
 }
-
-// api.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
-//   // Attach the Clerk session JWT when available.
-//   if (tokenGetter) {
-//     try {
-//       const token = await tokenGetter();
-//       if (token) {
-//         config.headers.Authorization = `Bearer ${token}`;
-//       }
-//     } catch {
-//       // token unavailable; continue without auth header
-//     }
-//   }
-//   return config;
-// });
 
 api.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
   if (tokenGetter) {
     try {
       const token = await tokenGetter();
 
-      await info(`Clerk token exists: ${!!token}`);
-      await info(`Clerk token length: ${token?.length ?? 0}`);
-
       if (token) {
         config.headers.Authorization = `Bearer ${token}`;
-
-        await info("Authorization header attached");
-      } else {
-        await info("No Clerk token received");
       }
 
       const deviceIdentifier = await getDeviceIdentifier();
 
       config.headers["X-Device-Id"] = deviceIdentifier;
     } catch (err) {
-      await error(`Failed to get Clerk token: ${String(err)}`);
+      // Log the failure only. Never log the token or the header value.
+      await error(`Failed to attach the authorization header: ${String(err)}`);
     }
-  } else {
-    await info("tokenGetter is null");
   }
 
   return config;

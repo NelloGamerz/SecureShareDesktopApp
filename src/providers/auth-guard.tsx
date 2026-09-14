@@ -1,63 +1,72 @@
-import {
-  SignedIn as ClerkSignedIn,
-  SignedOut as ClerkSignedOut,
-  useUser,
-} from '@clerk/clerk-react';
 import type { ReactNode } from 'react';
 import { Navigate } from 'react-router-dom';
-import { isClerkConfigured } from '@/lib/env';
+import { LoadingScreen } from '@/components/layout/loading-screen';
+import { useAuth } from '@/contexts/auth-context';
+import { useCurrentUserProfile } from '@/features/auth/auth-hooks';
 
 /**
- * ProtectedRoute — gates a subtree behind authentication.
- * In preview mode (Clerk not configured) it renders children directly.
+ * ProtectedRoute — gates a subtree behind a desktop session.
+ *
+ * Waits for the first status read from the Tauri layer before deciding, so a
+ * signed-in user is not bounced to `/sign-in` during startup.
  */
 export function ProtectedRoute({ children }: { children: ReactNode }) {
-  if (!isClerkConfigured) {
-    return <>{children}</>;
+  const { isAuthenticated, isLoaded } = useAuth();
+
+  if (!isLoaded) {
+    return <LoadingScreen label="Starting VilSend…" />;
   }
 
-  return (
-    <ClerkSignedIn>
-      {children}
-    </ClerkSignedIn>
-  );
+  if (!isAuthenticated) {
+    return <Navigate to="/sign-in" replace />;
+  }
+
+  return <>{children}</>;
 }
 
-/** AuthGate — redirects signed-in users away from auth pages. */
+/** AuthGate — keeps already-authenticated users off the sign-in/sign-up pages. */
 export function AuthGate({ children }: { children: ReactNode }) {
-  if (!isClerkConfigured) {
-    return <>{children}</>;
+  const { isAuthenticated, isLoaded } = useAuth();
+
+  if (!isLoaded) {
+    return <LoadingScreen label="Starting VilSend…" />;
   }
-  return <ClerkSignedOut>{children}</ClerkSignedOut>;
+
+  if (isAuthenticated) {
+    return <Navigate to="/organization" replace />;
+  }
+
+  return <>{children}</>;
 }
 
-/** Hook that returns a normalized user object across Clerk/preview modes. */
+/**
+ * Normalized user object for display.
+ *
+ * Clerk no longer exposes the user to the renderer, so display fields come from
+ * the application's own profile endpoint plus the local session.
+ */
 export function useCurrentUser() {
-  const { user, isLoaded, isSignedIn } = useUser();
+  const { isAuthenticated, isLoaded, user } = useAuth();
+  const { data: profile, isLoading } = useCurrentUserProfile({
+    enabled: isAuthenticated,
+  });
 
-  if (!isClerkConfigured) {
-    return {
-      isLoaded: true,
-      isSignedIn: true,
-      name: 'Demo User',
-      email: 'demo@vilsend.io',
-      imageUrl: '',
-      initials: 'DU',
-    } as const;
-  }
+  const firstName = profile?.firstName ?? '';
+  const name = firstName || 'User';
 
   return {
-    isLoaded,
-    isSignedIn,
-    name: user?.fullName ?? user?.username ?? 'User',
-    email: user?.primaryEmailAddress?.emailAddress ?? '',
-    imageUrl: user?.imageUrl ?? '',
-    firstName: user?.firstName ?? '',
-    lastName: user?.lastName ?? '',
-    initials:
-      (user?.firstName?.[0] ?? '') + (user?.lastName?.[0] ?? '') || 'U',
+    isLoaded: isLoaded && !isLoading,
+    isSignedIn: isAuthenticated,
+    id: user?.id ?? profile?.id,
+    name,
+    firstName,
+    // Not returned by the profile endpoint yet; kept so display components do
+    // not have to special-case a missing field.
+    lastName: '',
+    email: '',
+    imageUrl: '',
+    initials: firstName ? firstName.slice(0, 2).toUpperCase() : 'U',
   } as const;
 }
 
-export { ClerkSignedIn, ClerkSignedOut };
 export { Navigate };

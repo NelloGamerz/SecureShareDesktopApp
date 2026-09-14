@@ -10,7 +10,13 @@ export interface User {
 }
 
 export interface Session {
-  token: string;
+  /**
+   * The access token is intentionally absent from the renderer.
+   *
+   * It lives in the Rust `AuthState` and is fetched per request by the axios
+   * interceptor through the `get_auth_token` command, which also refreshes it.
+   */
+  token?: string;
   userId?: string;
   isAuthenticated: boolean;
 }

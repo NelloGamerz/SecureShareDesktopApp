@@ -289,6 +289,7 @@ use std::sync::Arc;
 
 use crate::events::EventDispatcher;
 use crate::services::local_transfer_file_service::LocalTransferFileService;
+use crate::services::oauth_service::OAuthService;
 use crate::services::{AuthService, EventService, WebSocketService};
 use crate::state::{AuthState, WebSocketState};
 use crate::transfer::manager::{TransferEvent, UploadManager};
@@ -300,6 +301,7 @@ pub struct AppState {
     pub auth_state: Arc<AuthState>,
     pub websocket_state: Arc<WebSocketState>,
     pub auth_service: Arc<AuthService>,
+    pub oauth_service: Arc<OAuthService>,
     pub websocket_service: Arc<WebSocketService>,
     pub event_service: Arc<EventService>,
     pub event_dispatcher: Arc<EventDispatcher>,
@@ -346,10 +348,16 @@ impl AppState {
             Arc::clone(&event_dispatcher),
         ));
 
+        let oauth_service = Arc::new(OAuthService::new(
+            Arc::clone(&auth_state),
+            app_handle.clone(),
+        ));
+
         let auth_service = Arc::new(AuthService::new(
             Arc::clone(&auth_state),
             Arc::clone(&websocket_service),
             Arc::clone(&event_service),
+            Arc::clone(&oauth_service),
             Arc::clone(&config),
         ));
 
@@ -358,6 +366,7 @@ impl AppState {
             auth_state,
             websocket_state,
             auth_service,
+            oauth_service,
             websocket_service,
             event_service,
             event_dispatcher,

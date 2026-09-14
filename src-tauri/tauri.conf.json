@@ -27,6 +27,12 @@
   },
 
   "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["vilsend"]
+      }
+    },
+
     "updater": {
       "active": true,
 
