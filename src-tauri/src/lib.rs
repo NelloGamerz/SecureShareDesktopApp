@@ -109,7 +109,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_secure_storage::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(Builder::new(|_| b"your-stronghold-password".to_vec()).build())
+        .plugin(Builder::new(|_| b"vilSend-strongHold-password".to_vec()).build())
         .setup(|app| {
             // tracing::info!("Executable: {:?}", app.path().executable()?);
             /*
