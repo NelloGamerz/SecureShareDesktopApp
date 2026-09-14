@@ -20,10 +20,10 @@ use app::AppState;
 use tauri_plugin_log::{log, Builder as LogBuilder, Target, TargetKind};
 
 use commands::auth::{
-    clear_all, delete_tunnel_hostname, delete_tunnel_token, get_connection_status,
-    get_default_download_location, get_tunnel_hostname, get_tunnel_token, login, logout,
-    save_tunnel_hostname, save_tunnel_token, send_message, set_default_download_location,
-    start_websocket, update_auth_token,
+    cancel_desktop_auth, clear_all, delete_tunnel_hostname, delete_tunnel_token, get_auth_status,
+    get_auth_token, get_connection_status, get_default_download_location, get_tunnel_hostname,
+    get_tunnel_token, logout, save_tunnel_hostname, save_tunnel_token, send_message,
+    set_default_download_location, start_desktop_auth, start_websocket,
 };
 
 use commands::transfer_commands::{
@@ -54,7 +54,27 @@ use crate::services::KeyringService;
 pub fn run() {
     // Logger::init();
 
-    tauri::Builder::default()
+    /*
+     * The single-instance plugin must be registered before any other plugin.
+     *
+     * On Windows and Linux a `vilsend://` deep link is delivered by launching
+     * the executable with the URL as an argument. Without this, completing
+     * sign-in in the browser would spawn a second copy of the app instead of
+     * completing the flow in the instance that started it. The `deep-link`
+     * feature forwards the URL on to the deep-link plugin.
+     */
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }));
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let builder = tauri::Builder::default();
+
+    builder
         // .plugin(
         //     LogBuilder::default()
         //         .level(log::LevelFilter::Info)
@@ -66,6 +86,7 @@ pub fn run() {
         //         ])
         //         .build(),
         // )
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(
             LogBuilder::default()
                 .level(log::LevelFilter::Trace)
@@ -95,18 +116,12 @@ pub fn run() {
              * Application config
              */
 
-            // #[cfg(debug_assertions)]
-            // {
-            //     if let Some(window) = app.get_webview_window("main") {
-            //         window.open_devtools();
-            //     }
-            // }
+            // let window = app
+            //     .get_webview_window("main")
+            //     .expect("main window not found");
 
-            let window = app
-                .get_webview_window("main")
-                .expect("main window not found");
+            // window.open_devtools();
 
-            window.open_devtools();
             let config = if cfg!(debug_assertions) {
                 AppConfig::development()
             } else {
@@ -134,6 +149,27 @@ pub fn run() {
                 AppState::new(app.handle().clone(), config, local_transfer_service.clone());
 
             let app_state = Arc::new(app_state);
+
+            /*
+             * Resume the desktop session from secure storage.
+             *
+             * This runs to completion before the webview can call
+             * `get_auth_status`, so a user who has already signed in opens
+             * straight into the app rather than being shown the sign-in screen
+             * on every launch. It reads the local keychain only — no network —
+             * so a slow or absent connection cannot delay startup.
+             */
+            {
+                let restored =
+                    tauri::async_runtime::block_on(app_state.oauth_service.restore());
+
+                tracing::info!(
+                    target: "auth",
+                    event = "session_restore_checked",
+                    restored,
+                    "checked secure storage for a previous desktop session"
+                );
+            }
 
             #[cfg(feature = "enable-updater")]
             {
@@ -179,6 +215,74 @@ pub fn run() {
              * Cloudflared state
              */
             app.manage(Cloudflared::new());
+
+            /*
+             * Desktop OAuth: `vilsend://auth/callback`
+             *
+             * Registered only after `app.manage(app_state)` above, because the
+             * callback handler resolves `AppState` from the app handle. The
+             * listener runs on the multithreaded async runtime, so registering
+             * it earlier would allow a callback to race setup and panic on an
+             * unmanaged state.
+             *
+             * The browser redirects to the registered custom scheme; the OS
+             * hands the URL to this process, and Rust completes the token
+             * exchange. The webview never sees the authorization code.
+             */
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+
+                let handle = app.handle().clone();
+
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let handle = handle.clone();
+
+                        tauri::async_runtime::spawn(async move {
+                            commands::auth::handle_auth_callback(handle, url).await;
+                        });
+                    }
+                });
+
+                // Launch-time callback, e.g. the app was closed while the user
+                // was in the browser. The in-memory PKCE verifier is gone in
+                // that case, so the callback fails cleanly and the UI asks the
+                // user to try again rather than hanging.
+                match app.deep_link().get_current() {
+                    Ok(Some(urls)) => {
+                        let handle = app.handle().clone();
+
+                        for url in urls {
+                            let handle = handle.clone();
+
+                            tauri::async_runtime::spawn(async move {
+                                commands::auth::handle_auth_callback(handle, url).await;
+                            });
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "auth",
+                            %error,
+                            "could not read the launch deep link"
+                        );
+                    }
+                }
+
+                // In development the app is not installed, so Windows and Linux
+                // have no registry entry for the scheme. Register it so
+                // `npm run tauri dev` can receive callbacks; in a bundled build
+                // the installer writes the entry instead.
+                #[cfg(all(debug_assertions, any(target_os = "windows", target_os = "linux")))]
+                if let Err(error) = app.deep_link().register_all() {
+                    tracing::warn!(
+                        target: "auth",
+                        %error,
+                        "could not register the vilsend:// scheme for development"
+                    );
+                }
+            }
 
             /*
              * Transfer storage
@@ -268,7 +372,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            login,
+            start_desktop_auth,
+            cancel_desktop_auth,
+            get_auth_status,
+            get_auth_token,
             logout,
             start_websocket,
             send_message,
@@ -296,7 +403,6 @@ pub fn run() {
             delete_local_transfer_files,
             delete_local_transfer_file,
             check_local_transfer_exists,
-            update_auth_token,
             detect_device_type
         ])
         // .run(tauri::generate_context!())

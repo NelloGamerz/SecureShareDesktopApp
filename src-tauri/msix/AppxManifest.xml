@@ -46,6 +46,19 @@
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png" />
 
+      <!--
+        Registers the `vilsend://` scheme so the OAuth callback can return to
+        the app. MSIX packages ignore the registry-based registration that the
+        NSIS/WiX installers perform, so the scheme must be declared here as
+        well. Keep in sync with `plugins.deep-link.desktop.schemes` in
+        tauri.conf.json.
+      -->
+      <Extensions>
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="vilsend" />
+        </uap:Extension>
+      </Extensions>
+
     </Application>
 
   </Applications>

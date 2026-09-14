@@ -40,8 +40,49 @@ export type TransferEvent =
   | "transfer-cancelled"
   | "transfer-request";
 
-export async function loginWithTauri(token: string, deviceInfo: DeviceInfo) {
-  return invoke<void>("login", { token, deviceInfo });
+/** Non-sensitive view of the desktop session held by Rust. */
+export interface TauriAuthStatus {
+  isAuthenticated: boolean;
+  userId?: string | null;
+  isAuthenticating: boolean;
+}
+
+export interface DesktopAuthConfig {
+  clientId: string;
+  issuer: string;
+  redirectUri: string;
+  scopes: string;
+  signupPrompt?: string;
+}
+
+/**
+ * Starts the system-browser Authorization Code + PKCE sign-in.
+ *
+ * Rust mints the PKCE verifier, opens the browser, and stores the resulting
+ * token. Nothing sensitive crosses this boundary, so no token is returned.
+ */
+export async function startDesktopAuth(
+  config: DesktopAuthConfig,
+  mode: "sign_in" | "sign_up",
+) {
+  return invoke<void>("start_desktop_auth", { config, mode });
+}
+
+/** Abandons an in-flight sign-in. Safe to call when none is pending. */
+export async function cancelDesktopAuth() {
+  return invoke<void>("cancel_desktop_auth");
+}
+
+export async function getAuthStatus() {
+  return invoke<TauriAuthStatus>("get_auth_status");
+}
+
+/**
+ * Returns a token for the `Authorization` header, refreshing it when close to
+ * expiry. Resolves to `null` when there is no session.
+ */
+export async function getAuthToken() {
+  return invoke<string | null>("get_auth_token");
 }
 
 export async function logoutFromTauri() {
@@ -168,10 +209,6 @@ export async function localTransferExists(
   return invoke<boolean>("local_transfer_exists", {
     transferId,
   });
-}
-
-export async function updateAuthToken(token: string) {
-  return invoke<void>("update_auth_token", { token });
 }
 
 export async function pauseTransfer(id: string) {

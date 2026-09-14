@@ -5,6 +5,7 @@ import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ExternalLink } from "@/components/ui/external-link";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCompleteOnboarding } from "./onboarding-hooks";
 import type {
@@ -324,25 +325,21 @@ export function OnboardingPage() {
                     />
                     <span className="text-sm text-muted-foreground">
                       I agree to the{" "}
-                      <a
+                      <ExternalLink
                         href="https://www.vilsend.in/terms"
-                        target="_blank"
-                        rel="noreferrer"
                         className="font-medium text-foreground underline-offset-4 hover:underline"
                         onClick={(e) => e.stopPropagation()}
                       >
                         Terms of Service
-                      </a>{" "}
+                      </ExternalLink>{" "}
                       and{" "}
-                      <a
+                      <ExternalLink
                         href="https://www.vilsend.in/privacy"
-                        target="_blank"
-                        rel="noreferrer"
                         className="font-medium text-foreground underline-offset-4 hover:underline"
                         onClick={(e) => e.stopPropagation()}
                       >
                         Privacy Policy
-                      </a>
+                      </ExternalLink>
                       .
                     </span>
                   </label>

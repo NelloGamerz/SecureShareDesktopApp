@@ -61,13 +61,31 @@ impl EventDispatcher {
         )))
     }
 
-    pub async fn emit_auth_state(&self) -> Result<(), AppError> {
+    /// Notifies the webview that the desktop session changed.
+    ///
+    /// Carries no token material — React reads the token through the
+    /// `get_auth_token` command when it needs one for a request.
+    pub async fn emit_auth_state(
+        &self,
+        is_authenticated: bool,
+        user_id: Option<String>,
+    ) -> Result<(), AppError> {
         let payload = serde_json::json!({
-            "type": "auth-state"
-            // "isAuthenticated": is_authenticated,
-            // "userId": user_id
+            "type": "auth-state",
+            "isAuthenticated": is_authenticated,
+            "userId": user_id
         });
         self.emit("auth-state-changed", payload).await
+    }
+
+    /// Reports a failed sign-in attempt to the webview so the UI can stop
+    /// waiting and show an error.
+    pub async fn emit_auth_error(&self, message: String) -> Result<(), AppError> {
+        let payload = serde_json::json!({
+            "type": "auth-error",
+            "message": message
+        });
+        self.emit("auth-error", payload).await
     }
 
     pub async fn emit_command(&self, command: ServerCommand) -> Result<(), AppError> {

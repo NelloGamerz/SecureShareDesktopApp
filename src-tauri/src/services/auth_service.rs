@@ -1,16 +1,22 @@
 use std::sync::Arc;
 
 use crate::error::AppError;
-use crate::models::DeviceInfo;
-use crate::models::Session;
+use crate::services::oauth_service::OAuthService;
 use crate::services::{EventService, WebSocketService};
 use crate::state::AuthState;
 use crate::utils::config::AppConfig;
 
+/// Owns the desktop session lifecycle.
+///
+/// The token itself is obtained by [`OAuthService`] (system-browser
+/// Authorization Code + PKCE) and lives in [`AuthState`]; this service is
+/// responsible for tearing the session down and telling the UI about it.
 pub struct AuthService {
     auth_state: Arc<AuthState>,
     websocket_service: Arc<WebSocketService>,
     event_service: Arc<EventService>,
+    oauth_service: Arc<OAuthService>,
+    #[allow(dead_code)]
     config: Arc<AppConfig>,
 }
 
@@ -19,36 +25,24 @@ impl AuthService {
         auth_state: Arc<AuthState>,
         websocket_service: Arc<WebSocketService>,
         event_service: Arc<EventService>,
+        oauth_service: Arc<OAuthService>,
         config: Arc<AppConfig>,
     ) -> Self {
         Self {
             auth_state,
             websocket_service,
             event_service,
+            oauth_service,
             config,
         }
     }
 
-    pub async fn login(&self, token: String, device_info: DeviceInfo) -> Result<(), AppError> {
-        // eprintln!("device info", device_info);
-        let session = Session::new(token.clone());
+    /// Announces that a sign-in completed. Called by the OAuth callback handler
+    /// after the token has been stored.
+    pub async fn notify_signed_in(&self) -> Result<(), AppError> {
+        let user_id = self.auth_state.user_id.read().await.clone();
 
-        {
-            let mut auth_token = self.auth_state.token.write().await;
-            *auth_token = Some(token);
-        }
-
-        {
-            let mut auth_session = self.auth_state.session.write().await;
-            *auth_session = Some(session);
-        }
-
-        {
-            let mut authenticated = self.auth_state.is_authenticated.write().await;
-            *authenticated = true;
-        }
-
-        self.event_service.emit_auth_state().await?;
+        self.event_service.emit_auth_state(true, user_id).await?;
 
         tracing::info!(
             target: "auth_service",
@@ -59,41 +53,22 @@ impl AuthService {
         Ok(())
     }
 
+    /// Ends the local desktop session.
+    ///
+    /// Stops dependent services, drops every credential and any in-flight
+    /// authorization request, then tells the UI it is signed out.
     pub async fn logout(&self) -> Result<(), AppError> {
         self.websocket_service.stop().await?;
 
-        {
-            let mut auth_token = self.auth_state.token.write().await;
-            *auth_token = None;
-        }
+        self.oauth_service.clear().await;
 
-        {
-            let mut auth_user = self.auth_state.user_id.write().await;
-            *auth_user = None;
-        }
+        self.event_service.emit_auth_state(false, None).await?;
 
-        {
-            let mut auth_session = self.auth_state.session.write().await;
-            *auth_session = None;
-        }
-
-        {
-            let mut authenticated = self.auth_state.is_authenticated.write().await;
-            *authenticated = false;
-        }
-
-        self.event_service.emit_auth_state().await?;
-        tracing::info!(target: "auth_service", event = "logout_completed", "user session cleared");
-        Ok(())
-    }
-
-    pub async fn update_token(&self, token: String) -> Result<(), AppError> {
-        let mut auth_token = self.auth_state.token.write().await;
-
-        *auth_token = Some(token);
-
-        let mut authenticated = self.auth_state.is_authenticated.write().await;
-        *authenticated = true;
+        tracing::info!(
+            target: "auth_service",
+            event = "logout_completed",
+            "user session cleared"
+        );
 
         Ok(())
     }
