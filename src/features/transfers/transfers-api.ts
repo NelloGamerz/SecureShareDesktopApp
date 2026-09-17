@@ -1,4 +1,5 @@
 import { api } from "@/lib/api";
+import { getDeviceIdentifier } from "@/services/getDeviceInfo";
 
 export type TransferConnectionType = "LAN" | "TUNNEL" | "lan" | "tunnel";
 
@@ -72,7 +73,16 @@ export async function createTransfer(
 
 export async function getMyTransfers(): Promise<TransferResponse[]> {
   const { data } = await api.get<TransferResponse[]>("/transfers");
-  return data;
+
+  const deviceIdentifier = await getDeviceIdentifier();
+
+  return data.map((transfer) => ({
+    ...transfer,
+
+    // The current device is the sender only when its stored identifier
+    // matches the device the backend recorded as the sender.
+    sentByMe: transfer.senderDeviceId === deviceIdentifier,
+  }));
 }
 
 export async function updateTransferStatus(
