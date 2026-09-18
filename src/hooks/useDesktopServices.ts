@@ -14,6 +14,7 @@ import {
 } from "@/api/tauri";
 
 import { useNotificationStore } from "@/store/notification-store";
+import { ensureTunnelHostname } from "@/features/tunnel/tunnel-hostname";
 import { useCurrentUserProfile } from "@/features/auth/auth-hooks";
 import { useAuth } from "@/contexts/auth-context";
 import { registerCurrentDevice } from "@/features/devices/devices-api";
@@ -167,10 +168,27 @@ export function useDesktopServices() {
           }
 
           // ---------------------------------------------------
+          // TUNNEL HOSTNAME
+          // ---------------------------------------------------
+
+          /*
+           * Cloudflared reads its hostname from the keychain, so repair a
+           * missing hostname before starting it rather than letting the spawn
+           * fail on a lookup error.
+           */
+          const hostname = await ensureTunnelHostname();
+
+          if (!hostname) {
+            console.error(
+              "[DesktopServices] Tunnel hostname unavailable. Skipping Cloudflared start.",
+            );
+          }
+
+          // ---------------------------------------------------
           // CLOUDFLARED
           // ---------------------------------------------------
 
-          if (!cloudflareRunning) {
+          if (!cloudflareRunning && hostname) {
             console.log("[DesktopServices] Starting Cloudflared...");
 
             try {

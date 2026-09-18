@@ -337,6 +337,28 @@ pub fn run() {
             });
 
             /*
+             * Log the stored tunnel hostname so a startup can confirm what the
+             * app will advertise without opening the UI. A missing hostname is
+             * expected before onboarding, so it is logged as a warning.
+             */
+            match KeyringService::get_hostname(app.handle()) {
+                Ok(hostname) => {
+                    tracing::info!(
+                        target: "keyring",
+                        hostname = %hostname,
+                        "Loaded tunnel hostname"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "keyring",
+                        %error,
+                        "Tunnel hostname not found"
+                    );
+                }
+            }
+
+            /*
              * Debug: Print stored device identity
              */
             // match KeyringService::get_device_public_key(app.handle()) {

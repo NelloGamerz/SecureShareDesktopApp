@@ -115,6 +115,14 @@ export async function save_tunnel_hostname(hostname: string) {
   return invoke<void>("save_tunnel_hostname", { hostname });
 }
 
+export async function get_tunnel_hostname() {
+  return invoke<string>("get_tunnel_hostname");
+}
+
+export async function delete_tunnel_hostname() {
+  return invoke<void>("delete_tunnel_hostname");
+}
+
 export async function startCloudflared() {
   return invoke<void>("start_cloudflared_cmd");
 }
