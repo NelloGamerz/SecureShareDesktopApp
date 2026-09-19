@@ -102,13 +102,9 @@ impl WebSocketService {
     pub async fn start(&self, device_info: DeviceInfo) -> Result<(), AppError> {
         println!("WEBSOCKET SERVICE START CALLED");
 
-        let has_token = self.auth_state.token.read().await.is_some();
-
-        println!("AUTH TOKEN AVAILABLE: {}", has_token);
-
-        if !has_token {
-            println!("WEBSOCKET START FAILED: NO AUTH TOKEN");
-
+        // Deliberately silent about whether a token is present — see
+        // `WebSocketState::start`.
+        if self.auth_state.token.read().await.is_none() {
             return Err(AppError::not_authenticated());
         }
 

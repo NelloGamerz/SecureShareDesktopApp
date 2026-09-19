@@ -34,13 +34,10 @@ impl WebSocketState {
     pub async fn start(&self, device_info: DeviceInfo) -> Result<(), AppError> {
         println!("WEBSOCKET STATE START CALLED");
 
-        let has_token = self.auth_state.token.read().await.is_some();
-
-        println!("TOKEN AVAILABLE IN WEBSOCKET STATE: {}", has_token);
-
-        if !has_token {
-            println!("NO AUTH TOKEN AVAILABLE");
-
+        // Whether a session exists is not logged: the refusal is visible to
+        // the caller as `NotAuthenticated`, and the log line told an observer
+        // nothing they could not infer from the connection being absent.
+        if self.auth_state.token.read().await.is_none() {
             return Err(AppError::not_authenticated());
         }
 

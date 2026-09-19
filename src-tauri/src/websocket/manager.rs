@@ -83,10 +83,6 @@ impl WebSocketManager {
     ) -> Result<(), AppError> {
         println!("WEBSOCKET MANAGER START CALLED");
 
-        let token = self.auth_state.token.read().await.clone();
-
-        println!("TOKEN AVAILABLE IN MANAGER: {}", token.is_some());
-
         tracing::info!(
             target: "websocket",
             event = "start_requested",
@@ -121,7 +117,6 @@ impl WebSocketManager {
         let handle = tokio::spawn(async move {
             println!("WEBSOCKET TOKIO TASK STARTED");
 
-            let token_for_loop = token.clone();
             let device_info_for_loop = device_info.clone();
             let mut attempt = 0_u32;
 
@@ -162,20 +157,17 @@ impl WebSocketManager {
                     token_guard.clone()
                 };
 
-                println!("TOKEN AVAILABLE IN LOOP: {}", token.is_some());
-
-                // let token = match token {
-                //     Some(token) => token,
-                //     None => {
-                //         println!("NO TOKEN AVAILABLE");
-                //         break;
-                //     }
-                // };
-
                 let token = match token {
                     Some(token) => token,
                     None => {
-                        println!("NO TOKEN AVAILABLE - WAITING");
+                        // The session may still be restoring, so wait rather
+                        // than giving up. The reason is logged as an event, not
+                        // as a token-presence flag.
+                        tracing::debug!(
+                            target: "websocket",
+                            event = "connect_deferred_no_session",
+                            "websocket connect deferred: no desktop session yet"
+                        );
 
                         sleep(std::time::Duration::from_secs(5)).await;
 
