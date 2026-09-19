@@ -1,4 +1,5 @@
 import { api } from "@/lib/api";
+import { getDeviceIdentifier } from "@/services/getDeviceInfo";
 
 /** Tunnel settings as provisioned for this device by the central API. */
 export interface TunnelInfo {
@@ -13,7 +14,11 @@ export interface TunnelInfo {
  * tunnel. Used to restore the hostname when the keychain copy is missing.
  */
 export async function getTunnelInfo(): Promise<TunnelInfo> {
-  const { data } = await api.get<TunnelInfo>("/tunnel/info");
+  const deviceIdentifier = await getDeviceIdentifier();
+
+  const { data } = await api.get<TunnelInfo>("/tunnel/info", {
+    headers: { "X-Device-Id": deviceIdentifier },
+  });
 
   if (!data?.hostname) {
     throw new Error("Tunnel info response did not include a hostname.");
