@@ -7,10 +7,16 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedCapabilities"
   IgnorableNamespaces="uap desktop rescap">
 
+  <!--
+    `Version` is a placeholder. The store build overwrites it from the release
+    tag (see "UPDATE PACKAGE VERSION" in .github/workflows/release.yml), so the
+    value here only matters when packaging an MSIX by hand. Keep it in step
+    with the `version` field in Cargo.toml, which is the single source of truth.
+  -->
   <Identity
     Name="VilSend"
     Publisher="CN=VilSend"
-    Version="1.0.0.0"
+    Version="1.0.4.0"
     ProcessorArchitecture="x64" />
 
   <Properties>

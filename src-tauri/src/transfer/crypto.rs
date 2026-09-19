@@ -96,23 +96,6 @@ pub fn derive_transfer_key(shared_secret: &[u8; 32]) -> Result<[u8; 32], String>
 // ----------------------------------------------------------------------
 //
 
-// pub fn encrypt_chunk(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedChunk, String> {
-//     let cipher = Aes256Gcm::new(key.into());
-
-//     let mut nonce = [0u8; 12];
-
-//     rand::thread_rng().fill_bytes(&mut nonce);
-
-//     let ciphertext = cipher
-//         .encrypt(Nonce::from_slice(&nonce), plaintext)
-//         .map_err(|e| e.to_string())?;
-
-//     Ok(EncryptedChunk {
-//         nonce: nonce.to_vec(),
-//         data: ciphertext,
-//     })
-// }
-
 pub fn encrypt_chunk(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedChunk, String> {
     let cipher = Aes256Gcm::new(key.into());
 

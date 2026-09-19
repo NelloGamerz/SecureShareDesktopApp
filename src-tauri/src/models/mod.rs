@@ -16,13 +16,6 @@ pub enum ConnectionStatus {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum ServerEvent {
-    ConnectionStatus(ConnectionStatus),
-    Message(String),
-    Error(String),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
     pub device_name: String,
@@ -32,10 +25,4 @@ pub struct DeviceInfo {
     pub app_version: String,
 }
 
-pub use transfer::{
-    ConnectionType,
-    TransferMetadata,
-    // LocalTransferFile,
-    // TransferStatus,
-    // TransferStatusResponse,
-};
+pub use transfer::{ConnectionType, TransferMetadata};

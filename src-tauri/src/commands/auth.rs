@@ -12,7 +12,6 @@ use crate::models::ConnectionStatus;
 use crate::models::DeviceInfo;
 use crate::services::keyring_service::KeyringService;
 use crate::services::oauth_service::DesktopAuthConfig;
-// use crate::services::SecureStorage;
 
 const DEFAULT_DOWNLOAD_LOCATION_KEY: &str = "default_download_location";
 
@@ -181,22 +180,6 @@ pub async fn handle_auth_callback(app: AppHandle, url: Url) {
     }
 }
 
-// #[tauri::command]
-// pub async fn start_websocket(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
-//     state.websocket_service.start().await
-// }
-
-// #[tauri::command]
-// pub async fn start_websocket(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
-//     println!("START_WEBSOCKET COMMAND HIT");
-
-//     let result = state.websocket_service.start().await;
-
-//     println!("START_WEBSOCKET RESULT: {:?}", result);
-
-//     result
-// }
-
 #[tauri::command]
 pub async fn start_websocket(
     state: State<'_, Arc<AppState>>,
@@ -218,6 +201,17 @@ pub async fn start_websocket(
     println!("START_WEBSOCKET RESULT: {:?}", result);
 
     result
+}
+
+/// Stops the control-plane WebSocket.
+///
+/// The webview has always invoked `stop_websocket`, on sign-out and on
+/// teardown, but no command of that name was registered — the call failed at
+/// the IPC boundary and the socket kept running after the session that
+/// authenticated it was gone.
+#[tauri::command]
+pub async fn stop_websocket(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    state.websocket_service.stop().await
 }
 
 #[tauri::command]

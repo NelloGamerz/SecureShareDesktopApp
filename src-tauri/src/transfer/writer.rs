@@ -20,11 +20,11 @@ use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64},
+        atomic::{AtomicBool, AtomicU64},
         Arc, Mutex,
     },
 };
-use sysinfo::{Disks, System};
+use sysinfo::Disks;
 
 use std::sync::atomic::Ordering;
 use tokio::fs;
@@ -166,7 +166,6 @@ pub async fn start_transfer(
             transfer_id: request.transfer_id.clone(),
             total_bytes: request.file_size,
             received_bytes: AtomicU64::new(0),
-            total_chunks: 0,
             received_chunks: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -219,7 +218,6 @@ pub async fn start_transfer(
             transfer_id: request.transfer_id.clone(),
             total_bytes: request.file_size,
             received_bytes: AtomicU64::new(0),
-            total_chunks: 0,
             received_chunks: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -325,7 +323,6 @@ pub async fn start_transfer(
         total_bytes: request.file_size,
         received_bytes: AtomicU64::new(0),
 
-        total_chunks: 0,
         received_chunks: AtomicU64::new(0),
 
         paused: AtomicBool::new(false),
@@ -624,48 +621,6 @@ pub async fn receive(
         return Err((StatusCode::CONFLICT, "transfer cancelled".into()));
     }
 
-    // if fs::metadata(&part).await.is_err() {
-    //     fs::write(&part, decrypted).await.map_err(|e| {
-    //         download
-    //             .received_bytes
-    //             .fetch_add(decrypted.len() as u64, Ordering::Relaxed);
-
-    //         download.received_chunks.fetch_add(1, Ordering::Relaxed);
-
-    //         *download.status.lock().unwrap() = TransferStatus::Downloading;
-
-    //         events::emit_progress(
-    //             &state.app,
-    //             "transfer-progress",
-    //             progress::make_download(&download),
-    //         );
-    //         tracing::error!(
-    //             transfer_id=%transfer,
-    //             chunk=index,
-    //             error=%e,
-    //             "failed writing chunk"
-    //         );
-
-    //         (
-    //             StatusCode::INTERNAL_SERVER_ERROR,
-    //             format!("write failed: {e}"),
-    //         )
-    //     })?;
-
-    //     tracing::info!(
-    //         transfer_id=%transfer,
-    //         chunk=index,
-    //         path=%part.display(),
-    //         "chunk saved"
-    //     );
-    // } else {
-    //     tracing::debug!(
-    //         transfer_id=%transfer,
-    //         chunk=index,
-    //         "chunk already exists"
-    //     );
-    // }
-
     if fs::metadata(&part).await.is_err() {
         let decrypted_size = decrypted.len() as u64;
 
@@ -785,15 +740,6 @@ pub async fn receive(
     );
 
     Ok(StatusCode::OK)
-}
-
-fn io_error(e: std::io::Error) -> (StatusCode, String) {
-    tracing::warn!(
-        error=%e,
-        "receiver write failed"
-    );
-
-    (StatusCode::INTERNAL_SERVER_ERROR, "storage failure".into())
 }
 
 pub async fn get_public_key(

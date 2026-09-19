@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 use crate::error::AppError;
 use crate::events::EventDispatcher;
@@ -10,7 +10,6 @@ use crate::websocket::{WebSocketManager, WebSocketManagerConfig};
 
 pub struct WebSocketState {
     pub manager: Arc<Mutex<Option<Arc<WebSocketManager>>>>,
-    pub status: Arc<RwLock<ConnectionStatus>>,
     pub config: Arc<AppConfig>,
     pub auth_state: Arc<crate::state::AuthState>,
     pub event_dispatcher: Arc<EventDispatcher>,
@@ -24,7 +23,6 @@ impl WebSocketState {
     ) -> Self {
         Self {
             manager: Arc::new(Mutex::new(None)),
-            status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             config,
             auth_state,
             event_dispatcher,
@@ -34,13 +32,10 @@ impl WebSocketState {
     pub async fn start(&self, device_info: DeviceInfo) -> Result<(), AppError> {
         println!("WEBSOCKET STATE START CALLED");
 
-        let has_token = self.auth_state.token.read().await.is_some();
-
-        println!("TOKEN AVAILABLE IN WEBSOCKET STATE: {}", has_token);
-
-        if !has_token {
-            println!("NO AUTH TOKEN AVAILABLE");
-
+        // Whether a session exists is not logged: the refusal is visible to
+        // the caller as `NotAuthenticated`, and the log line told an observer
+        // nothing they could not infer from the connection being absent.
+        if self.auth_state.token.read().await.is_none() {
             return Err(AppError::not_authenticated());
         }
 

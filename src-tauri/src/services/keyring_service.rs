@@ -232,10 +232,6 @@ impl KeyringService {
         Self::set(app, DEVICE_PUBLIC_KEY, key)
     }
 
-    // pub fn get_device_public_key(app: &AppHandle) -> Result<String, String> {
-    //     Self::get(app, DEVICE_PUBLIC_KEY)
-    // }
-
     pub fn get_device_public_key(app: &AppHandle) -> Result<String, String> {
         let private_key = Self::get(app, DEVICE_PRIVATE_KEY)?;
         derive_public_key(&private_key)

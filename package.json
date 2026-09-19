@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "check:ipc": "node scripts/check-ipc-contract.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

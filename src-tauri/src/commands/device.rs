@@ -1,7 +1,6 @@
 use crate::services::{
     generate_device_keypair::generate_device_keypair, keyring_service::KeyringService,
 };
-use sysinfo::{Components, System};
 use tauri::AppHandle;
 
 #[tauri::command]
@@ -23,22 +22,27 @@ pub async fn create_device_identity(app: AppHandle) -> Result<String, String> {
 // #[tauri::command]
 #[tauri::command]
 pub async fn detect_device_type() -> String {
+    // Exactly one of these blocks is compiled, so the function has a value on
+    // every supported platform without an unreachable trailing expression.
     #[cfg(target_os = "windows")]
     {
-        return detect_windows_device_type();
+        detect_windows_device_type()
     }
 
     #[cfg(target_os = "macos")]
     {
-        return detect_macos_device_type();
+        detect_macos_device_type()
     }
 
     #[cfg(target_os = "linux")]
     {
-        return detect_linux_device_type();
+        detect_linux_device_type()
     }
 
-    "UNKNOWN".into()
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        "UNKNOWN".into()
+    }
 }
 
 #[cfg(target_os = "windows")]

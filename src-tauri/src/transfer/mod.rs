@@ -11,6 +11,5 @@ pub mod scanner;
 pub mod scheduler;
 pub mod state;
 pub mod upload;
-pub mod worker;
 pub mod writer;
 pub mod crypto;

@@ -23,7 +23,7 @@ use commands::auth::{
     cancel_desktop_auth, clear_all, delete_tunnel_hostname, delete_tunnel_token, get_auth_status,
     get_auth_token, get_connection_status, get_default_download_location, get_tunnel_hostname,
     get_tunnel_token, logout, save_tunnel_hostname, save_tunnel_token, send_message,
-    set_default_download_location, start_desktop_auth, start_websocket,
+    set_default_download_location, start_desktop_auth, start_websocket, stop_websocket,
 };
 
 use commands::transfer_commands::{
@@ -42,18 +42,15 @@ use commands::cloudflared::{cloudflared_status, start_cloudflared_cmd, stop_clou
 use commands::device::{create_device_identity, detect_device_type};
 
 use state::cloudflared_state::Cloudflared;
-use tauri_plugin_stronghold::Builder;
 
 use tauri::Manager;
 
-use utils::{config::AppConfig, logger::Logger};
+use utils::config::AppConfig;
 
 use crate::services::KeyringService;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Logger::init();
-
     /*
      * The single-instance plugin must be registered before any other plugin.
      *
@@ -75,21 +72,21 @@ pub fn run() {
     let builder = tauri::Builder::default();
 
     builder
-        // .plugin(
-        //     LogBuilder::default()
-        //         .level(log::LevelFilter::Info)
-        //         .targets([
-        //             Target::new(TargetKind::LogDir {
-        //                 file_name: Some("app".into()),
-        //             }),
-        //             Target::new(TargetKind::Stdout),
-        //         ])
-        //         .build(),
-        // )
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(
+        .plugin({
+            /*
+             * Trace is a development level: it records request and payload
+             * detail that a shipped build should not be writing to disk. Debug
+             * builds keep it; release builds log at Info.
+             */
+            let level = if cfg!(debug_assertions) {
+                log::LevelFilter::Trace
+            } else {
+                log::LevelFilter::Info
+            };
+
             LogBuilder::default()
-                .level(log::LevelFilter::Trace)
+                .level(level)
                 .targets([
                     // Log file
                     Target::new(TargetKind::LogDir {
@@ -97,30 +94,36 @@ pub fn run() {
                     }),
                     // Console (cargo tauri dev)
                     Target::new(TargetKind::Stdout),
-                    // Errors
-                    // Target::new(TargetKind::Stderr),
-                    // Frontend console (devtools)
-                    // Target::new(TargetKind::Webview),
                 ])
-                .build(),
-        )
+                .build()
+        })
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_secure_storage::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(Builder::new(|_| b"vilSend-strongHold-password".to_vec()).build())
         .setup(|app| {
             // tracing::info!("Executable: {:?}", app.path().executable()?);
             /*
              * Application config
              */
 
-            let window = app
-                .get_webview_window("main")
-                .expect("main window not found");
+            /*
+             * Devtools belong to development only.
+             *
+             * `open_devtools` does not exist in a release build unless the
+             * Tauri `devtools` feature is enabled, and this crate does not
+             * enable it — so the release build has no inspector at all, and a
+             * release binary never opens one automatically.
+             */
+            #[cfg(all(desktop, debug_assertions))]
+            {
+                let window = app
+                    .get_webview_window("main")
+                    .expect("main window not found");
 
-            window.open_devtools();
+                window.open_devtools();
+            }
 
             let config = if cfg!(debug_assertions) {
                 AppConfig::development()
@@ -182,19 +185,6 @@ pub fn run() {
             }
 
             let dispatcher2 = Arc::clone(&app_state.event_dispatcher);
-
-            /*
-             * Local SQLite storage
-             */
-
-            /*
-             * Application state
-             */
-            // let app_state = Arc::new(AppState::new(
-            //     app.handle().clone(),
-            //     config,
-            //     local_transfer_service.clone(),
-            // ));
 
             /*
              * Start transfer event listener
@@ -358,39 +348,6 @@ pub fn run() {
                 }
             }
 
-            /*
-             * Debug: Print stored device identity
-             */
-            // match KeyringService::get_device_public_key(app.handle()) {
-            //     Ok(public_key) => {
-            //         tracing::info!(
-            //             device_public_key = %public_key,
-            //             "Loaded device public key"
-            //         );
-            //     }
-            //     Err(err) => {
-            //         tracing::warn!(
-            //             error = %err,
-            //             "Device public key not found"
-            //         );
-            //     }
-            // }
-
-            // match KeyringService::get_device_private_key(app.handle()) {
-            //     Ok(private_key) => {
-            //         tracing::info!(
-            //             device_private_key = %private_key,
-            //             "Loaded device private key"
-            //         );
-            //     }
-            //     Err(err) => {
-            //         tracing::warn!(
-            //             error = %err,
-            //             "Device private key not found"
-            //         );
-            //     }
-            // }
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -400,6 +357,7 @@ pub fn run() {
             get_auth_token,
             logout,
             start_websocket,
+            stop_websocket,
             send_message,
             get_connection_status,
             save_tunnel_token,

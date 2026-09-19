@@ -223,6 +223,18 @@ risk:
 architecture exists, as a plain script over the source tree. That script is
 worth writing on day one.
 
+**Phase 1 note:** the first of the three was written —
+`scripts/check-ipc-contract.mjs`, run as `npm run check:ipc`. It reads the
+`generate_handler!` list out of `src-tauri/src/lib.rs` and scans `src/` for
+`invoke("<name>")` call sites, rather than the generated manifest §7.4
+describes; it strips comments first, and it checks command *names* only —
+argument names and types are not yet covered. It found two instances of the
+B1 defect class: `stop_websocket` (the known one) and `local_transfer_exists`
+(not previously documented). The other two script checks — emitted events vs
+`listen` calls, and `ConnectionStatus` serialisation — are still unwritten;
+the second would have caught the confirmed `server-event` gap.
+Summarised in `reports/phase-1-report.md` §7.
+
 ---
 
 ## 6. CI changes

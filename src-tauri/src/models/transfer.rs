@@ -25,7 +25,12 @@ pub enum ConnectionType {
 #[serde(rename_all = "camelCase")]
 pub struct TransferMetadata {
     pub transfer_id: String,
-    // pub transfer_key: String,
+    // Part of the `start_transfer` command's payload, so it is kept even
+    // though nothing reads it: the command's shape is a public contract and
+    // removing a field from it is a breaking change for the webview. The
+    // sender in fact ignores this value and fetches the receiver's key from
+    // `GET /transfer/public-key` instead — see the phase 1 report.
+    #[allow(dead_code)]
     pub receiver_public_key: String,
     // pub receiver_id: String,
     pub network_type: ConnectionType,
@@ -53,7 +58,6 @@ pub struct TransferStatusResponse {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-// #[serde(rename_all = "camelCase")]
 pub struct LocalTransferFile {
     pub transfer_id: String,
     pub file_path: String,
