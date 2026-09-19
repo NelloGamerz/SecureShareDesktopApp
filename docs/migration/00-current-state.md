@@ -1,5 +1,12 @@
 # 00 — Current State
 
+> **Phase 1 corrections.** Four claims in this audit were contradicted by the
+> code while Phase 1 was implemented and are marked inline: **H1** (the signing
+> key was never in the repository), the `server-event` / `websocket-message`
+> rows in §3.2 (neither is ever emitted), and **H3** (a fourth orphan file
+> exists). Phase 1 also found several defects this audit does not cover —
+> see `reports/phase-1-report.md` §7.
+>
 > **How to read this document.** Everything below was read from the repository
 > at commit `7c6b82b` (branch `main`). File paths and line numbers are real.
 > Where I could not determine something from the code, it is marked
@@ -98,8 +105,8 @@ delete_local_transfer_file, check_local_transfer_exists, detect_device_type
 |---|---|---|
 | `auth-state-changed` | `events/dispatcher.rs:68-79` | `src/contexts/auth-context.tsx:148` |
 | `auth-error` | `events/dispatcher.rs:83-89` | `src/contexts/auth-context.tsx:170` |
-| `server-event` | `events/dispatcher.rs` (connection status) | `src/contexts/websocket-context.tsx:19` |
-| `websocket-message` | `events/dispatcher.rs` | `src/contexts/websocket-context.tsx:25` |
+| `server-event` | **NOT EMITTED — corrected in Phase 1.** Nothing in `src-tauri/src` emits this name. The frontend listens for it at `src/contexts/websocket-context.tsx:19`, so that listener is inert and `status` never leaves its initial value. | `src/contexts/websocket-context.tsx:19` |
+| `websocket-message` | **NOT EMITTED — corrected in Phase 1.** Same as above; no emitter exists. | `src/contexts/websocket-context.tsx:25` |
 | `transfer-request` | `events/dispatcher.rs:43-50` | `src/api/tauri.ts:156` |
 | `transfer-progress` | `transfer/events.rs` via `manager.rs`/`writer.rs` | `src/api/tauri.ts:150` |
 | `transfer-completed` | ditto | ditto |
@@ -242,7 +249,7 @@ unbounded queues, one global lock.
 | `transfer/download.rs` | 0 | **No** |
 | `transfer/cancle.rs` *(sic — misspelled)* | 0 | **No** |
 | `utils/bitset.rs`, `fs.rs`, `hash.rs`, `path.rs`, `time.rs` | 0 each | **No** |
-| `transfer/worker.rs` | 96 | Yes — contains only a comment |
+| `transfer/worker.rs` | 96 | Yes — contains only a comment. **Phase 1:** this is an eleventh empty-module file; the plan's task 1.9 named only ten. Deleted. |
 | `websocket/protocol.rs` | 430 | No (`// pub mod protocol;`) — **entirely commented out** |
 | `websocket/WebSocketManager.rs` | 117 | No — orphan, third case-duplicate |
 | `websocket/error.rs` | — | Declared but `WebSocketError` is not re-exported; unused |
@@ -564,9 +571,9 @@ the project is on Tauri v2 — already flagged in `docs/BUILD_AND_RELEASE.md:19`
 
 | # | Finding | Evidence |
 |---|---|---|
-| H1 | **`TAURI_SIGNING_PRIVATE_KEY` is present in the committed root `.env`.** | `.env` (grep for `^[A-Z_]+=`) |
+| H1 | ~~`TAURI_SIGNING_PRIVATE_KEY` is present in the committed root `.env`.~~ **Corrected in Phase 1: this is false.** `.env` is listed in `.gitignore` and has never been committed on any ref (`git log --all -- .env` is empty). The key was observed in an untracked working-copy file. The real defect next door was that `.gitignore` also ignored `.env.example`, so the template shipped nowhere; Phase 1 fixed that. | `.env`, `.gitignore:14` |
 | H2 | `src-tauri/2` is a stray file containing npm audit output — an accidental shell redirect (`npm install 2> file`). | `src-tauri/2` |
-| H3 | **Three case-duplicate orphan files** exist because this directory has per-directory case sensitivity enabled on Windows. Confirmed **distinct inodes and distinct md5s**, both tracked by git. | `state/auth_state.rs` + `state/AuthState.rs`; `state/websocket_state.rs` + `state/WebSocketState.rs`; `websocket/manager.rs` + `websocket/WebSocketManager.rs` |
+| H3 | **Three case-duplicate orphan files** exist because this directory has per-directory case sensitivity enabled on Windows. Confirmed **distinct inodes and distinct md5s**, both tracked by git. **Phase 1 addition:** a fourth, unrelated orphan exists in the same directory — `state/receiver_state.rs` is not declared in `state/mod.rs` and would not compile (`PathBuf` and `Arc` are used without imports). All four were deleted in Phase 1. | `state/auth_state.rs` + `state/AuthState.rs`; `state/websocket_state.rs` + `state/WebSocketState.rs`; `websocket/manager.rs` + `websocket/WebSocketManager.rs`; `state/receiver_state.rs` |
 | H4 | Version drift: `tauri.conf.json` = `1.0.4`, `Cargo.toml` = `0.1.0`, `msix/AppxManifest.xml` = `1.0.0.0`. | three files |
 | H5 | `app/mod.rs`: lines **1-287 are three commented-out historical `AppState` implementations**; lines 288-392 are live. | `app/mod.rs` |
 | H6 | Every service file carries a fully-commented-out earlier draft above the live code (`websocket_service.rs`, `local_transfer_file_service.rs`, `cloudflared.rs`, `secure_storage.rs`). | multiple |

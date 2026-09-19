@@ -103,11 +103,11 @@ blamed for them, and means the security posture only improves from here.
 | 1.2 | Rotate the committed `TAURI_SIGNING_PRIVATE_KEY` and remove it from `.env`; add `.env` to `.gitignore` if not present | `.env`, `.gitignore` |
 | 1.3 | Replace `"csp": null` with a real CSP | `src-tauri/tauri.conf.json` |
 | 1.4 | Drop `LevelFilter::Trace` → `Info` in release | `src-tauri/src/lib.rs:90-106` |
-| 1.5 | Stop logging token existence/length | `src/lib/api.ts:14-44` |
+| 1.5 | Stop logging token existence/length | **Corrected in Phase 1:** `src/lib/api.ts` was already clean. The live sites were five `println!` calls in `services/websocket_service.rs`, `state/websocket_state.rs` and `websocket/manager.rs`. |
 | 1.6 | Register the missing `stop_websocket` command | `src-tauri/src/lib.rs:396-429`, `commands/` |
 | 1.7 | Delete ~1500 lines of commented-out dead code | `app/mod.rs:1-287`, `services/secure_storage.rs`, `services/*.rs` drafts, `websocket/protocol.rs`, `lib.rs:78-88` |
 | 1.8 | Delete the 3 case-duplicate orphan files | `state/AuthState.rs`, `state/WebSocketState.rs`, `websocket/WebSocketManager.rs` |
-| 1.9 | Delete the 10 empty stub files and their dangling references | `transfer/{checksum,persistence,pause,download,cancle}.rs`, `utils/{bitset,fs,hash,path,time}.rs` |
+| 1.9 | Delete the 11 empty stub files and their dangling references | `transfer/{checksum,persistence,pause,download,cancle,worker}.rs`, `utils/{bitset,fs,hash,path,time}.rs` |
 | 1.10 | Remove dead dependencies: `keyring`, `ed25519-dalek`, `iota_stronghold`, and unregister the unused Stronghold plugin | `Cargo.toml`, `lib.rs:112` |
 | 1.11 | Remove the stray `src-tauri/2` file | `src-tauri/2` |
 | 1.12 | Fix the `ConnectionStatus` casing mismatch | `src/hooks/useDesktopServices.ts:112` |
@@ -124,7 +124,7 @@ blamed for them, and means the security posture only improves from here.
 
 ### Acceptance criteria
 
-- [ ] `cargo check` produces **zero warnings** (currently reports ~27).
+- [ ] `cargo check` produces **zero warnings** (the baseline is 21, not ~27).
 - [ ] No `devtools` window in a release build.
 - [ ] `grep -rn "your-stronghold\|vilSend-strongHold" src-tauri/` returns nothing.
 - [ ] `git ls-files src-tauri/src | wc -l` drops by ≥ 14.
@@ -133,9 +133,15 @@ blamed for them, and means the security posture only improves from here.
 
 ### Tests required
 
-None new (there is no harness yet). Manual smoke: sign in → send → receive →
-sign out. **Capture this as a written checklist** — it becomes the regression
-suite in Phase 2.
+No unit tests (there is no harness yet). One source-tree check was added,
+because `06-testing-and-quality.md` §5.1/§6.3 assigns it to this phase and
+because task 1.6 is a bug fix that needs a failing-first guard:
+`scripts/check-ipc-contract.mjs` (`npm run check:ipc`) asserts that every
+`invoke("<name>")` in `src/` names a command registered in
+`generate_handler!`. It fails on the pre-1.6 tree and found a second instance
+of the same defect. Manual smoke: sign in → send → receive → sign out.
+**Capture this as a written checklist** — it becomes the regression suite in
+Phase 2.
 
 ### Risks
 
