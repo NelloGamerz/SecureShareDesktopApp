@@ -1,6 +1,9 @@
 [package]
 name = "vilsend"
-version = "0.1.0"
+# The single source of truth for the application version. `tauri.conf.json`
+# deliberately omits `version`, so the bundler falls back to this value; and
+# `tauri::generate_context!` reports it to the app as the package version.
+version = "1.0.4"
 description = "Secure file sharing built for modern teams — fast, encrypted, and simple across every device."
 authors = ["you"]
 edition = "2021"
