@@ -12,13 +12,13 @@ interface WebSocketContextValue {
 const WebSocketContext = createContext<WebSocketContextValue | null>(null);
 
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
-  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
+  const [status, setStatus] = useState<ConnectionStatus>('Disconnected');
   const [messages, setMessages] = useState<WebSocketMessage[]>([]);
 
   useEffect(() => {
     const unsubscribe = listen<ServerEvent>('server-event', (event) => {
       if (event.payload.type === 'connection-status') {
-        setStatus((event.payload.payload as ConnectionStatus) ?? 'disconnected');
+        setStatus((event.payload.payload as ConnectionStatus) ?? 'Disconnected');
       }
     });
 
@@ -37,7 +37,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     await sendTauriMessage(payload);
   };
 
-  const value = useMemo(() => ({ status, connected: status === 'connected', messages, send }), [messages, status]);
+  const value = useMemo(() => ({ status, connected: status === 'Connected', messages, send }), [messages, status]);
 
   return <WebSocketContext.Provider value={value}>{children}</WebSocketContext.Provider>;
 }

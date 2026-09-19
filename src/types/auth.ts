@@ -21,12 +21,21 @@ export interface Session {
   isAuthenticated: boolean;
 }
 
+/**
+ * Mirrors `ConnectionStatus` in `src-tauri/src/models/mod.rs`.
+ *
+ * Serde serialises the unit variants under their Rust names, so the wire
+ * values are PascalCase. `Error` carries a message and is serialised
+ * externally tagged. These spellings are the ones `get_connection_status`
+ * returns and the ones a `server-event` payload carries — do not lower-case
+ * them, and do not compare against lower-case literals.
+ */
 export type ConnectionStatus =
-  | 'disconnected'
-  | 'connecting'
-  | 'connected'
-  | 'reconnecting'
-  | 'error';
+  | 'Disconnected'
+  | 'Connecting'
+  | 'Connected'
+  | 'Reconnecting'
+  | { Error: string };
 
 export interface WebSocketMessage {
   type: string;

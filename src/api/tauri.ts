@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { DeviceInfo } from "@/features/onboarding/onboarding-types";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import type { ConnectionStatus } from "@/types/auth";
 
 export interface TransferProgress {
   transfer_id: string;
@@ -103,10 +104,6 @@ export async function sendTauriMessage(payload: string) {
   return invoke<void>("send_message", { payload });
 }
 
-export async function getTauriConnectionStatus() {
-  return invoke<string>("get_connection_status");
-}
-
 export async function save_tunnel_token(token: string) {
   return invoke<void>("save_tunnel_token", { token });
 }
@@ -131,7 +128,7 @@ export async function stopCloudflared() {
   return invoke<void>("stop_cloudflared_cmd");
 }
 
-export function getConnectionStatus(): Promise<string> {
+export function getConnectionStatus(): Promise<ConnectionStatus> {
   return invoke("get_connection_status");
 }
 
