@@ -105,7 +105,6 @@ impl WebSocketManager {
             guard.clone()
         };
         let config = self.config.clone();
-        let connection = self.connection.clone();
         let sender = self.sender.clone();
         let reconnect_attempt = self.reconnect_attempt.clone();
         let task_handle = self.task_handle.clone();

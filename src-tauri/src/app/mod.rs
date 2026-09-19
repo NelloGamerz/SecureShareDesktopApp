@@ -7,19 +7,19 @@ use crate::services::{AuthService, EventService, WebSocketService};
 use crate::state::{AuthState, WebSocketState};
 use crate::transfer::manager::{TransferEvent, UploadManager};
 use crate::utils::config::AppConfig;
-use crate::websocket::WebSocketManager;
 
+/// The state the webview can reach.
+///
+/// Only the services are held. The `config`, `auth_state`,
+/// `websocket_state`, `upload_manager` and `local_transfer_service` values
+/// built in `new` are owned by the services below, which are their only
+/// readers, so keeping second copies here would be dead weight.
 pub struct AppState {
-    pub config: Arc<AppConfig>,
-    pub auth_state: Arc<AuthState>,
-    pub websocket_state: Arc<WebSocketState>,
     pub auth_service: Arc<AuthService>,
     pub oauth_service: Arc<OAuthService>,
     pub websocket_service: Arc<WebSocketService>,
     pub event_service: Arc<EventService>,
     pub event_dispatcher: Arc<EventDispatcher>,
-    pub upload_manager: Arc<UploadManager>,
-    pub local_transfer_service: Arc<LocalTransferFileService>,
 }
 
 impl AppState {
@@ -57,7 +57,6 @@ impl AppState {
         let websocket_service = Arc::new(WebSocketService::new(
             Arc::clone(&websocket_state),
             Arc::clone(&auth_state),
-            Arc::clone(&config),
             Arc::clone(&event_dispatcher),
         ));
 
@@ -75,31 +74,13 @@ impl AppState {
         ));
 
         let state = Self {
-            config,
-            auth_state,
-            websocket_state,
             auth_service,
             oauth_service,
             websocket_service,
             event_service,
             event_dispatcher,
-            upload_manager,
-            local_transfer_service,
         };
 
         (state, rx)
-    }
-
-    /*
-     * Call this immediately when WebSocketManager is created
-     */
-    pub async fn set_websocket_manager(&self, manager: Arc<WebSocketManager>) {
-        {
-            let mut websocket = self.websocket_state.manager.lock().await;
-
-            *websocket = Some(manager.clone());
-        }
-
-        self.event_dispatcher.attach_websocket_manager(manager);
     }
 }

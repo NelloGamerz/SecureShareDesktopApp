@@ -4,12 +4,10 @@ use crate::error::AppError;
 use crate::events::EventDispatcher;
 use crate::models::DeviceInfo;
 use crate::state::{AuthState, WebSocketState};
-use crate::utils::config::AppConfig;
 
 pub struct WebSocketService {
     websocket_state: Arc<WebSocketState>,
     auth_state: Arc<AuthState>,
-    config: Arc<AppConfig>,
     event_dispatcher: Arc<EventDispatcher>,
 }
 
@@ -17,13 +15,11 @@ impl WebSocketService {
     pub fn new(
         websocket_state: Arc<WebSocketState>,
         auth_state: Arc<AuthState>,
-        config: Arc<AppConfig>,
         event_dispatcher: Arc<EventDispatcher>,
     ) -> Self {
         Self {
             websocket_state,
             auth_state,
-            config,
             event_dispatcher,
         }
     }

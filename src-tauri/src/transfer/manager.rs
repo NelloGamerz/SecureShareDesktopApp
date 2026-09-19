@@ -128,7 +128,6 @@ impl UploadManager {
         let state = Arc::new(UploadState {
             transfer_id: metadata.transfer_id.clone(),
             transfer_key,
-            sender_ephemeral_public_key: ephemeral.public_key,
             endpoint: metadata.endpoint.clone(),
             network_type: metadata.network_type.clone(),
             total_bytes,

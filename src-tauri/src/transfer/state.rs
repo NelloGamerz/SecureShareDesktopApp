@@ -6,12 +6,10 @@ use std::{
     },
     time::Instant,
 };
-use x25519_dalek::PublicKey;
 
 pub struct UploadState {
     pub transfer_id: String,
     pub transfer_key: [u8; 32],
-    pub sender_ephemeral_public_key: PublicKey,
     pub endpoint: String,
     pub network_type: ConnectionType,
     pub total_bytes: u64,
@@ -47,7 +45,6 @@ pub struct DownloadState {
     pub total_bytes: u64,
     pub received_bytes: AtomicU64,
 
-    pub total_chunks: u64,
     pub received_chunks: AtomicU64,
 
     pub paused: AtomicBool,

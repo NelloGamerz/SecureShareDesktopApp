@@ -1,4 +1,3 @@
-use crate::utils::config::AppConfig;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
