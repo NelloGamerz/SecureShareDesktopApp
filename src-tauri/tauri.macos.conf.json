@@ -3,7 +3,8 @@
   "identifier": "in.vilsend.app",
   "bundle": {
     "resources": [
-      "resources/cloudflared/macos-x64/cloudflared"
+      "resources/cloudflared/macos-x64/cloudflared",
+      "resources/cloudflared/macos-arm64/cloudflared"
     ]
   }
 }
