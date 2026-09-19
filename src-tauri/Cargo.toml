@@ -32,16 +32,11 @@ tokio-util = { version = "0.7", features = ["codec", "compat", "time"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tauri-plugin-store = "2"
-tauri-plugin-stronghold = "2"
-iota_stronghold = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.7"
-keyring = "3"
 anyhow = "1"
 tauri-plugin-secure-storage = "1.4.0"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = "0.6"
 base64 = "0.22"
 aes-gcm = "0.10"
@@ -49,7 +44,10 @@ rand = "0.8"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tauri-plugin-log = "2.9.0"
-x25519-dalek = "2"
+# `static_secrets` was previously enabled only as a side effect of the
+# (unused) ed25519-dalek dependency, so `StaticSecret` disappeared when that
+# dependency was dropped. Declared explicitly now.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1"
 hkdf = "0.12"
 hex = "0.4"
