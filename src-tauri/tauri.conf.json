@@ -17,7 +17,6 @@
         "title": "VilSend",
         "width": 800,
         "height": 600,
-        "devtools": true,
         "useHttpsScheme": true
       }
     ],

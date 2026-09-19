@@ -116,11 +116,22 @@ pub fn run() {
              * Application config
              */
 
-            let window = app
-                .get_webview_window("main")
-                .expect("main window not found");
+            /*
+             * Devtools belong to development only.
+             *
+             * `open_devtools` does not exist in a release build unless the
+             * Tauri `devtools` feature is enabled, and this crate does not
+             * enable it — so the release build has no inspector at all, and a
+             * release binary never opens one automatically.
+             */
+            #[cfg(all(desktop, debug_assertions))]
+            {
+                let window = app
+                    .get_webview_window("main")
+                    .expect("main window not found");
 
-            window.open_devtools();
+                window.open_devtools();
+            }
 
             let config = if cfg!(debug_assertions) {
                 AppConfig::development()
