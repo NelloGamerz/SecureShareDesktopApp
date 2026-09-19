@@ -27,33 +27,6 @@ impl LocalTransferFileService {
         Self { pool }
     }
 
-    // pub async fn insert(
-    //     &self,
-    //     file: LocalTransferFile,
-    // ) -> Result<(), sqlx::Error> {
-
-    //     sqlx::query(
-    //         r#"
-    //         INSERT INTO local_transfer_files
-    //         (
-    //             transfer_id,
-    //             file_path,
-    //             file_name,
-    //             file_size
-    //         )
-    //         VALUES (?, ?, ?, ?)
-    //         "#
-    //     )
-    //     .bind(file.transfer_id)
-    //     .bind(file.file_path)
-    //     .bind(file.file_name)
-    //     .bind(file.file_size as i64)
-    //     .execute(&self.pool)
-    //     .await?;
-
-    //     Ok(())
-    // }
-
     pub async fn insert(&self, file: LocalTransferFile) -> Result<(), sqlx::Error> {
         tracing::info!(
             transfer_id = %file.transfer_id,
@@ -89,38 +62,6 @@ impl LocalTransferFileService {
 
         Ok(())
     }
-
-    // pub async fn get_by_transfer_id(
-    //     &self,
-    //     transfer_id: &str,
-    // ) -> Result<Vec<LocalTransferFile>, sqlx::Error> {
-    //     let rows = sqlx::query(
-    //         r#"
-    //         SELECT
-    //             transfer_id,
-    //             file_path,
-    //             file_name,
-    //             file_size
-    //         FROM local_transfer_files
-    //         WHERE transfer_id = ?
-    //         "#,
-    //     )
-    //     .bind(transfer_id)
-    //     .fetch_all(&self.pool)
-    //     .await?;
-
-    //     let files = rows
-    //         .into_iter()
-    //         .map(|row| LocalTransferFile {
-    //             transfer_id: row.get("transfer_id"),
-    //             file_path: row.get("file_path"),
-    //             file_name: row.get("file_name"),
-    //             file_size: row.get::<i64, _>("file_size") as u64,
-    //         })
-    //         .collect();
-
-    //     Ok(files)
-    // }
 
     pub async fn get_by_transfer_id(
         &self,

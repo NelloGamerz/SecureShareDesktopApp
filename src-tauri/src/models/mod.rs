@@ -35,7 +35,4 @@ pub struct DeviceInfo {
 pub use transfer::{
     ConnectionType,
     TransferMetadata,
-    // LocalTransferFile,
-    // TransferStatus,
-    // TransferStatusResponse,
 };

@@ -8,18 +8,6 @@ use crate::{
     services::local_transfer_file_service::LocalTransferFileService,
 };
 
-// #[tauri::command]
-// pub async fn save_local_transfer_file(
-//     service: State<'_, Arc<LocalTransferFileService>>,
-//     file: LocalTransferFile,
-// ) -> Result<(), String> {
-
-//     service
-//         .insert(file)
-//         .await
-//         .map_err(|e| e.to_string())
-// }
-
 #[tauri::command]
 pub async fn save_local_transfer_file(
     service: State<'_, Arc<LocalTransferFileService>>,

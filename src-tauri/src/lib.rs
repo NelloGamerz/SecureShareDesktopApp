@@ -46,14 +46,12 @@ use tauri_plugin_stronghold::Builder;
 
 use tauri::Manager;
 
-use utils::{config::AppConfig, logger::Logger};
+use utils::config::AppConfig;
 
 use crate::services::KeyringService;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Logger::init();
-
     /*
      * The single-instance plugin must be registered before any other plugin.
      *
@@ -75,17 +73,6 @@ pub fn run() {
     let builder = tauri::Builder::default();
 
     builder
-        // .plugin(
-        //     LogBuilder::default()
-        //         .level(log::LevelFilter::Info)
-        //         .targets([
-        //             Target::new(TargetKind::LogDir {
-        //                 file_name: Some("app".into()),
-        //             }),
-        //             Target::new(TargetKind::Stdout),
-        //         ])
-        //         .build(),
-        // )
         .plugin(tauri_plugin_deep_link::init())
         .plugin({
             /*
@@ -200,19 +187,6 @@ pub fn run() {
             }
 
             let dispatcher2 = Arc::clone(&app_state.event_dispatcher);
-
-            /*
-             * Local SQLite storage
-             */
-
-            /*
-             * Application state
-             */
-            // let app_state = Arc::new(AppState::new(
-            //     app.handle().clone(),
-            //     config,
-            //     local_transfer_service.clone(),
-            // ));
 
             /*
              * Start transfer event listener
@@ -375,39 +349,6 @@ pub fn run() {
                     );
                 }
             }
-
-            /*
-             * Debug: Print stored device identity
-             */
-            // match KeyringService::get_device_public_key(app.handle()) {
-            //     Ok(public_key) => {
-            //         tracing::info!(
-            //             device_public_key = %public_key,
-            //             "Loaded device public key"
-            //         );
-            //     }
-            //     Err(err) => {
-            //         tracing::warn!(
-            //             error = %err,
-            //             "Device public key not found"
-            //         );
-            //     }
-            // }
-
-            // match KeyringService::get_device_private_key(app.handle()) {
-            //     Ok(private_key) => {
-            //         tracing::info!(
-            //             device_private_key = %private_key,
-            //             "Loaded device private key"
-            //         );
-            //     }
-            //     Err(err) => {
-            //         tracing::warn!(
-            //             error = %err,
-            //             "Device private key not found"
-            //         );
-            //     }
-            // }
 
             Ok(())
         })

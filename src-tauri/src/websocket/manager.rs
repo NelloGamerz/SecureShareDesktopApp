@@ -233,20 +233,6 @@ impl WebSocketManager {
 
                         println!("STARTING HEARTBEAT TASK");
 
-                        // let heartbeat_task = tokio::spawn(async move {
-                        //     println!("HEARTBEAT STARTED");
-
-                        //     if let Err(err) = heartbeat_loop(
-                        //         heartbeat_sender,
-                        //         heartbeat_shutdown,
-                        //         heartbeat_interval,
-                        //     )
-                        //     .await
-                        //     {
-                        //         println!("HEARTBEAT ERROR: {:?}", err);
-                        //     }
-                        // });
-
                         let heartbeat_task = tokio::spawn(async move {
                             println!("HEARTBEAT STARTED");
 
@@ -279,11 +265,6 @@ impl WebSocketManager {
                                                                                             }
                                                                                         }
 
-                                                                                        // result = &mut receive_dispatch => {
-                                                                                        //     println!("RECEIVER FINISHED: {:?}", result);
-                                                                                        //     break;
-                                                                                        // }
-
                                                                                         result = &mut receive_dispatch => {
                                                             match result {
                                                                 Ok(Ok(())) => println!("Receiver exited normally"),
@@ -293,11 +274,6 @@ impl WebSocketManager {
 
                                                             break;
                                                         }
-
-                                                                                        // result = &mut heartbeat_task => {
-                                                                                        //     println!("HEARTBEAT FINISHED: {:?}", result);
-                                                                                        //     break;
-                                                                                        // }
 
                                                                                         result = &mut heartbeat_task => {
                                 match result {
