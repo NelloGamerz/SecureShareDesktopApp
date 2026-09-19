@@ -214,7 +214,7 @@ export async function deleteLocalTransferFile(
 export async function localTransferExists(
   transferId: string,
 ): Promise<boolean> {
-  return invoke<boolean>("local_transfer_exists", {
+  return invoke<boolean>("check_local_transfer_exists", {
     transferId,
   });
 }

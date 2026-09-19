@@ -23,7 +23,7 @@ use commands::auth::{
     cancel_desktop_auth, clear_all, delete_tunnel_hostname, delete_tunnel_token, get_auth_status,
     get_auth_token, get_connection_status, get_default_download_location, get_tunnel_hostname,
     get_tunnel_token, logout, save_tunnel_hostname, save_tunnel_token, send_message,
-    set_default_download_location, start_desktop_auth, start_websocket,
+    set_default_download_location, start_desktop_auth, start_websocket, stop_websocket,
 };
 
 use commands::transfer_commands::{
@@ -418,6 +418,7 @@ pub fn run() {
             get_auth_token,
             logout,
             start_websocket,
+            stop_websocket,
             send_message,
             get_connection_status,
             save_tunnel_token,
