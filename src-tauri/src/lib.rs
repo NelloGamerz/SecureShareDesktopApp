@@ -87,9 +87,20 @@ pub fn run() {
         //         .build(),
         // )
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(
+        .plugin({
+            /*
+             * Trace is a development level: it records request and payload
+             * detail that a shipped build should not be writing to disk. Debug
+             * builds keep it; release builds log at Info.
+             */
+            let level = if cfg!(debug_assertions) {
+                log::LevelFilter::Trace
+            } else {
+                log::LevelFilter::Info
+            };
+
             LogBuilder::default()
-                .level(log::LevelFilter::Trace)
+                .level(level)
                 .targets([
                     // Log file
                     Target::new(TargetKind::LogDir {
@@ -97,13 +108,9 @@ pub fn run() {
                     }),
                     // Console (cargo tauri dev)
                     Target::new(TargetKind::Stdout),
-                    // Errors
-                    // Target::new(TargetKind::Stderr),
-                    // Frontend console (devtools)
-                    // Target::new(TargetKind::Webview),
                 ])
-                .build(),
-        )
+                .build()
+        })
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
