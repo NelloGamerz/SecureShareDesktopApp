@@ -96,14 +96,15 @@ impl CloudflaredService {
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
 
-            // `flatten()` here drops each `Err` and asks for the next line.
-            // A read that keeps failing without reaching EOF — non-UTF-8 output
-            // does exactly that — makes this loop spin forever. Clippy suggests
-            // `map_while(Result::ok)`, which stops at the first error instead.
+            // `flatten()` drops each `Err` and asks for the next line. A line
+            // that is not valid UTF-8 is an `Err`, and `read_line` has already
+            // consumed it by the time it reports one, so each error costs a
+            // line rather than the loop — `flatten()` reads the stream to the
+            // end. The tests below pin that, because the `allow` depends on it.
             //
-            // Not changed in this phase: it is a behaviour change on a path with
-            // no test harness (a child process's pipe), and this phase is a pure
-            // refactor. Recorded as a defect in the phase report.
+            // Clippy's suggestion, `map_while(Result::ok)`, would stop at the
+            // first undecodable byte and silently truncate cloudflared's output.
+            // Wrong for a log reader, so the lint is allowed deliberately.
             #[allow(clippy::lines_filter_map_ok)]
             for line in reader.lines().flatten() {
                 println!("cloudflared: {}", line);
@@ -116,7 +117,10 @@ impl CloudflaredService {
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
 
-            // Same as the stdout reader above.
+            // Same as the stdout reader above — and here it matters more than
+            // truncation: `tunnel_live` is set from a line that may arrive
+            // after one that failed to decode, and a reader that stopped early
+            // would never see it, so the tunnel would be declared dead.
             #[allow(clippy::lines_filter_map_ok)]
             for line in reader.lines().flatten() {
                 eprintln!("cloudflared: {}", line);
@@ -218,5 +222,91 @@ impl CloudflaredService {
         }
         info!("Using cloudflared binary: {:?}", path);
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Cursor, ErrorKind};
+
+    /// The premise the `allow(clippy::lines_filter_map_ok)` on the two output
+    /// readers rests on, checked rather than assumed.
+    ///
+    /// `read_line` rejects a line that is not valid UTF-8 — and, this asserts,
+    /// consumes it from the reader before doing so. That is what makes
+    /// `lines().flatten()` safe here: each `Err` costs one bad line off the
+    /// front of the stream and the next call reads the line after it, so the
+    /// loop always makes progress.
+    #[test]
+    fn read_line_consumes_a_bad_line_before_reporting_it() {
+        let bytes = b"first\n\xff\xfe not utf-8\nthird\n".to_vec();
+        let mut reader = BufReader::new(Cursor::new(bytes));
+        let mut line = String::new();
+
+        assert_eq!(reader.read_line(&mut line).expect("valid line"), 6);
+        assert_eq!(line, "first\n");
+
+        line.clear();
+
+        let error = reader
+            .read_line(&mut line)
+            .expect_err("the second line is not valid UTF-8");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(line.is_empty(), "a rejected line must not be appended to");
+
+        // The one that matters: the bad line is behind us, not still in front.
+        assert_eq!(reader.read_line(&mut line).expect("valid line"), 6);
+        assert_eq!(line, "third\n");
+
+        assert_eq!(reader.read_line(&mut line).expect("end of input"), 0);
+    }
+
+    /// The other half of the same premise, and the reason `flatten()` is kept
+    /// over clippy's suggestion.
+    ///
+    /// The lint is allowed here for the same reason it is allowed in the
+    /// readers: this test exists to show that the input it warns about does
+    /// not, in fact, run forever.
+    #[test]
+    #[allow(clippy::lines_filter_map_ok)]
+    fn flatten_keeps_draining_where_map_while_would_stop() {
+        // The line the stderr reader watches for sits *after* a line that does
+        // not decode, which is the whole point.
+        let bytes =
+            b"one line\n\xff\xfe undecodable\nRegistered tunnel connection\nlast\n".to_vec();
+
+        let drained: Vec<String> = BufReader::new(Cursor::new(bytes.clone()))
+            .lines()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            drained,
+            vec!["one line", "Registered tunnel connection", "last"],
+            "flatten() must skip the bad line and read to the end"
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|line| line.contains("Registered tunnel connection")),
+            "the bad line must not hide the one that flips tunnel_live"
+        );
+
+        // Clippy's suggestion, on the same input, for contrast: correct for a
+        // reader whose errors are terminal, wrong for this one, where a read
+        // error costs a line rather than the stream.
+        let stopped: Vec<String> = BufReader::new(Cursor::new(bytes))
+            .lines()
+            .map_while(Result::ok)
+            .collect();
+
+        assert_eq!(stopped, vec!["one line"]);
+        assert!(
+            !stopped
+                .iter()
+                .any(|line| line.contains("Registered tunnel connection")),
+            "map_while(Result::ok) would truncate cloudflared's output here"
+        );
     }
 }

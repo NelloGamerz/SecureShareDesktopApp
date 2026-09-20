@@ -2,14 +2,18 @@
 
 **Branch:** `phase-2-workspace-core` (from `dev` @ `d657c05`)
 **Tag:** `pre-workspace` @ `d657c05`
-**Commits:** 10 — `08700c9` … `1af397e`: nine for the plan's tasks plus the
-golden-payload capture, and one correction (`1af397e`, §9 D1)
+**Commits:** eleven for the phase proper — `08700c9` … `e678da6`: eight plan
+tasks, the golden-payload capture the brief requires, the `frontendDist`
+correction (`1af397e`, §9 D1) and this report — plus four follow-ups from the
+review round (`e80bbec`, `ee97ac6`, `d60a950` and the commit carrying §12's
+report corrections), listed in §12. Fifteen in all.
 **Plan:** [`05-migration-plan.md`](../05-migration-plan.md) § "Phase 2 — Workspace +
 `vilsend-core` + `EventSink` port"
-**Diff:** 171 files changed, 2,537 insertions, 1,213 deletions — of which the
+**Diff:** 171 files changed, 3,079 insertions, 1,217 deletions — of which the
 largest single deletion is 886 lines of commented-out workflow (§4.1) and the
 largest single addition is `vilsend-core` at ~1,150 lines including tests.
-Excluding this report: 170 files, 2,031 insertions.
+At the end of the phase proper, before the review round in §12: 170 files,
+2,031 insertions.
 
 ---
 
@@ -57,7 +61,7 @@ plan requires, which is why `2.5` has an unused `TauriEventSink` for one commit.
 | Criterion | Result | Evidence |
 |---|---|---|
 | `cargo build -p vilsend-core` succeeds; no Tauri/reqwest/axum/sqlx/keyring in its tree | ✅ **PASS** | `cargo tree -p vilsend-core --prefix none` → `serde`, `serde_core`, `serde_derive`, `proc-macro2`, `unicode-ident`, `quote`, `syn`, `thiserror`, `thiserror-impl`, and `serde_json` as a dev-dependency. Nothing else. Asserted by the `architecture` CI job. |
-| `cargo test -p vilsend-core` runs ≥ 10 tests | ✅ **PASS** | **29**: 21 unit (`progress` 10, `event` 4, `error` 4, `ids` 3), 3 in `tests/event_sequence.rs`, 5 in `tests/golden_payloads.rs`. `cargo test --workspace` is 37 including the shell's 8. |
+| `cargo test -p vilsend-core` runs ≥ 10 tests | ✅ **PASS** | **30**: 22 unit (`progress` 10, `error` 5, `event` 4, `ids` 3), 3 in `tests/event_sequence.rs`, 5 in `tests/golden_payloads.rs`. At the end of the phase proper it was 29; §12's review round added one. `cargo test --workspace` is 41, the shell contributing 11. |
 | Golden payload fixtures byte-identical before/after | ✅ **PASS** | `git diff --stat 08700c9 HEAD -- tests/fixtures/` is empty. The fixtures are compared, never regenerated, by `crates/desktop/src/golden.rs` and `crates/core/tests/golden_payloads.rs`; regeneration needs `UPDATE_GOLDEN=1`, which no gate sets. |
 | Frontend unchanged; every `listen(...)` gets the same payload | ✅ **PASS** with a caveat | `git diff pre-workspace HEAD -- src/ index.html public/ package.json` is empty. The six names in `transfers-hooks.ts:160-165` equal `DomainEvent::wire_name()` for all six variants and equal `transfer-event-names.json`, in the same order. **Caveat:** this proves the names and payload shapes agree; it does not prove delivery, which needs a GUI run (§10). |
 | `cargo tauri build` produces an installer from the new layout | ✅ **PASS** after the `frontendDist` fix | §3.1 — the first run failed, and that failure is the most useful thing this phase found. The MSI (26.5 MB) and NSIS (19.0 MB) installers are on disk; the command's exit is 1, one step later, at updater signing for the want of a key. |
@@ -144,7 +148,7 @@ says so in a comment.
 |---|---|
 | `cargo fmt --all --check` | Passes. Failed on 9 files before task 2.8 (§4.4). |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passes, zero warnings. Was 10. |
-| `cargo test --workspace` | Passes: 37 tests. |
+| `cargo test --workspace` | Passes: 41 tests (30 core, 11 shell). |
 | `npm run typecheck` | Passes. |
 | `npm run check:ipc` | Passes: 28 call sites, 33 registered commands. Failed with `ENOENT` before §9 D2. |
 | `npm run build` | Passes, 15 s. |
@@ -312,7 +316,7 @@ unless noted.
 
 | # | Document claim | Reality |
 |---|---|---|
-| 1 | The brief cites `docs/migration/smoke-checklist.md` | **The file does not exist** — not in the working tree and not on any ref. Not created here, because a checklist I invent is not the checklist you meant. |
+| 1 | The brief cites `docs/migration/smoke-checklist.md` | **The file does not exist** — not in the working tree and not on any ref. Not created here, because a checklist I invent is not the checklist you meant. Still open after the review round, which asked for it to be added with the exact text to be pasted alongside the request: that text did not arrive (§12.1). |
 | 2 | `05-migration-plan.md` task 2.1 cites the CI cache path at `release.yml:939-950` | Line numbers moved when §4.1 deleted 886 lines. Rewritten to name the step instead of the lines. |
 | 3 | `05-migration-plan.md` task 2.7 suggests `cargo tree … \| grep -E …` "must fail the build" | The un-negated form *passes* when a forbidden crate is present (§3.2). The shared phase rules already say to negate; the plan's own text did not. The CI job uses the negated form. |
 | 4 | `docs/API.md:27` says the message protocol is defined in `…/websocket/protocol.rs` | No such file — Phase 1 deleted the commented-out draft. Pre-existing and outside this phase; the pointer is now at `crates/desktop/src/websocket/protocol.rs` and still wrong. |
@@ -444,13 +448,46 @@ false alarm. It is the half that would actually capture resolution, so if it
 ever fires, the fix is a second config out of the way or a narrow
 `TAURI_CLI_CONFIG_DEPTH` of `2` — never `1`.
 
-**D6 · `cloudflared.rs` can spin forever on a persistent read error — NOT FIXED**
-`BufReader::lines().flatten()` drops each `Err` and asks for the next line. A
-read that keeps failing without reaching EOF — non-UTF-8 child output does
-exactly that — never terminates. Clippy flags it; `map_while(Result::ok)` stops
-at the first error. Two sites, both cloudflared output readers. Not changed: it
-is a behaviour change on a path with no test harness (§4.4). `allow`ed with the
-reason inline so it is not mistaken for a false positive.
+**D6 · `cloudflared.rs`'s `lines().flatten()` — the original claim was wrong,
+and the `allow` is now backed by a test**
+
+This report first said the two cloudflared output readers "can spin forever on a
+persistent read error", because `flatten()` drops each `Err` and asks for the
+next line. **That is not what happens**, and it was worth the twenty minutes to
+find out: `BufRead::read_line` consumes a line before it rejects it. Measured
+directly, on `b"first\n\xff\xfe not utf-8\nthird\n"`:
+
+| call | result |
+|---|---|
+| `read_line` on line 1 | `Ok(6)`, `"first\n"` |
+| `read_line` on line 2 | `Err(InvalidData)`, buffer left empty |
+| `read_line` on line 3 | `Ok(6)`, `"third\n"` — the bad line is behind it |
+
+So each error costs one bad line, the iterator always makes progress, and
+`flatten()` reads the stream to the end. It does not spin.
+
+That inverts the conclusion. Clippy's suggested `map_while(Result::ok)` is
+**worse here, not better**: it stops at the first undecodable byte and silently
+truncates cloudflared's output. On the stdout reader that loses log lines; on
+the stderr reader it is a live defect, because `tunnel_live` is set from
+`"Registered tunnel connection"`, and a line that fails to decode arriving
+before it would stop the reader before the flag is ever set — the tunnel comes
+up and the app reports it dead.
+
+Two tests in `crates/desktop/src/services/cloudflared.rs` pin both halves:
+
+- `read_line_consumes_a_bad_line_before_reporting_it` — the table above.
+- `flatten_keeps_draining_where_map_while_would_stop` — feeds a bad line
+  *before* the watcher line and asserts `flatten()` yields
+  `["one line", "Registered tunnel connection", "last"]` while
+  `map_while(Result::ok)` yields `["one line"]`.
+
+The `allow(clippy::lines_filter_map_ok)` stays, now with a comment that says
+what is actually true and why the lint is wrong for this reader rather than
+with a rationale for a defect that does not exist.
+
+Nothing here was changed in behaviour: `flatten()` was already what the code
+did. Only the explanation and the evidence are new.
 
 **D7 · The frontend's `TransferProgress` type declares three fields the payload
 never carries — NOT FIXED**
@@ -493,9 +530,11 @@ supplied elapsed time. Together they cover both.
 
 3. **Confirm the CI workflow runs green on GitHub.** It has never run. The
    architecture job, the frontend job and the Rust job are each locally
-   reproduced in §3.3, but the workflow's own plumbing — the `dist` artifact
+   reproduced in §3.3, and the two new resolution guards were checked against
+   synthetic trees, but the workflow's own plumbing — the `dist` artifact
    between jobs, the Linux system dependencies, `actions/cache` keyed on
-   `Cargo.lock` — is untested. The first push will tell you.
+   `Cargo.lock`, the `find` in the second guard — is untested. The first push
+   will tell you.
 
    One specific thing to watch: `npm run build` succeeds locally, but Vite
    auto-loads the untracked `.env`, which CI does not have. Vite does not
@@ -503,11 +542,45 @@ supplied elapsed time. Together they cover both.
    build — but the local pass is not evidence either way, and I did not move
    your `.env` aside to find out. If the frontend job fails there, that is why.
 
-4. **Confirm the toolchain pin does not surprise CI.** `rust-toolchain.toml`
-   asks for 1.93.0; `dtolnay/rust-toolchain@stable` installs whatever stable is
-   current. Inside the repository `rustup` follows the pin, so CI will download
-   1.93.0 in addition to stable. Correct, and one extra download — but if you
-   would rather CI follow `stable` directly, delete the pin and say so.
+4. **Confirm the toolchain pin does not surprise CI — it changed since the
+   first draft of this list.** `rust-toolchain.toml` now declares the
+   components *and* the three runner targets, and **no workflow names a Rust
+   version any more**: the four Rust jobs read `channel` out of that file,
+   install it, and fail if the toolchain they end up with is not the pinned
+   one. `dtolnay/rust-toolchain@stable` is gone, so the "downloads two
+   toolchains" surprise this list used to warn about cannot happen.
+
+   Two things to expect on the first run, both benign:
+
+   - `rustup toolchain install 1.93.0` downloads the toolchain, and then the
+     first shim call inside the repository also fetches `aarch64-apple-darwin`
+     and `x86_64-unknown-linux-gnu` std, because the file declares them. On
+     this workstation that took a few seconds and roughly 100 MB. It happens
+     once per runner cache, not per job.
+   - The same is true locally: your next `cargo` command outside CI has already
+     fetched those two targets. If you would rather not carry std for platforms
+     you do not build on, drop `targets` from `rust-toolchain.toml` and say so
+     — nothing cross-compiles today, so it is documentation as much as
+     configuration.
+
+   If a job fails here, the message will say which toolchain it got instead of
+   the pinned one; that assertion exists precisely so the failure is not a
+   confusing build error later.
+
+5. **Decide the remaining toolchain question.** `rust-toolchain.toml` reading
+   itself into the workflow keeps the version in one place, which is what the
+   pin is for. The alternative — `dtolnay/rust-toolchain@1.93.0` — is the
+   ecosystem-standard action and would need the version written twice. Say the
+   word if you prefer that; it is a four-line change in four jobs.
+
+6. **Re-run the four Rust gates after any toolchain bump.** They are green at
+   1.93.0 as of the last commit on this branch.
+
+7. **Supply the smoke-checklist content.** See §7.1 and the note in §12: the
+   file this phase was asked to add was to contain the exact text you were
+   going to paste alongside the request, and that text did not arrive. The file
+   is not in the repository, because a checklist I invent is not the checklist
+   you meant.
 
 5. **Delete the stale local tag and branch if you do not want them**:
    `pre-workspace` is on `d657c05`, and `phase-2-*` branches are local only.
@@ -538,3 +611,130 @@ supplied elapsed time. Together they cover both.
 - **Roughly 70 `println!` statements remain** across `websocket/`,
   `services/cloudflared.rs` and `commands/auth.rs`. Phase 1 made the same call
   for the same reason, and this phase is not the one to spend a diff on them.
+
+---
+
+## 12. Follow-up round
+
+Five items came back after the first draft of this report. Four are done; the
+fifth could not be started.
+
+### 12.1 The smoke checklist — **BLOCKED, needs the text**
+
+Item 3 asked for `docs/migration/smoke-checklist.md` to be added "with the exact
+content I place next to this prompt". **That content did not arrive** — the
+request carried the instructions and nothing else, and the file is not on disk,
+untracked, or on any ref (§7.1). It has not been written.
+
+I am not going to invent it. A smoke checklist is a list of the things *you*
+check before shipping, and a plausible-looking one written by me would be worse
+than the gap: it would look authoritative, be wrong about which flows matter,
+and quietly replace the real one. The value of this file is entirely in its
+authorship.
+
+Paste the text and it is a one-commit change. Meanwhile §10.1 says what a
+smoke test has to cover for this phase's purposes: sign-in, a completed send, a
+completed receive, and a progress bar that advances — all four needing a running
+app rather than a test.
+
+### 12.2 Toolchain pin — `e80bbec`
+
+`rust-toolchain.toml` now declares components (`rustfmt`, `clippy`) and the
+three runner targets, and no workflow names a Rust version any more. The four
+Rust jobs read `channel` from the file, install it, and assert the active
+toolchain is the pinned one. `dtolnay/rust-toolchain@stable` is gone, so no job
+runs a compiler the repository did not choose.
+
+Targets were derived from the workflows rather than assumed: **no workflow
+passes `--target`**, so the matrix builds each runner for its own host triple —
+`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`.
+They are declared so that host-only assumption is explicit and enforced rather
+than inherited from whatever the runner image ships. Verified that rustup acts
+on them: the first shim call inside the repository installed both non-host std
+libraries.
+
+Verified locally by running the step body verbatim: it parses `1.93.0`, installs
+it, prints `active toolchain: 1.93.0-x86_64-pc-windows-msvc`, and the assertion
+rejects a simulated `stable-x86_64-pc-windows-msvc`.
+
+Per-job toolchain and target after the change:
+
+| Workflow | Job | Runner | Toolchain | Target |
+|---|---|---|---|---|
+| `release.yml` | `release` ×3 | `ubuntu-latest` | 1.93.0 | `x86_64-unknown-linux-gnu` |
+| `release.yml` | `release` ×3 | `windows-latest` | 1.93.0 | `x86_64-pc-windows-msvc` |
+| `release.yml` | `release` ×3 | `macos-latest` | 1.93.0 | `aarch64-apple-darwin` |
+| `release.yml` | `build-windows-store` | `windows-latest` | 1.93.0 | `x86_64-pc-windows-msvc` |
+| `release.yml` | `upload-windows-store-to-r2` | `ubuntu-latest` | — | no Rust |
+| `release.yml` | `upload-updater` | `ubuntu-latest` | — | no Rust |
+| `ci.yml` | `architecture` | `ubuntu-latest` | 1.93.0 | `x86_64-unknown-linux-gnu` |
+| `ci.yml` | `frontend` | `ubuntu-latest` | — | Node only |
+| `ci.yml` | `rust` | `ubuntu-latest` | 1.93.0 | `x86_64-unknown-linux-gnu` |
+
+The two `release.yml` steps carry `shell: bash`, because that workflow's matrix
+includes `windows-latest` and `build-windows-store` runs there too — on Windows
+`run:` is PowerShell by default and would reject the syntax.
+
+### 12.3 The auth message — `ee97ac6`
+
+Done as a failing-first fix. `VilsendError::Authentication(String)` carries the
+reason across the boundary with `kind() == ErrorKind::Unauthenticated`; the
+round trip through `AppError::Auth` is now lossless. `AppError` itself is
+untouched and the golden fixtures did not move.
+
+The new test failed with exactly the defect before the fix:
+
+```
+assertion `left == right` failed
+  left: "not authenticated"
+ right: "your session expired"
+```
+
+### 12.4 The resolution guard — `d60a950`, and §9 D5 corrected
+
+The suggested escape hatch in §9 D5 was **wrong**, and this is the useful part
+of the item. `TAURI_CLI_CONFIG_DEPTH=1` does not narrow the walk safely; it puts
+`crates/desktop` — depth 2 — out of reach, and `tauri info` then prints an
+*empty* App section and still exits 0. Reaching for it as a hardening measure
+would have hidden the project instead of protecting it. Measured:
+
+| `TAURI_CLI_CONFIG_DEPTH` | App section | exit |
+|---|---|---|
+| unset (3) | `frontendDist: ../../dist`, CSP, devUrl | 0 |
+| 2 | identical to unset | 0 |
+| 1 | **empty** | 0 |
+
+D5 now carries that table, and the walk is guarded in CI by two steps in the
+`frontend` job: one asserts the `frontendDist` the CLI reports equals the one
+`crates/desktop/tauri.conf.json` declares (read from the config, not
+hard-coded), the other asserts exactly one `tauri.conf.json` within depth 3
+outside `node_modules`. Both were checked against synthetic trees — one config
+passes, a second at depth 2 fires, none fires — and the first was confirmed to
+fire under `TAURI_CLI_CONFIG_DEPTH=1`, which is the failure an exit-code check
+cannot see.
+
+The `node_modules` half is a warning rather than a failure: the walk does not
+skip that directory, any dependency may ship a config file, and a guard we
+cannot fix should not block unrelated work.
+
+Both steps sit in the `frontend` job because `tauri info` resolves the App
+section with Node alone — verified by running it with `cargo` and `rustc` off
+`PATH` — so the guard costs no Rust download. They also run before anything
+invokes cargo, so `target/` does not exist to contribute noise.
+
+### 12.5 D6 was wrong, and is now corrected and tested
+
+Item 5 asked for D6's claim to be checked with a tiny test, and the claim did
+not survive it. `BufRead::read_line` **consumes** a line before rejecting it, so
+`lines().flatten()` does not spin — it skips the bad line and reads on. Which
+inverts the conclusion: clippy's `map_while(Result::ok)` would truncate
+cloudflared's output at the first undecodable byte, and on the stderr reader
+would lose the `"Registered tunnel connection"` line that sets `tunnel_live`.
+The `allow` stays, now for the right reason.
+
+D6 in §9 now carries the measurements and the two tests that pin them.
+
+### 12.6 The commit count
+
+Corrected. The header said ten; the phase proper is eleven commits
+(`08700c9` … `e678da6`), and there are four follow-ups on top.
