@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev, "phase-*"]
+  pull_request:
+
+# A new push to the same ref supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================
+  # ARCHITECTURE LINT
+  #
+  # The dependency direction in ADR-0002 is the whole reason the workspace
+  # exists, so it is asserted rather than left to review. `vilsend-core` is
+  # the domain layer: nothing that reaches a shell, a socket, a database or
+  # an OS keychain may appear in its dependency tree.
+  # ============================================================
+  architecture:
+    name: Architecture lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Printed on every run so a failure is diagnosable from the log alone.
+      # `--prefix none` prints one bare `name version` line per crate, which is
+      # what makes the anchored pattern below match package names rather than
+      # substrings of them.
+      - name: Print the dependency tree of vilsend-core
+        run: cargo tree -p vilsend-core --prefix none
+
+      # Negated on purpose: a bare `grep` exits 0 when it finds a match, so the
+      # un-negated form would pass the lint exactly when it should fail, and
+      # fail it when there is nothing to report. The `!` inverts that.
+      #
+      # It is the only command in this step, and therefore the last one, which
+      # is what makes the step's exit status the lint's verdict — bash's
+      # `set -e` deliberately does not abort on a negated command.
+      - name: vilsend-core must not depend on a shell or an adapter
+        run: "! cargo tree -p vilsend-core --prefix none | grep -E '^(tauri|reqwest|axum|sqlx|keyring)( |$)'"
+
+      # Guards the guard: without this, the lint above would also pass if the
+      # crate had left the workspace and `cargo tree` resolved nothing.
+      - name: vilsend-core must still be in the workspace
+        run: cargo tree -p vilsend-core --prefix none | grep -q '^vilsend-core '
