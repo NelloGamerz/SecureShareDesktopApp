@@ -207,27 +207,66 @@ fn the_scan_actually_works() {
 }
 
 #[test]
-fn the_sdk_does_not_re_export_an_enum_that_is_not_non_exhaustive() {
-    // Every enum this crate re-exports has to keep the guarantee, or a caller
-    // following the README's advice to add a catch-all arm is doing it for
-    // nothing. `vilsend-core`'s `TransferStatus` is the frozen wire enum —
-    // adding a variant to it would break the golden fixtures — so it is
-    // `#[non_exhaustive]`-free by design and is **not** re-exported here.
+fn every_enum_the_sdk_re_exports_is_non_exhaustive_where_it_is_defined() {
+    // A re-export is still this crate's public API: a caller matching on
+    // `Progress::status` is matching on `vilsend_core::TransferStatus`, and if
+    // that enum were closed an added variant would break them — no matter what
+    // this crate's own enums do.
+    //
+    // So the check reaches into `vilsend-core`'s source. `TransferStatus` was
+    // the one that failed it; Phase 5 marked it, which changes nothing on the
+    // wire and is pinned against the golden fixtures.
     let re_exports = std::fs::read_to_string(crate_root().join("src").join("lib.rs"))
         .expect("lib.rs is readable");
 
-    assert!(
-        re_exports.contains("TransferStatus"),
-        "if TransferStatus stopped being re-exported, this test is stale"
-    );
+    let core_sources: Vec<String> = {
+        let mut paths = Vec::new();
 
-    // The three from `core` that *are* re-exported, each of which is
-    // `#[non_exhaustive]` in its own crate. Named here so that a change on
-    // either side is visible.
-    for name in ["ErrorKind", "VilsendError", "DomainEvent"] {
+        rust_sources(
+            &crate_root().join("..").join("core").join("src"),
+            &mut paths,
+        );
+        paths.sort();
+
+        paths
+            .into_iter()
+            .map(|path| std::fs::read_to_string(&path).expect("core source is readable"))
+            .collect()
+    };
+
+    let mut checked = 0usize;
+
+    for name in ["DomainEvent", "ErrorKind", "TransferStatus", "VilsendError"] {
         assert!(
             re_exports.contains(name),
             "{name} should be re-exported by the SDK"
         );
+
+        let declared = core_sources
+            .iter()
+            .find_map(|source| {
+                let lines: Vec<&str> = source.lines().collect();
+
+                public_declarations(&lines, "enum")
+                    .into_iter()
+                    .find(|(_, declaration)| declaration.contains(&format!("enum {name}")))
+                    .map(|(index, _)| has_attribute_above(&lines, index, "#[non_exhaustive]"))
+            })
+            .unwrap_or_else(|| panic!("{name} is not declared in vilsend-core"));
+
+        assert!(declared, "{name} is re-exported but not #[non_exhaustive]");
+        checked += 1;
     }
+
+    assert_eq!(checked, 4);
+
+    // And the deliberate exception stays an exception: `ConnectionStatus` is
+    // the shell's own vocabulary and is not part of the SDK's surface, so it is
+    // left alone. If it ever appears here, that decision has been reversed by
+    // accident.
+    assert!(
+        !re_exports.contains("ConnectionStatus"),
+        "ConnectionStatus is not re-exported, so it is not covered by the SDK's \
+         semver policy — if that changes, mark it `#[non_exhaustive]` in core too"
+    );
 }

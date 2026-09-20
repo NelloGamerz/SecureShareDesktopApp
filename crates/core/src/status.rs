@@ -11,6 +11,16 @@ use serde::{Deserialize, Serialize};
 ///
 /// `SCREAMING_SNAKE_CASE` is the existing wire encoding; the frontend compares
 /// against these strings.
+///
+/// `#[non_exhaustive]` because `vilsend-sdk` **re-exports this type** as part
+/// of its public API, and `04-sdk-cli-mobile-build-plan.md` §2.5 requires every
+/// public enum in that API to be open to new variants. The attribute is a
+/// Rust-side guarantee only: it changes nothing on the wire, and the golden
+/// fixtures in `tests/golden_payloads.rs` still pin the eight variants exactly.
+///
+/// Phase 5 added it. `ConnectionStatus` is deliberately *not* marked: the SDK
+/// does not re-export it, and nothing outside the shell sees it.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransferStatus {
