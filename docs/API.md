@@ -24,7 +24,7 @@ Axios normalizes 401 into a session-expired error. Other errors expose the serve
 
 ## WebSocket
 
-Production default: `wss://api.vilsend.in/ws`; development default: `ws://localhost:8080/ws`. The Rust client sends `Authorization: Bearer <Clerk token>` and `x-device-id`. The message protocol is defined in `src-tauri/src/websocket/protocol.rs` and the receiver dispatches Tauri events.
+Production default: `wss://api.vilsend.in/ws`; development default: `ws://localhost:8080/ws`. The Rust client sends `Authorization: Bearer <Clerk token>` and `x-device-id`. The message protocol is defined in `crates/desktop/src/websocket/protocol.rs` and the receiver dispatches Tauri events.
 
 ## Local transfer receiver
 

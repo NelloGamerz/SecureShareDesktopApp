@@ -1,0 +1,35 @@
+# The toolchain this repository builds with — the single source of truth for
+# it. `rustup` reads this file inside the repository, so it takes precedence
+# over whatever `rustup default` says, on a workstation and on a CI runner
+# alike. Nothing in `.github/workflows/` names a Rust version.
+#
+# 1.93.0 is what the committed `Cargo.lock` was produced with. Pinning it means
+# a Rust release cannot change the build without a commit.
+#
+# Bumping the channel means regenerating `Cargo.lock`, and nothing where —
+# see the workflow steps that read the channel out of this file.
+[toolchain]
+channel = "1.93.0"
+
+# `rustfmt` is the `cargo fmt` gate; `clippy` is the `-D warnings` gate. Both
+# are run by `.github/workflows/ci.yml`.
+components = ["rustfmt", "clippy"]
+
+# The host triples of the three runners the release matrix uses. **No workflow
+# passes `--target`**, so nothing cross-compiles and nothing needs a target
+# other than its runner's own — these are listed to make that explicit and to
+# make it true by construction rather than by accident of the runner image.
+#
+#   ubuntu-latest   → x86_64-unknown-linux-gnu
+#   windows-latest  → x86_64-pc-windows-msvc
+#   macos-latest    → aarch64-apple-darwin
+#
+# `macos-latest` is Apple silicon today. The macOS bundle config ships
+# cloudflared for both `macos-x64` and `macos-arm64`, so a build on an Intel
+# runner still produces a working app; add `x86_64-apple-darwin` here if you
+# ever pin the macOS runner to `macos-13`.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]

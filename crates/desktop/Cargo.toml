@@ -1,0 +1,77 @@
+[package]
+name = "vilsend"
+# The single source of truth for the application version. `tauri.conf.json`
+# deliberately omits `version`, so the bundler falls back to this value; and
+# `tauri::generate_context!` reports it to the app as the package version.
+version = "1.0.4"
+description = "Secure file sharing built for modern teams — fast, encrypted, and simple across every device."
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "server_frontend_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The platform-agnostic domain crate. The edge runs shell -> core and never the
+# other way; `cargo tree -p vilsend-core` is asserted in CI (ADR-0002).
+vilsend-core = { path = "../core" }
+# The `devtools` feature is deliberately NOT enabled: it is what lets a
+# release build open a web inspector. Debug builds keep devtools regardless.
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec", "compat", "time"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+tracing = "0.1"
+tauri-plugin-store = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.7"
+anyhow = "1"
+tauri-plugin-secure-storage = "1.4.0"
+rand_core = "0.6"
+base64 = "0.22"
+aes-gcm = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+tauri-plugin-log = "2.9.0"
+# `static_secrets` was previously enabled only as a side effect of the
+# (unused) ed25519-dalek dependency, so `StaticSecret` disappeared when that
+# dependency was dropped. Declared explicitly now.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+hkdf = "0.12"
+hex = "0.4"
+tauri-plugin-os = "2"
+tauri-plugin-device = "1"
+sysinfo = "0.37"
+tauri-plugin-updater = "2"
+tauri-plugin-http = "2.6.0"
+tauri-plugin-deep-link = "2"
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+# Forwards `vilsend://` deep links (and argv) from a second process into the
+# already-running instance so an in-flight OAuth flow can complete.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Power"] }
+
+[features]
+default = ["enable-updater"]
+enable-updater = []

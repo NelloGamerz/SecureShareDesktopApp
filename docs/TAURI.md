@@ -2,11 +2,11 @@
 
 ## Runtime composition
 
-`src-tauri/src/lib.rs` registers Tauri v2 plugins for filesystem, store, opener, secure storage, dialog, Stronghold, log, and updater. It manages `AppState`, `Cloudflared`, and SQLite-backed local transfer storage. The window-destroyed handler kills Cloudflared, but there is no equally explicit transfer/WebSocket shutdown coordinator.
+`crates/desktop/src/lib.rs` registers Tauri v2 plugins for filesystem, store, opener, secure storage, dialog, Stronghold, log, and updater. It manages `AppState`, `Cloudflared`, and SQLite-backed local transfer storage. The window-destroyed handler kills Cloudflared, but there is no equally explicit transfer/WebSocket shutdown coordinator.
 
 Commands registered in `lib.rs` include auth (`login`, `logout`, `update_auth_token`), WebSocket (`start_websocket`, `send_message`, `get_connection_status`), tunnel settings/process control, transfer lifecycle, local transfer metadata, identity creation, device type detection, and download-location settings.
 
-Capabilities in `src-tauri/capabilities/default.json` allow core, opener, store, dialog, filesystem stat/read, and log. The application CSP is `null` and the main window has devtools enabled in `src-tauri/tauri.conf.json`.
+Capabilities in `crates/desktop/capabilities/default.json` allow core, opener, store, dialog, filesystem stat/read, and log. The application CSP is `null` and the main window has devtools enabled in `crates/desktop/tauri.conf.json`.
 
 ## Native integrations
 

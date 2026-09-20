@@ -22,7 +22,7 @@ NEW (additive):
 
 ## Files Created
 
-### 1. `src-tauri/tauri.windows.store.conf.json`
+### 1. `crates/desktop/tauri.windows.store.conf.json`
 
 **Purpose**: Store-specific Tauri configuration that:
 - Disables the Tauri updater plugin
@@ -58,7 +58,7 @@ NEW (additive):
 
 ## Files Modified
 
-### 1. `src-tauri/Cargo.toml`
+### 1. `crates/desktop/Cargo.toml`
 
 **Changes**:
 - Added features section with `enable-updater` feature flag (enabled by default)
@@ -77,7 +77,7 @@ windows = { version = "0.62", features = ["Win32_System_Power"] }
 
 ---
 
-### 2. `src-tauri/src/lib.rs`
+### 2. `crates/desktop/src/lib.rs`
 
 **Changes**:
 - Wrapped updater import with `#[cfg(feature = "enable-updater")]`
@@ -153,21 +153,21 @@ windows = { version = "0.62", features = ["Win32_System_Power"] }
 ### Local Development Build (with updater enabled)
 
 ```bash
-npm run tauri -- build --config src-tauri/tauri.windows.conf.json
+npm run tauri -- build --config crates/desktop/tauri.windows.conf.json
 ```
 
-Output: Traditional EXE/MSI installers in `src-tauri/target/release/bundle/nsis/` and `src-tauri/target/release/bundle/msi/`
+Output: Traditional EXE/MSI installers in `target/release/bundle/nsis/` and `target/release/bundle/msi/`
 
 ### Local Microsoft Store Build (updater disabled)
 
 ```bash
 npm run tauri -- build \
-  --config src-tauri/tauri.windows.store.conf.json \
+  --config crates/desktop/tauri.windows.store.conf.json \
   --bundle msi \
   --no-default-features
 ```
 
-Output: MSIX package in `src-tauri/target/release/bundle/msi/`
+Output: MSIX package in `target/release/bundle/msi/`
 
 ---
 
@@ -513,11 +513,11 @@ git tag v0.3.1
 If you need to build locally with specific version:
 
 ```bash
-# Edit src-tauri/tauri.conf.json
+# Edit crates/desktop/tauri.conf.json
 # Change "version": "0.3.0" to "0.3.0"
 
 npm run tauri -- build \
-  --config src-tauri/tauri.windows.store.conf.json \
+  --config crates/desktop/tauri.windows.store.conf.json \
   --bundle msi \
   --no-default-features
 ```
@@ -575,7 +575,7 @@ VilSend/
 **Before**: ✓  
 **After**: ✓ **UNCHANGED**
 
-- Build: `src-tauri/tauri.linux.conf.json`
+- Build: `crates/desktop/tauri.linux.conf.json`
 - Installer: `.deb`, `.AppImage`
 - Distribution: GitHub Releases + R2
 - Updates: Tauri updater checking `https://update.vilsend.in/latest.json`
@@ -585,7 +585,7 @@ VilSend/
 **Before**: ✓  
 **After**: ✓ **UNCHANGED**
 
-- Build: `src-tauri/tauri.macos.conf.json`
+- Build: `crates/desktop/tauri.macos.conf.json`
 - Installer: `.dmg`, `.app.tar.gz`
 - Distribution: GitHub Releases + R2
 - Updates: Tauri updater checking `https://update.vilsend.in/latest.json`
@@ -595,7 +595,7 @@ VilSend/
 **Before**: ✓  
 **After**: ✓ **UNCHANGED**
 
-- Build: `src-tauri/tauri.windows.conf.json`
+- Build: `crates/desktop/tauri.windows.conf.json`
 - Installer: `.msi` (WiX), `.nsis`
 - Distribution: GitHub Releases + R2
 - Updates: Tauri updater checking `https://update.vilsend.in/latest.json`
@@ -606,7 +606,7 @@ VilSend/
 **Before**: ✗ (N/A)  
 **After**: ✓ **NEW**
 
-- Build: `src-tauri/tauri.windows.store.conf.json`
+- Build: `crates/desktop/tauri.windows.store.conf.json`
 - Package: `.msix`
 - Distribution: Microsoft Store only
 - Updates: Microsoft Store (not Tauri updater)
@@ -623,7 +623,7 @@ VilSend/
 **Solution**:
 ```bash
 # Ensure resources exist
-ls -la src-tauri/resources/cloudflared/windows-x64/cloudflared.exe
+ls -la crates/desktop/resources/cloudflared/windows-x64/cloudflared.exe
 
 # If missing, you may need to download/add it to the repository
 ```
@@ -635,10 +635,10 @@ ls -la src-tauri/resources/cloudflared/windows-x64/cloudflared.exe
 **Solution**:
 ```bash
 # Verify file exists
-ls -la src-tauri/tauri.windows.store.conf.json
+ls -la crates/desktop/tauri.windows.store.conf.json
 
 # Verify syntax
-cat src-tauri/tauri.windows.store.conf.json | grep -c "version"
+cat crates/desktop/tauri.windows.store.conf.json | grep -c "version"
 ```
 
 ### MSIX Installation Fails

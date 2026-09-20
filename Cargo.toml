@@ -1,0 +1,18 @@
+# The Cargo workspace for VilSend.
+#
+# Phase 2 of the migration (docs/migration/05-migration-plan.md, task 2.1)
+# introduced this file and moved `src-tauri/` to `crates/desktop/`, so that the
+# platform-agnostic crates can be built and tested without pulling Tauri in.
+# See docs/migration/adr/0002-crate-layout-and-dependency-direction.md for the
+# layout this grows into.
+#
+# `crates/desktop` keeps the name `vilsend` because it is the crate the
+# installer, the updater and the bundle identifier are attached to.
+#
+# Members are listed explicitly rather than globbed: a new crate appearing in
+# the workspace should be a deliberate act, and `cargo tree` assertions in CI
+# are keyed on the crate names.
+
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/desktop"]

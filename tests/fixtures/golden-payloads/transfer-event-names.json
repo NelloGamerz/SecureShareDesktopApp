@@ -1,0 +1,8 @@
+[
+  "transfer-progress",
+  "transfer-completed",
+  "transfer-failed",
+  "transfer-paused",
+  "transfer-resumed",
+  "transfer-cancelled"
+]

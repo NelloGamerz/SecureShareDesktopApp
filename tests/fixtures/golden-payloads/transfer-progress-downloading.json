@@ -1,0 +1,9 @@
+{
+  "transfer_id": "3c59dc04-8e88-4b0a-9f5e-6d7c8b9a0f11",
+  "uploaded_bytes": 3000000,
+  "total_bytes": 12000000,
+  "percentage": 25.0,
+  "speed": 1000000.0,
+  "eta": 9,
+  "status": "DOWNLOADING"
+}

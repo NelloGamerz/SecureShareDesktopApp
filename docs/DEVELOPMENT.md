@@ -18,7 +18,7 @@ npm run typecheck
 npm run lint
 npm run tauri dev
 npm run tauri build
-cargo check --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path crates/desktop/Cargo.toml
 ```
 
 `npm run tauri dev` uses Vite on port 1420 and the Tauri development window. `npm run tauri build` runs `npm run build` first through Tauri config and packages the app.

@@ -9,15 +9,15 @@ Your Tauri v2 application now has a **separate, independent Windows distribution
 ## What Was Implemented
 
 ### 1. **Store-Specific Configuration** ✅
-- **File**: `src-tauri/tauri.windows.store.conf.json`
+- **File**: `crates/desktop/tauri.windows.store.conf.json`
 - Disables Tauri updater plugin for Store builds
 - Includes cloudflared.exe resources
 - Ready for MSIX packaging
 
 ### 2. **Conditional Updater Compilation** ✅
 - **Files Modified**:
-  - `src-tauri/Cargo.toml` - Added `enable-updater` feature flag
-  - `src-tauri/src/lib.rs` - Wrapped updater with conditional compilation
+  - `crates/desktop/Cargo.toml` - Added `enable-updater` feature flag
+  - `crates/desktop/src/lib.rs` - Wrapped updater with conditional compilation
   
 - **How it works**:
   - Default builds: Updater enabled (Linux, macOS, Windows direct)
@@ -83,17 +83,17 @@ Release Tag: git tag v0.3.0
 
 ### Created
 ```
-src-tauri/tauri.windows.store.conf.json
+crates/desktop/tauri.windows.store.conf.json
 MICROSOFT_STORE_IMPLEMENTATION.md
 STORE_QUICK_REFERENCE.md
 ```
 
 ### Modified
 ```
-src-tauri/Cargo.toml
+crates/desktop/Cargo.toml
   + Added [features] section with enable-updater
 
-src-tauri/src/lib.rs
+crates/desktop/src/lib.rs
   + Wrapped updater import with #[cfg(feature = "enable-updater")]
   + Wrapped updater initialization with conditional block
 
@@ -168,7 +168,7 @@ See `MICROSOFT_STORE_IMPLEMENTATION.md` → "Microsoft Store Setup Guide" for de
 ## Cloudflared Resource Verification
 
 ✅ **Included in MSIX**: cloudflared.exe is bundled automatically
-- Config: `src-tauri/tauri.windows.store.conf.json` includes it
+- Config: `crates/desktop/tauri.windows.store.conf.json` includes it
 - Path: `resources/cloudflared/windows-x64/cloudflared.exe`
 - Runtime: App finds it via `app.path().resource_dir()`
 
@@ -189,7 +189,7 @@ The workflow automatically handles this conversion.
 
 ### Existing Direct Windows Build
 ```bash
-npm run tauri -- build --config src-tauri/tauri.windows.conf.json
+npm run tauri -- build --config crates/desktop/tauri.windows.conf.json
 ```
 Output: EXE/MSI installers
 Updater: ✓ Enabled
@@ -197,7 +197,7 @@ Updater: ✓ Enabled
 ### New Store Build
 ```bash
 npm run tauri -- build \
-  --config src-tauri/tauri.windows.store.conf.json \
+  --config crates/desktop/tauri.windows.store.conf.json \
   --bundle msi \
   --no-default-features
 ```

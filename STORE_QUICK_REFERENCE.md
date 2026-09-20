@@ -3,11 +3,11 @@
 ## Changes Made
 
 ### ✅ Files Created
-1. **`src-tauri/tauri.windows.store.conf.json`** - Store-specific Tauri config with updater disabled
+1. **`crates/desktop/tauri.windows.store.conf.json`** - Store-specific Tauri config with updater disabled
 
 ### ✅ Files Modified
-1. **`src-tauri/Cargo.toml`** - Added `enable-updater` feature flag
-2. **`src-tauri/src/lib.rs`** - Wrapped updater code with `#[cfg(feature = "enable-updater")]`
+1. **`crates/desktop/Cargo.toml`** - Added `enable-updater` feature flag
+2. **`crates/desktop/src/lib.rs`** - Wrapped updater code with `#[cfg(feature = "enable-updater")]`
 3. **`.github/workflows/release.yml`** - Added `build-windows-store` and `publish-windows-store` jobs
 
 ### ✅ Documentation Created

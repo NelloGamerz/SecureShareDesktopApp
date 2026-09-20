@@ -1,0 +1,22 @@
+[package]
+name = "vilsend-core"
+# Not shipped on its own yet: Phase 2 only establishes the crate and proves the
+# dependency direction. It is versioned apart from the desktop app because the
+# desktop app's version is the updater's version, and this crate has no
+# installer.
+version = "0.1.0"
+edition = "2021"
+description = "Platform-agnostic domain types, ports and error model for VilSend."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+# ADR-0002 rule 1: `vilsend-core` depends on nothing but `serde`, `thiserror`,
+# `async-trait`, `bytes`, `futures-core` and `tracing`. Only the first two are
+# used so far. Adding an edge here needs an ADR.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+# Tests only: the golden payload fixtures are JSON files compared byte for byte.
+serde_json = "1"

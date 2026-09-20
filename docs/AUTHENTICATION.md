@@ -34,7 +34,7 @@ User clicks "Continue in browser"
 React  signIn() / signUp()                 src/contexts/auth-context.tsx
         │  invoke("start_desktop_auth", { config, mode })
         ▼
-Rust   OAuthService::begin()               src-tauri/src/services/oauth_service.rs
+Rust   OAuthService::begin()               crates/desktop/src/services/oauth_service.rs
         │  • generate code_verifier (32 random bytes, base64url)
         │  • code_challenge = base64url(SHA-256(verifier))
         │  • generate state (32 random bytes)
@@ -299,7 +299,7 @@ The callback uses the custom URL scheme `vilsend://auth/callback`.
 | Platform | How the scheme is registered |
 | --- | --- |
 | Windows (NSIS/WiX) | `plugins.deep-link.desktop.schemes` in `tauri.conf.json`; the installer writes the registry entry. |
-| Windows (MSIX / Store) | MSIX ignores registry writes, so `src-tauri/msix/AppxManifest.xml` declares a `windows.protocol` extension. Keep both in sync. |
+| Windows (MSIX / Store) | MSIX ignores registry writes, so `crates/desktop/msix/AppxManifest.xml` declares a `windows.protocol` extension. Keep both in sync. |
 | Linux | `plugins.deep-link.desktop.schemes`; written on install. `register_all()` is called in debug builds. |
 | macOS | Registration is not possible at runtime; it works only from the bundled app installed in `/Applications`. |
 
@@ -358,13 +358,13 @@ URLs carrying neither `code` nor `error` are ignored, so unrelated deep links ne
 
 | File | Responsibility |
 | --- | --- |
-| `src-tauri/src/services/oauth_service.rs` | PKCE generation, authorize URL, code exchange, refresh, state validation. |
-| `src-tauri/src/commands/auth.rs` | Auth commands and the deep-link callback handler. |
-| `src-tauri/src/services/auth_service.rs` | Session lifecycle and sign-in/out notifications. |
-| `src-tauri/src/state/auth_state.rs` | In-memory token, refresh token, expiry, and pending flow. |
-| `src-tauri/src/lib.rs` | Plugin registration, deep-link listener, command handler list. |
-| `src-tauri/tauri.conf.json` | `plugins.deep-link.desktop.schemes`. |
-| `src-tauri/msix/AppxManifest.xml` | `windows.protocol` extension for the Store build. |
+| `crates/desktop/src/services/oauth_service.rs` | PKCE generation, authorize URL, code exchange, refresh, state validation. |
+| `crates/desktop/src/commands/auth.rs` | Auth commands and the deep-link callback handler. |
+| `crates/desktop/src/services/auth_service.rs` | Session lifecycle and sign-in/out notifications. |
+| `crates/desktop/src/state/auth_state.rs` | In-memory token, refresh token, expiry, and pending flow. |
+| `crates/desktop/src/lib.rs` | Plugin registration, deep-link listener, command handler list. |
+| `crates/desktop/tauri.conf.json` | `plugins.deep-link.desktop.schemes`. |
+| `crates/desktop/msix/AppxManifest.xml` | `windows.protocol` extension for the Store build. |
 | `src/lib/auth-config.ts` | OAuth configuration and issuer derivation. |
 | `src/contexts/auth-context.tsx` | Session state, sign-in/sign-up, logout, event subscriptions. |
 | `src/providers/axios-provider.tsx` | Registers the Tauri token getter with axios. |

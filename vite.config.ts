@@ -22,7 +22,10 @@ export default defineConfig({
       ? { protocol: 'ws', host, port: 1421 }
       : undefined,
     watch: {
-      ignored: ['**/src-tauri/**'],
+      // The Rust workspace lives under `crates/`, and its build output lands in
+      // the workspace-root `target/`. Watching either one makes Vite reload the
+      // webview on every cargo rebuild.
+      ignored: ['**/crates/**', '**/target/**'],
     },
   },
   envPrefix: ['VITE_', 'TAURI_'],

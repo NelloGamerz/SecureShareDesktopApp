@@ -6,7 +6,8 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist', 'src-tauri', 'src/components/ui/**'],
+    // `crates` and `target` are the Rust workspace and its build output.
+    ignores: ['dist', 'target', 'crates', 'src/components/ui/**'],
   },
   {
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
