@@ -11,7 +11,7 @@
 //! |---|---|---|---|
 //! | AEAD associated data | none — a ciphertext is bound to nothing | [`ChunkAad`] binds transfer, file, index, path and protocol version | 4.1 |
 //! | KDF salt | none — two sessions reaching the same ECDH secret share a key | [`derive_transfer_key_v2`] salts with both handshake nonces | 4.2 |
-//! | Nonce repeats | undetectable — no call has anywhere to record one | `NonceWindow`, bounded | 4.4 |
+//! | Nonce repeats | undetectable — no call has anywhere to record one | [`NonceWindow`], bounded, per transfer key | 4.4 |
 //!
 //! # Why the two implementations never share a key
 //!
@@ -332,6 +332,211 @@ pub fn open(
             },
         )
         .map_err(|_| VilsendError::IntegrityMismatch("v2 chunk tag did not verify".into()))
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Nonce discipline (task 4.4)
+ * ----------------------------------------------------------------------
+ */
+
+/// How many attempts [`NonceWindow::seal`] makes to draw a nonce that is not
+/// already in the window.
+///
+/// With a 96-bit nonce and a 4096-entry window a collision has probability
+/// about 2^-84, so this bound is unreachable in practice. It exists so the loop
+/// is bounded *by construction* rather than by the improbability of the event —
+/// a deterministic RNG (a test, a mocked source, a catastrophically broken
+/// entropy pool) must produce an error, not a spin.
+const MAX_NONCE_ATTEMPTS: usize = 8;
+
+/// A bounded sliding window of the nonces recently used under one transfer key.
+///
+/// **One per direction.** The sender holds a window so it never *emits* a
+/// repeat; the receiver holds a different window so it never *accepts* one. The
+/// two are not shared and not synchronised — a window that both drew from and
+/// checked against would reject the sender's own output, which is a mistake
+/// worth naming because it reads as natural until it is written down.
+///
+/// Both are keyed on the same transfer key, and both are dropped when the
+/// session ends.
+///
+/// # Why a window and not a set
+///
+/// `05-migration-plan.md`'s risk table names the cost: "Nonce-repeat checking
+/// costs memory on huge transfers — bound it: a sliding window, not a full
+/// set." A full set for a 100 GB transfer at 4 MiB chunks is 25,600 entries and
+/// grows without limit. A window of [`Self::DEFAULT_CAPACITY`] entries is 48 KiB
+/// flat, and it covers the last 4,096 chunks — at the default chunk size, a
+/// 16 GiB span. A replay is an attack presented promptly; a chunk from 16 GiB
+/// ago is not the threat model, and a test asserts that a nonce which has left
+/// the window is accepted again, so the eviction is deliberate and visible
+/// rather than an accident of the data structure.
+///
+/// # What this does *not* cover
+///
+/// The window is **in memory and per session**. A receiver that restarts loses
+/// it, so a chunk captured before the restart and replayed after it is not
+/// caught by this check — it is caught by the AAD, if the replay targets a
+/// different index or file, and by the resume bitmap (task 4.7) if it targets
+/// the same slot. Persisting the window is not part of task 4.4 and is recorded
+/// in the phase report as a known limit rather than silently claimed.
+///
+/// A sender that retries a chunk re-encrypts it — `upload_chunk` calls
+/// `encrypt_chunk` inside its retry loop — so a retry draws a fresh nonce and
+/// cannot be mistaken for a replay.
+#[derive(Debug)]
+pub struct NonceWindow {
+    capacity: usize,
+    ring: std::collections::VecDeque<[u8; NONCE_LEN]>,
+    seen: std::collections::HashSet<[u8; NONCE_LEN]>,
+}
+
+impl Default for NonceWindow {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_CAPACITY)
+    }
+}
+
+impl NonceWindow {
+    /// 4,096 nonces, 48 KiB. See the type docs for why that number.
+    pub const DEFAULT_CAPACITY: usize = 4096;
+
+    /// A window remembering the last `capacity` nonces.
+    ///
+    /// # Panics
+    ///
+    /// If `capacity` is zero. A zero-capacity window remembers nothing, so it
+    /// would silently accept every replay — a security control that is off is
+    /// worse than one that is absent, because the caller believes it is on.
+    /// This is a construction-time programmer error, not attacker-controlled
+    /// input, so it panics rather than returning a `Result` the caller would
+    /// have to thread through code that cannot fail for any other reason.
+    pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "a nonce window must remember at least one nonce"
+        );
+
+        Self {
+            capacity,
+            ring: std::collections::VecDeque::with_capacity(capacity),
+            seen: std::collections::HashSet::with_capacity(capacity),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// How many nonces are currently remembered. Never exceeds
+    /// [`Self::capacity`].
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
+    /// Record a nonce, rejecting one that is already in the window.
+    ///
+    /// Returns [`ErrorKind::IntegrityMismatch`] on a repeat. It is a replay, and
+    /// it is reported as an integrity failure for the same reason a failed tag
+    /// is: the caller must not be able to distinguish "this is a replay" from
+    /// "this did not authenticate" by the response.
+    pub fn observe(&mut self, nonce: &[u8; NONCE_LEN]) -> Result<(), VilsendError> {
+        if self.seen.contains(nonce) {
+            return Err(VilsendError::IntegrityMismatch(
+                "v2 chunk nonce repeated within the window".into(),
+            ));
+        }
+
+        self.record(nonce);
+
+        Ok(())
+    }
+
+    /// Seal a chunk with a freshly drawn nonce, guaranteed not to be one this
+    /// window has already used.
+    ///
+    /// The nonce is drawn **before** sealing and recorded **before** the AEAD
+    /// runs, so a failure inside `seal` still spends it. Handing a nonce back
+    /// to the pool after a partial use is how nonce reuse happens.
+    pub fn seal<R: rand::RngCore>(
+        &mut self,
+        rng: &mut R,
+        key: &[u8; 32],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<SealedChunk, VilsendError> {
+        for _ in 0..MAX_NONCE_ATTEMPTS {
+            let mut nonce = [0u8; NONCE_LEN];
+            rng.fill_bytes(&mut nonce);
+
+            if self.seen.contains(&nonce) {
+                continue;
+            }
+
+            self.record(&nonce);
+
+            // The free function, not a method: reaching it directly is the way
+            // to skip the discipline, and there is exactly one place that
+            // should.
+            return seal(key, aad, &nonce, plaintext);
+        }
+
+        Err(VilsendError::Internal(format!(
+            "could not draw an unused nonce in {MAX_NONCE_ATTEMPTS} attempts"
+        )))
+    }
+
+    /// Open a chunk, rejecting a nonce the window has already accepted.
+    ///
+    /// The tag is verified **first**, and the nonce is recorded **only on
+    /// success**. That ordering is deliberate: an unauthenticated chunk has not
+    /// spent its nonce, and letting a flood of forged chunks push real entries
+    /// out of the window would let an attacker evict the coverage that rejects
+    /// the replay they actually intend to send.
+    pub fn open(
+        &mut self,
+        key: &[u8; 32],
+        aad: &[u8],
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, VilsendError> {
+        if nonce.len() != NONCE_LEN {
+            return Err(VilsendError::InvalidInput(format!(
+                "v2 chunk nonce must be {NONCE_LEN} bytes, got {}",
+                nonce.len()
+            )));
+        }
+
+        let mut fixed = [0u8; NONCE_LEN];
+        fixed.copy_from_slice(nonce);
+
+        // The free function, not this method: `open(...)` with no receiver is
+        // the module-level AEAD, and calling it is the point.
+        let plaintext = open(key, aad, &fixed, ciphertext)?;
+
+        self.observe(&fixed)?;
+
+        Ok(plaintext)
+    }
+
+    /// Append `nonce`, evicting the oldest entry once the window is full. The
+    /// only caller that can have already checked for a repeat is
+    /// [`Self::observe`], which does it first.
+    fn record(&mut self, nonce: &[u8; NONCE_LEN]) {
+        if self.ring.len() == self.capacity {
+            if let Some(evicted) = self.ring.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+
+        self.ring.push_back(*nonce);
+        self.seen.insert(*nonce);
+    }
 }
 
 #[cfg(test)]
@@ -901,6 +1106,315 @@ mod tests {
                 "a nonce of {length} bytes must be InvalidInput, not a panic"
             );
         }
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * Nonce discipline (task 4.4)
+     * ------------------------------------------------------------------
+     */
+
+    /// A test RNG that returns the same bytes every time it is asked.
+    ///
+    /// Exists to prove that [`NonceWindow::seal`]'s retry loop is bounded *by
+    /// construction*: a source that can only produce one nonce must yield an
+    /// error, not a spin.
+    struct ConstantRng(u8);
+
+    impl rand::RngCore for ConstantRng {
+        fn next_u32(&mut self) -> u32 {
+            u32::from_le_bytes([self.0; 4])
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            u64::from_le_bytes([self.0; 8])
+        }
+
+        fn fill_bytes(&mut self, destination: &mut [u8]) {
+            destination.fill(self.0);
+        }
+
+        fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(destination);
+
+            Ok(())
+        }
+    }
+
+    /// A small window, so that eviction is reachable in a test. The default is
+    /// 4,096 and asserting eviction at that size would mean 4,097 insertions.
+    fn small_window() -> NonceWindow {
+        NonceWindow::new(4)
+    }
+
+    fn nonce_of(byte: u8) -> [u8; NONCE_LEN] {
+        [byte; NONCE_LEN]
+    }
+
+    #[test]
+    fn the_default_capacity_is_what_the_docs_say() {
+        assert_eq!(NonceWindow::DEFAULT_CAPACITY, 4096);
+        assert_eq!(NonceWindow::default().capacity(), 4096);
+    }
+
+    #[test]
+    fn a_fresh_window_remembers_nothing() {
+        let window = small_window();
+
+        assert!(window.is_empty());
+        assert_eq!(window.len(), 0);
+        assert_eq!(window.capacity(), 4);
+    }
+
+    #[test]
+    fn a_repeated_nonce_is_rejected() {
+        let mut window = small_window();
+
+        assert!(window.observe(&nonce_of(0x01)).is_ok());
+
+        assert_eq!(
+            window.observe(&nonce_of(0x01)).unwrap_err().kind(),
+            ErrorKind::IntegrityMismatch,
+            "a repeat is a replay and must classify as an integrity failure"
+        );
+    }
+
+    /// The capacity-1 boundary: the window still does its one job.
+    #[test]
+    fn a_window_of_capacity_one_rejects_an_immediate_repeat() {
+        let mut window = NonceWindow::new(1);
+
+        assert!(window.observe(&nonce_of(0x01)).is_ok());
+        assert!(window.observe(&nonce_of(0x01)).is_err());
+        assert_eq!(window.len(), 1);
+    }
+
+    /// **The test that makes it a window rather than a set.**
+    ///
+    /// A nonce that has been evicted is accepted again. That is the deliberate
+    /// cost of bounding memory, stated as behaviour so that nobody later
+    /// "fixes" it into an unbounded set without a failing test.
+    #[test]
+    fn an_evicted_nonce_is_accepted_again_which_is_what_makes_it_a_window() {
+        let mut window = small_window();
+
+        for byte in 0..4 {
+            window.observe(&nonce_of(byte)).unwrap();
+        }
+
+        assert_eq!(window.len(), 4, "full, and no larger than its capacity");
+
+        // The fifth insertion evicts the first.
+        window.observe(&nonce_of(4)).unwrap();
+
+        assert_eq!(window.len(), 4);
+        assert!(
+            window.observe(&nonce_of(0)).is_ok(),
+            "a nonce that left the window is no longer remembered"
+        );
+
+        // The fourth is still inside it.
+        assert!(window.observe(&nonce_of(3)).is_err());
+    }
+
+    #[test]
+    fn the_window_never_grows_past_its_capacity() {
+        let mut window = NonceWindow::new(3);
+
+        for byte in 0..200u8 {
+            // Nonces are distinct per iteration; a repeat here would be a test
+            // bug, not a rejection.
+            let _ = window.observe(&nonce_of(byte));
+        }
+
+        assert_eq!(window.len(), 3, "bounded memory under an arbitrary run");
+    }
+
+    /// Concurrency is 4 by default, so chunks complete out of order. An
+    /// out-of-order run must not look like a replay.
+    #[test]
+    fn an_out_of_order_run_of_chunks_is_not_mistaken_for_a_replay() {
+        let mut sender = NonceWindow::default();
+        let mut rng = rand::thread_rng();
+        let aad = fixed_aad();
+
+        let sealed: Vec<_> = (0..4)
+            .map(|index| {
+                sender
+                    .seal(&mut rng, &KEY, &aad, format!("chunk {index}").as_bytes())
+                    .unwrap()
+            })
+            .collect();
+
+        let mut receiver = NonceWindow::default();
+
+        for (index, chunk) in sealed.iter().enumerate().rev() {
+            assert_eq!(
+                receiver
+                    .open(&KEY, &aad, &chunk.nonce, &chunk.ciphertext)
+                    .unwrap(),
+                format!("chunk {index}").as_bytes()
+            );
+        }
+    }
+
+    /// The same chunk twice: the acceptance criterion at the window level.
+    ///
+    /// Two windows, because a sender and a receiver are two sides: the sender
+    /// draws through its own and the receiver checks against its own.
+    #[test]
+    fn a_replayed_chunk_is_rejected_by_the_window() {
+        let mut receiver = NonceWindow::default();
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"chunk three").unwrap();
+
+        assert!(receiver
+            .open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+            .is_ok());
+
+        assert_eq!(
+            receiver
+                .open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::IntegrityMismatch
+        );
+    }
+
+    /// The ordering choice in [`NonceWindow::open`], asserted: a chunk whose
+    /// tag did not verify has not spent its nonce, so the legitimate copy of it
+    /// still opens.
+    ///
+    /// Without this, a forged chunk could consume the nonce of a real one and
+    /// turn a replay defence into a denial of service against the sender.
+    #[test]
+    fn a_tampered_chunk_does_not_spend_its_nonce() {
+        let mut receiver = NonceWindow::default();
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"chunk three").unwrap();
+
+        let mut tampered = sealed.ciphertext.clone();
+        tampered[0] ^= 0x01;
+
+        assert!(receiver.open(&KEY, &aad, &sealed.nonce, &tampered).is_err());
+        assert!(
+            receiver.is_empty(),
+            "nothing authenticated, nothing recorded"
+        );
+
+        assert_eq!(
+            receiver
+                .open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+                .unwrap(),
+            b"chunk three"
+        );
+    }
+
+    /// A chunk that authenticated is remembered, so the sender's own output
+    /// cannot be replayed back at it.
+    #[test]
+    fn sealing_records_the_nonce_so_a_replay_cannot_verify() {
+        let mut window = NonceWindow::default();
+        let mut rng = rand::thread_rng();
+
+        let sealed = window
+            .seal(&mut rng, &KEY, &fixed_aad(), b"payload")
+            .unwrap();
+
+        assert!(window.observe(&sealed.nonce).is_err());
+    }
+
+    #[test]
+    fn sealing_draws_a_different_nonce_each_time() {
+        let mut window = NonceWindow::default();
+        let mut rng = rand::thread_rng();
+        let aad = fixed_aad();
+
+        let first = window.seal(&mut rng, &KEY, &aad, b"payload").unwrap();
+        let second = window.seal(&mut rng, &KEY, &aad, b"payload").unwrap();
+
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.ciphertext, second.ciphertext);
+    }
+
+    /// The retry loop is bounded. A source that can only produce one nonce
+    /// collides with the previous draw and must return an error rather than
+    /// spin forever.
+    #[test]
+    fn sealing_is_bounded_when_the_rng_can_only_repeat_itself() {
+        let mut window = NonceWindow::default();
+        let mut rng = ConstantRng(0x5A);
+
+        assert!(window.seal(&mut rng, &KEY, &fixed_aad(), b"first").is_ok());
+
+        assert_eq!(
+            window
+                .seal(&mut rng, &KEY, &fixed_aad(), b"second")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Internal,
+            "a deterministic source must fail, not hang"
+        );
+
+        assert_eq!(window.len(), 1, "the failed draw recorded nothing");
+    }
+
+    #[test]
+    fn a_nonce_of_the_wrong_length_is_an_error_and_not_a_panic_through_the_window() {
+        let mut window = NonceWindow::default();
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        for length in [0usize, 11, 13, 16] {
+            let nonce = vec![0x0A; length];
+
+            assert_eq!(
+                window
+                    .open(&KEY, &aad, &nonce, &sealed.ciphertext)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+
+        assert!(window.is_empty(), "a rejected length records nothing");
+    }
+
+    /// A zero-capacity window is a security control that is silently off, so it
+    /// is refused at construction rather than accepted.
+    #[test]
+    #[should_panic(expected = "must remember at least one nonce")]
+    fn a_zero_capacity_window_panics() {
+        let _ = NonceWindow::new(0);
+    }
+
+    /// The window rejects a replay at the same index; the AAD rejects one at a
+    /// different index. Both routes end at `IntegrityMismatch`, and this asserts
+    /// they do so through the same entry point.
+    #[test]
+    fn a_chunk_replayed_at_another_index_is_rejected_through_the_window() {
+        let mut window = NonceWindow::default();
+
+        let sealed = seal(
+            &KEY,
+            &aad_of("t-1", "f-1", 3, "docs/report.pdf"),
+            &[0x0A; NONCE_LEN],
+            b"chunk three",
+        )
+        .unwrap();
+
+        let result = window.open(
+            &KEY,
+            &aad_of("t-1", "f-1", 99, "docs/report.pdf"),
+            &sealed.nonce,
+            &sealed.ciphertext,
+        );
+
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::IntegrityMismatch);
+        assert!(window.is_empty());
     }
 
     /*
