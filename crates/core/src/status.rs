@@ -1,7 +1,7 @@
 //! Transfer and connection lifecycle enums.
 //!
 //! Both are moved verbatim from the desktop shell
-//! (`src-tauri/src/models/transfer.rs` and `src-tauri/src/models/mod.rs`).
+//! (`crates/desktop/src/models/transfer.rs` and `crates/desktop/src/models/mod.rs`).
 //! The serde attributes *are* the wire format the webview reads, so they stay
 //! exactly as they were.
 
