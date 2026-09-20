@@ -41,8 +41,7 @@ fn assert_fixture(name: &str, actual: String) {
         .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
 
     assert_eq!(
-        expected,
-        actual,
+        expected, actual,
         "wire format for {name} changed — this is a breaking change for the webview"
     );
 }

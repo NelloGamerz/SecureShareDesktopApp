@@ -90,7 +90,6 @@ fn resolve_download_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve Downloads folder: {error}"))
 }
 
-
 fn check_receiver_storage(path: &Path, _required_bytes: u64) -> Result<u64, String> {
     let path = if path.is_dir() {
         path.to_path_buf()
@@ -520,7 +519,7 @@ pub async fn receive(
         ))?
     };
 
-    let hash = Sha256::digest(&transfer_key);
+    let hash = Sha256::digest(transfer_key);
 
     tracing::info!(
         transfer_key_hash=%hex::encode(hash),

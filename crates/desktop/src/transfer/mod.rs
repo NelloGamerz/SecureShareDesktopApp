@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod constants;
+pub mod crypto;
 pub mod errors;
 pub mod http_client;
 pub mod manager;
@@ -11,4 +12,3 @@ pub mod scheduler;
 pub mod state;
 pub mod upload;
 pub mod writer;
-pub mod crypto;

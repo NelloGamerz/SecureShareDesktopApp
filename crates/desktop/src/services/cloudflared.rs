@@ -96,6 +96,15 @@ impl CloudflaredService {
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
 
+            // `flatten()` here drops each `Err` and asks for the next line.
+            // A read that keeps failing without reaching EOF — non-UTF-8 output
+            // does exactly that — makes this loop spin forever. Clippy suggests
+            // `map_while(Result::ok)`, which stops at the first error instead.
+            //
+            // Not changed in this phase: it is a behaviour change on a path with
+            // no test harness (a child process's pipe), and this phase is a pure
+            // refactor. Recorded as a defect in the phase report.
+            #[allow(clippy::lines_filter_map_ok)]
             for line in reader.lines().flatten() {
                 println!("cloudflared: {}", line);
             }
@@ -107,6 +116,8 @@ impl CloudflaredService {
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
 
+            // Same as the stdout reader above.
+            #[allow(clippy::lines_filter_map_ok)]
             for line in reader.lines().flatten() {
                 eprintln!("cloudflared: {}", line);
 

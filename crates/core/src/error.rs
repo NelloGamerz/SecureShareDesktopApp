@@ -185,7 +185,10 @@ mod tests {
 
     #[test]
     fn the_display_form_is_human_readable() {
-        assert_eq!(VilsendError::Unauthenticated.to_string(), "not authenticated");
+        assert_eq!(
+            VilsendError::Unauthenticated.to_string(),
+            "not authenticated"
+        );
         assert_eq!(
             VilsendError::NotFound("transfer-1".into()).to_string(),
             "not found: transfer-1"

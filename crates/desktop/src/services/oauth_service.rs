@@ -218,7 +218,9 @@ impl TokenRequestError {
 impl std::fmt::Display for TokenRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Transport(error) => write!(formatter, "could not reach the token endpoint: {error}"),
+            Self::Transport(error) => {
+                write!(formatter, "could not reach the token endpoint: {error}")
+            }
             Self::Rejected {
                 status,
                 detail,

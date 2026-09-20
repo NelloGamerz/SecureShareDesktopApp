@@ -7,13 +7,11 @@ use crate::error::AppError;
 use crate::websocket::WebSocketSender;
 use serde_json::json;
 
-
 pub async fn heartbeat_loop(
     sender: Arc<WebSocketSender>,
     shutdown: CancellationToken,
     interval_secs: u64,
 ) -> Result<(), AppError> {
-
     let interval = Duration::from_secs(interval_secs.max(1));
 
     loop {

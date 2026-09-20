@@ -4,7 +4,7 @@
  *
  * The webview's only way to reach Rust is `invoke("<name>", ...)`, and the
  * only way a name becomes reachable is by being listed in the
- * `generate_handler![...]` registry in `src-tauri/src/lib.rs`. Nothing checks
+ * `generate_handler![...]` registry in `crates/desktop/src/lib.rs`. Nothing checks
  * that the two agree, so a typo or a forgotten registration is a runtime
  * `command not found` with no compile-time signal.
  *
@@ -23,7 +23,7 @@ import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-const registryPath = join(repoRoot, "src-tauri", "src", "lib.rs");
+const registryPath = join(repoRoot, "crates", "desktop", "src", "lib.rs");
 const frontendRoot = join(repoRoot, "src");
 
 /** Reads a file, normalising line endings so offsets are stable. */
@@ -241,7 +241,7 @@ if (missing.length > 0) {
   }
 
   console.error(
-    "\nEach of these fails at runtime with \"command not found\". Register the command in src-tauri/src/lib.rs or fix the name at the call site.",
+    "\nEach of these fails at runtime with \"command not found\". Register the command in crates/desktop/src/lib.rs or fix the name at the call site.",
   );
 }
 

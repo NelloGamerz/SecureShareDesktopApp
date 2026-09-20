@@ -24,12 +24,12 @@ pub async fn upload_chunk(
 
             file.seek(std::io::SeekFrom::Start(job.offset)).await?;
 
-            let mut bytes = vec![0u8; job.length as usize];
+            let mut bytes = vec![0u8; job.length];
 
             file.read_exact(&mut bytes).await?;
 
             let encrypted = crypto::encrypt_chunk(transfer_key, &bytes)
-                .map_err(|e| crate::transfer::errors::TransferError::Crypto(e))?;
+                .map_err(crate::transfer::errors::TransferError::Crypto)?;
 
             client
                 .send(endpoint, token, job, encrypted.data, encrypted.nonce)

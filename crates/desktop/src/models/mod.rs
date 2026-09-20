@@ -1,7 +1,7 @@
-pub mod session;
 pub mod chunk;
 pub mod file_info;
 pub mod progress;
+pub mod session;
 pub mod transfer;
 
 pub use session::Session;

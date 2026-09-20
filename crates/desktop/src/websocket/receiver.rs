@@ -14,22 +14,18 @@ pub async fn receive_loop(
             Ok(message) => {
                 println!("RECEIVED FRAME: {:?}", message);
 
-                match message {
-                    Message::Text(text) => {
-                        println!("TEXT: {}", text);
+                if let Message::Text(text) = message {
+                    println!("TEXT: {}", text);
 
-                        match serde_json::from_str::<ServerCommand>(&text) {
-                            Ok(command) => {
-                                dispatcher.emit_command(command).await?;
-                            }
+                    match serde_json::from_str::<ServerCommand>(&text) {
+                        Ok(command) => {
+                            dispatcher.emit_command(command).await?;
+                        }
 
-                            Err(err) => {
-                                tracing::warn!("invalid websocket command: {}", err);
-                            }
+                        Err(err) => {
+                            tracing::warn!("invalid websocket command: {}", err);
                         }
                     }
-
-                    _ => {}
                 }
             }
 

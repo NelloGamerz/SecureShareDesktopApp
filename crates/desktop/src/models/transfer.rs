@@ -9,6 +9,11 @@ pub use vilsend_core::TransferStatus;
 pub enum ConnectionType {
     Lan,
     Tunnel,
+    // The variant name is deliberately the serialised value. `rename_all` maps
+    // it to `"REMOTE"` on the wire either way, but renaming it to satisfy a
+    // style lint would put the wire format one serde release away from a
+    // silent change, for no gain.
+    #[allow(clippy::upper_case_acronyms)]
     REMOTE,
 }
 
@@ -46,7 +51,6 @@ pub struct TransferStatusResponse {
     pub retry_count: u32,
     pub status: TransferStatus,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalTransferFile {

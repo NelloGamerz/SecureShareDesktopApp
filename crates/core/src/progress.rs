@@ -123,7 +123,13 @@ mod tests {
     }
 
     fn download(received: u64, total: u64, elapsed_secs: f64) -> TransferProgress {
-        download_progress(ID, received, total, elapsed_secs, TransferStatus::Downloading)
+        download_progress(
+            ID,
+            received,
+            total,
+            elapsed_secs,
+            TransferStatus::Downloading,
+        )
     }
 
     #[test]

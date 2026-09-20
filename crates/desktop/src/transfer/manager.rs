@@ -106,10 +106,9 @@ impl UploadManager {
 
         let shared = crypto::derive_shared_secret(&ephemeral.private_key, &receiver_public);
 
-        let transfer_key =
-            crypto::derive_transfer_key(&shared).map_err(|e| TransferError::Invalid(e))?;
+        let transfer_key = crypto::derive_transfer_key(&shared).map_err(TransferError::Invalid)?;
 
-        let hash = Sha256::digest(&transfer_key);
+        let hash = Sha256::digest(transfer_key);
 
         tracing::info!(
             transfer_key_hash=%hex::encode(hash),

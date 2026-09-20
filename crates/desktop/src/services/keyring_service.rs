@@ -193,7 +193,8 @@ impl KeyringService {
             refresh_token: Self::get_optional(app, AUTH_REFRESH_TOKEN)?,
             // A value that cannot be parsed is treated as unknown rather than
             // fatal; the token is then refreshed lazily on first use.
-            expires_at: Self::get_optional(app, AUTH_EXPIRES_AT)?.and_then(|value| value.parse().ok()),
+            expires_at: Self::get_optional(app, AUTH_EXPIRES_AT)?
+                .and_then(|value| value.parse().ok()),
             user_id: Self::get_optional(app, AUTH_USER_ID)?,
             token_endpoint: Self::get_optional(app, AUTH_TOKEN_ENDPOINT)?,
             client_id: Self::get_optional(app, AUTH_CLIENT_ID)?,

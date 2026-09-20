@@ -48,7 +48,8 @@ fn a_simulated_upload_emits_progress_then_completion() {
 
     assert_eq!(percentages, vec![0.0, 25.0, 50.0, 75.0, 100.0, 100.0]);
 
-    let statuses: Vec<TransferStatus> = events.iter().map(|e| e.progress().status.clone()).collect();
+    let statuses: Vec<TransferStatus> =
+        events.iter().map(|e| e.progress().status.clone()).collect();
 
     assert_eq!(statuses.last(), Some(&TransferStatus::Completed));
     assert!(sink.is_empty(), "take() must drain the sink");
@@ -69,10 +70,7 @@ fn a_simulated_download_reports_a_failure_with_the_last_progress_it_had() {
 
     let events = sink.take();
 
-    assert_eq!(
-        names(&events),
-        vec!["transfer-progress", "transfer-failed"]
-    );
+    assert_eq!(names(&events), vec!["transfer-progress", "transfer-failed"]);
 
     // The failure carries the progress made before it, not an empty payload.
     let failed = events[1].progress();
@@ -101,11 +99,7 @@ fn pause_resume_and_cancel_are_distinguishable_events_on_the_same_payload() {
 
     assert_eq!(
         names(&events),
-        vec![
-            "transfer-paused",
-            "transfer-resumed",
-            "transfer-cancelled"
-        ]
+        vec!["transfer-paused", "transfer-resumed", "transfer-cancelled"]
     );
 
     // All three carry an identical payload — the name is the only difference,
