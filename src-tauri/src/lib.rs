@@ -2,6 +2,8 @@ mod app;
 mod commands;
 mod error;
 mod events;
+#[cfg(test)]
+mod golden;
 mod models;
 mod services;
 mod state;
@@ -163,8 +165,7 @@ pub fn run() {
              * so a slow or absent connection cannot delay startup.
              */
             {
-                let restored =
-                    tauri::async_runtime::block_on(app_state.oauth_service.restore());
+                let restored = tauri::async_runtime::block_on(app_state.oauth_service.restore());
 
                 tracing::info!(
                     target: "auth",

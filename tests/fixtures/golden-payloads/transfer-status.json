@@ -1,0 +1,10 @@
+{
+  "Cancelled": "CANCELLED",
+  "Completed": "COMPLETED",
+  "Downloading": "DOWNLOADING",
+  "Failed": "FAILED",
+  "Paused": "PAUSED",
+  "Pending": "PENDING",
+  "Queued": "QUEUED",
+  "Uploading": "UPLOADING"
+}

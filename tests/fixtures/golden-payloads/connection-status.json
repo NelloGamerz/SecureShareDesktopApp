@@ -1,0 +1,9 @@
+{
+  "Connected": "Connected",
+  "Connecting": "Connecting",
+  "Disconnected": "Disconnected",
+  "Error": {
+    "Error": "websocket closed"
+  },
+  "Reconnecting": "Reconnecting"
+}
