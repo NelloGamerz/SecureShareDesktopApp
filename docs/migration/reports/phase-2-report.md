@@ -398,7 +398,7 @@ would have broken the "frontend unchanged" criterion. `npm run lint` is not in
 the CI workflow, on purpose: a gate that is red on arrival is a gate people learn
 to ignore.
 
-**D5 · The Tauri CLI finds the project by a depth-3 directory walk — NOT FIXED**
+**D5 · The Tauri CLI finds the project by a depth-3 directory walk — GUARDED**
 §4.1. When `src-tauri/` existed, resolution hit a fast path. It no longer does,
 so every `tauri` invocation now walks the repository — including `node_modules`
 and any build output — to depth 3, sorted files-with-extensions-first, ignoring
@@ -407,9 +407,42 @@ correctly today (there is exactly one config file within depth 3), and it is the
 CLI's own documented fallback rather than a flag. But a future
 `node_modules/<pkg>/<sub>/tauri.conf.json`, or a second app under
 `crates/<x>/tauri.conf.json` at depth ≤ 3, would silently redirect the build.
-The escape hatch is `TAURI_CLI_CONFIG_DEPTH=1`, which is an environment variable
-rather than a flag, so it would not violate the brief's "no non-standard flags"
-condition if you decide the walk is too fragile.
+
+**§9 D5's original escape hatch was wrong, and the correction matters.**
+`TAURI_CLI_CONFIG_DEPTH=1` does *not* tighten the walk to something safe — it
+puts `crates/desktop` out of reach, because that directory sits at depth 2.
+Measured on this layout:
+
+| `TAURI_CLI_CONFIG_DEPTH` | `tauri info` App section | exit |
+|---|---|---|
+| unset (3) | `frontendDist: ../../dist`, CSP, devUrl | 0 |
+| `2` | identical to unset | 0 |
+| `1` | **empty** — no CSP, no frontendDist, no devUrl | **0** |
+
+So the failure is quiet: the CLI reports nothing and succeeds. Anyone reaching
+for depth 1 as a hardening measure would instead have hidden the project, and
+found out later. `2` is the smallest value that still resolves, and is the only
+value worth using if the walk is ever narrowed.
+
+**The walk is now guarded in CI rather than trusted.** Two steps in the
+`frontend` job, verified against synthetic trees as well as this one:
+
+1. `tauri-cli must resolve crates/desktop` asserts the `frontendDist` the CLI
+   reports equals the one `crates/desktop/tauri.conf.json` declares — read from
+   the config, not hard-coded. Under `TAURI_CLI_CONFIG_DEPTH=1` it fires, which
+   is the point: it catches the silent-empty case that an exit-code check
+   cannot. It runs before anything invokes cargo, so `target/` cannot
+   contribute noise.
+2. `exactly one tauri.conf.json within the CLI's search depth` fails if the
+   count within depth 3 outside `node_modules` is anything but one, or if the
+   one is not `crates/desktop`.
+
+The guard cannot cover a config file *inside* `node_modules`, because the walk
+does not skip that directory and any dependency may ship one. That half is
+reported as a CI warning instead of a failure, so it is visible without being a
+false alarm. It is the half that would actually capture resolution, so if it
+ever fires, the fix is a second config out of the way or a narrow
+`TAURI_CLI_CONFIG_DEPTH` of `2` — never `1`.
 
 **D6 · `cloudflared.rs` can spin forever on a persistent read error — NOT FIXED**
 `BufReader::lines().flatten()` drops each `Err` and asks for the next line. A

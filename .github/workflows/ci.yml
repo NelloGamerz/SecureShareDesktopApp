@@ -105,6 +105,62 @@ jobs:
       - name: IPC contract
         run: npm run check:ipc
 
+      # ------------------------------------------------------------
+      # TAURI PROJECT RESOLUTION
+      #
+      # `tauri-cli` looks for the project in the current directory and in
+      # `./src-tauri`, then falls back to a walk of the current directory
+      # bounded by `TAURI_CLI_CONFIG_DEPTH` (default 3) that does *not* honour
+      # `.gitignore`. The fallback is the only reason `crates/desktop` is found,
+      # and it fails quietly: with no project in reach, `tauri info` prints an
+      # empty App section and still exits 0 — verified locally, where
+      # `TAURI_CLI_CONFIG_DEPTH=1` produces exactly that. So the assertion is on
+      # the resolved value, not on the exit code.
+      #
+      # Run before anything invokes cargo, so `target/` does not exist and
+      # cannot contribute noise to the count below.
+      # ------------------------------------------------------------
+      - name: tauri-cli must resolve crates/desktop
+        run: |
+          resolved=$(npx tauri info | sed -n 's/^    - frontendDist: //p')
+          expected=$(node -p "require('./crates/desktop/tauri.conf.json').build.frontendDist")
+
+          echo "tauri-cli resolved frontendDist = '${resolved:-<nothing>}'"
+          echo "crates/desktop/tauri.conf.json declares '$expected'"
+
+          if [ "$resolved" != "$expected" ]; then
+            echo "::error::tauri-cli did not resolve crates/desktop/tauri.conf.json"
+            echo "An empty value means it resolved no project at all: the fallback"
+            echo "walk is bounded by TAURI_CLI_CONFIG_DEPTH (default 3), and"
+            echo "crates/desktop sits at depth 2. Lowering it hides the project"
+            echo "instead of failing, so do not."
+            exit 1
+          fi
+
+      - name: exactly one tauri.conf.json within the CLI's search depth
+        run: |
+          found=$(find . -maxdepth 3 -name 'tauri.conf.json' | sort)
+          echo "within depth 3:"
+          printf '%s\n' "$found"
+
+          outside=$(printf '%s\n' "$found" | grep -v '^\./node_modules/' | grep . || true)
+          count=$(printf '%s\n' "$outside" | grep -c . || true)
+
+          if [ "$count" -ne 1 ] || [ "$outside" != "./crates/desktop/tauri.conf.json" ]; then
+            echo "::error::expected exactly ./crates/desktop/tauri.conf.json within depth 3"
+            echo "A second config file inside the walk can capture resolution."
+            exit 1
+          fi
+
+          # The walk does not skip `node_modules`, so this half cannot be a hard
+          # failure — any dependency is free to ship a config file — but it is
+          # the half that would actually capture resolution, so it is reported.
+          inside=$(printf '%s\n' "$found" | grep '^\./node_modules/' || true)
+          if [ -n "$inside" ]; then
+            echo "::warning::a tauri.conf.json sits under node_modules, which the walk does not skip:"
+            printf '%s\n' "$inside"
+          fi
+
       - name: Build
         run: npm run build
 
