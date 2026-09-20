@@ -1,0 +1,35 @@
+[package]
+name = "vilsend-sdk"
+# The version of the *public API*, which is not the version of the app. ADR-0005
+# keeps this crate at `publish = false` until Phase 7 is done and the CLI has
+# exercised the surface, so nothing here is a promise to a third party yet.
+version = "0.1.0"
+edition = "2021"
+description = "The stable public API for VilSend."
+license = "Apache-2.0 OR MIT"
+# ADR-0005: "Do not publish the Rust crate to crates.io until Phase 7 is
+# complete." A comment cannot enforce that; this can.
+publish = false
+
+[dependencies]
+# The domain types and the boundary error model. The SDK is a facade over the
+# engine, and the engine's vocabulary is `vilsend-core`'s.
+vilsend-core = { path = "../core" }
+# `Stream` for the event verb (04 §2.3). `futures-core` is the trait-only crate
+# and `futures-channel` supplies the bounded fan-out queue; neither pulls in a
+# runtime, which `01` §6.1 requires — host apps may run their own.
+futures-core = "0.3"
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+# Per-chunk integrity over the in-memory link. Also what `Outcome::verified`
+# is a statement about.
+sha2 = "0.10"
+# Requests are data, not closures (04 §2.2), so they serialise cleanly across
+# FFI. `vilsend-core` already depends on serde, so this adds no new crate to
+# the tree.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The integration tests drive a full send -> receive cycle and need to poll the
+# public futures without a runtime; `futures` supplies that executor.
+futures = "0.3"
+serde_json = "1"
