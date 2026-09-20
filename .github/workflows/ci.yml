@@ -30,8 +30,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      # `rust-toolchain.toml` is the only place the Rust version is written
+      # down. Installing `stable` would put this job on a different compiler
+      # from the one the repository pins, and `rustup` would then download the
+      # pinned one anyway on first use — so read the pin and install that.
+      - name: Install the pinned Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          test -n "$channel" || { echo "::error::rust-toolchain.toml declares no channel"; exit 1; }
+          rustup toolchain install "$channel"
+          # Running a shim inside the repository is what makes rustup apply the
+          # file: it installs the pinned channel plus the components and targets
+          # declared there.
+          rustc --version
+          active=$(rustup show active-toolchain | cut -d' ' -f1)
+          echo "active toolchain: $active (pinned: $channel)"
+          case "$active" in
+            "$channel"*) ;;
+            *) echo "::error::active toolchain $active is not the pinned $channel"; exit 1 ;;
+          esac
 
       # Printed on every run so a failure is diagnosable from the log alone.
       # `--prefix none` prints one bare `name version` line per crate, which is
@@ -125,12 +142,20 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
 
-      # `rust-toolchain.toml` pins the channel; this installs it plus the two
-      # components the gates below need.
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Same as the architecture job: the pin in `rust-toolchain.toml` decides
+      # the compiler, and it brings `rustfmt` and `clippy` with it.
+      - name: Install the pinned Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          test -n "$channel" || { echo "::error::rust-toolchain.toml declares no channel"; exit 1; }
+          rustup toolchain install "$channel"
+          rustc --version
+          active=$(rustup show active-toolchain | cut -d' ' -f1)
+          echo "active toolchain: $active (pinned: $channel)"
+          case "$active" in
+            "$channel"*) ;;
+            *) echo "::error::active toolchain $active is not the pinned $channel"; exit 1 ;;
+          esac
 
       - name: Cache Rust
         uses: actions/cache@v4
