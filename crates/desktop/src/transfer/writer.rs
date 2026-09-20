@@ -1,7 +1,8 @@
 use crate::{
     models::{progress, transfer::TransferStatus},
-    transfer::{crypto, events, http_client::StartTransferRequest, merger, state::DownloadState},
+    transfer::{crypto, http_client::StartTransferRequest, merger, state::DownloadState},
 };
+use vilsend_core::{DomainEvent, EventSink};
 
 use axum::{
     body::Bytes,
@@ -36,7 +37,12 @@ pub struct PublicKeyResponse {
 
 #[derive(Clone)]
 pub struct ReceiverState {
+    /// Still needed for the settings store, the Downloads directory and secure
+    /// storage. Phase 3 replaces those with ports; until then this stays.
     pub app: tauri::AppHandle,
+    /// The shell's [`EventSink`]. Emitting progress no longer goes through
+    /// `app`.
+    pub events: Arc<dyn EventSink>,
     pub root: PathBuf,
     pub guard: std::sync::Arc<tokio::sync::Mutex<()>>,
     pub keys: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, [u8; 32]>>>,
@@ -45,9 +51,10 @@ pub struct ReceiverState {
 }
 
 impl ReceiverState {
-    pub fn new(app: tauri::AppHandle, root: PathBuf) -> Self {
+    pub fn new(app: tauri::AppHandle, events: Arc<dyn EventSink>, root: PathBuf) -> Self {
         Self {
             app,
+            events,
             root,
             guard: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             keys: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -173,11 +180,9 @@ pub async fn start_transfer(
             status: Mutex::new(TransferStatus::Failed),
         });
 
-        events::emit_progress(
-            &state.app,
-            "transfer-failed",
-            progress::make_download(&duplicate),
-        );
+        state.events.emit(DomainEvent::TransferFailed {
+            progress: progress::make_download(&duplicate),
+        });
 
         return Err((
             StatusCode::CONFLICT,
@@ -225,11 +230,9 @@ pub async fn start_transfer(
             status: Mutex::new(TransferStatus::Failed),
         });
 
-        events::emit_progress(
-            &state.app,
-            "transfer-failed",
-            progress::make_download(&insufficient),
-        );
+        state.events.emit(DomainEvent::TransferFailed {
+            progress: progress::make_download(&insufficient),
+        });
 
         return Err((
             StatusCode::INSUFFICIENT_STORAGE,
@@ -345,11 +348,9 @@ pub async fn start_transfer(
     /*
      * Notify frontend so it can immediately show the transfer.
      */
-    events::emit_progress(
-        &state.app,
-        "transfer-progress",
-        progress::make_download(&download),
-    );
+    state.events.emit(DomainEvent::TransferProgress {
+        progress: progress::make_download(&download),
+    });
 
     tracing::info!(
         transfer_id = %request.transfer_id,
@@ -627,11 +628,9 @@ pub async fn receive(
         fs::write(&part, decrypted).await.map_err(|e| {
             *download.status.lock().unwrap() = TransferStatus::Failed;
 
-            events::emit_progress(
-                &state.app,
-                "transfer-failed",
-                progress::make_download(&download),
-            );
+            state.events.emit(DomainEvent::TransferFailed {
+                progress: progress::make_download(&download),
+            });
 
             tracing::error!(
                 transfer_id=%transfer,
@@ -655,11 +654,9 @@ pub async fn receive(
 
         *download.status.lock().unwrap() = TransferStatus::Downloading;
 
-        events::emit_progress(
-            &state.app,
-            "transfer-progress",
-            progress::make_download(&download),
-        );
+        state.events.emit(DomainEvent::TransferProgress {
+            progress: progress::make_download(&download),
+        });
 
         tracing::info!(
             transfer_id=%transfer,
@@ -705,11 +702,9 @@ pub async fn receive(
 
         *download.status.lock().unwrap() = TransferStatus::Completed;
 
-        events::emit_progress(
-            &state.app,
-            "transfer-completed",
-            progress::make_download(&download),
-        );
+        state.events.emit(DomainEvent::TransferCompleted {
+            progress: progress::make_download(&download),
+        });
 
         state.downloads.write().await.remove(&transfer);
 

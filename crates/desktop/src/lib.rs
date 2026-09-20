@@ -138,6 +138,16 @@ pub fn run() {
 
             let database_path = app_data_dir.join("transfer.db");
 
+            /*
+             * The event port (ADR-0012).
+             *
+             * One sink is built here and shared by everything that emits: the
+             * upload manager and the receiver. It is a thin wrapper over the
+             * app handle, so there is nothing to keep per-consumer.
+             */
+            let events: Arc<dyn vilsend_core::EventSink> =
+                Arc::new(events::TauriEventSink::new(app.handle().clone()));
+
             let database_url = format!("sqlite:{}?mode=rwc", database_path.to_string_lossy());
 
             let pool = tauri::async_runtime::block_on(async {
@@ -150,8 +160,12 @@ pub fn run() {
             let local_transfer_service = Arc::new(tauri::async_runtime::block_on(async {
                 LocalTransferFileService::new(pool).await
             }));
-            let (app_state, rx) =
-                AppState::new(app.handle().clone(), config, local_transfer_service.clone());
+            let (app_state, rx) = AppState::new(
+                app.handle().clone(),
+                Arc::clone(&events),
+                config,
+                local_transfer_service.clone(),
+            );
 
             let app_state = Arc::new(app_state);
 
@@ -283,8 +297,11 @@ pub fn run() {
             /*
              * Local receiver server
              */
-            let receiver_state =
-                transfer::writer::ReceiverState::new(app.handle().clone(), transfer_root);
+            let receiver_state = transfer::writer::ReceiverState::new(
+                app.handle().clone(),
+                Arc::clone(&events),
+                transfer_root,
+            );
 
             tauri::async_runtime::spawn(async move {
                 let address =

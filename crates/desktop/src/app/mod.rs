@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use vilsend_core::EventSink;
+
 use crate::events::EventDispatcher;
 use crate::services::local_transfer_file_service::LocalTransferFileService;
 use crate::services::oauth_service::OAuthService;
@@ -25,6 +27,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         app_handle: tauri::AppHandle,
+        events: Arc<dyn EventSink>,
         config: AppConfig,
         local_transfer_service: Arc<LocalTransferFileService>,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<TransferEvent>) {
@@ -36,7 +39,7 @@ impl AppState {
         let upload_root = std::env::temp_dir().join("transfer_uploads");
 
         let upload_manager = Arc::new(UploadManager::new(
-            app_handle.clone(),
+            events,
             upload_root,
             Arc::clone(&local_transfer_service),
             tx,

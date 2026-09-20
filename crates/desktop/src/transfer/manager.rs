@@ -6,7 +6,7 @@ use crate::{
     transfer::{
         chunker, constants,
         errors::{Result, TransferError},
-        events, progress, scanner, scheduler,
+        progress, scanner, scheduler,
         state::UploadState,
     },
 };
@@ -17,7 +17,7 @@ use std::{
     sync::atomic::Ordering,
     sync::{Arc, Mutex},
 };
-use tauri::AppHandle;
+use vilsend_core::{DomainEvent, EventSink};
 
 #[derive(Debug)]
 pub enum TransferEvent {
@@ -28,21 +28,23 @@ pub enum TransferEvent {
 #[derive(Clone)]
 pub struct UploadManager {
     transfers: Arc<Mutex<HashMap<String, Arc<UploadState>>>>,
-    app: AppHandle,
+    /// The shell's [`EventSink`]. Replaces the `AppHandle` this struct used to
+    /// hold: emitting progress was the only thing the handle was for.
+    events: Arc<dyn EventSink>,
     upload_root: PathBuf,
     local_files: Arc<LocalTransferFileService>,
     transfer_events: tokio::sync::mpsc::UnboundedSender<TransferEvent>,
 }
 impl UploadManager {
     pub fn new(
-        app: AppHandle,
+        events: Arc<dyn EventSink>,
         upload_root: PathBuf,
         local_files: Arc<LocalTransferFileService>,
         transfer_events: tokio::sync::mpsc::UnboundedSender<TransferEvent>,
     ) -> Self {
         Self {
             transfers: Arc::new(Mutex::new(HashMap::new())),
-            app,
+            events,
             upload_root,
             local_files,
             transfer_events,
@@ -155,12 +157,14 @@ impl UploadManager {
         tokio::spawn(async move {
             *state.status.lock().expect("status lock poisoned") = TransferStatus::Uploading;
             let s = state.clone();
-            let app = manager.app.clone();
+            let events = Arc::clone(&manager.events);
             let on_success = Arc::new(move |length: usize, retries: u32| {
                 s.uploaded_bytes.fetch_add(length as u64, Ordering::Relaxed);
                 s.uploaded_chunks.fetch_add(1, Ordering::Relaxed);
                 s.retry_count.fetch_add(retries, Ordering::Relaxed);
-                events::emit_progress(&app, "transfer-progress", progress::make(&s));
+                events.emit(DomainEvent::TransferProgress {
+                    progress: progress::make(&s),
+                });
             });
             let result = scheduler::run(
                 jobs,
@@ -176,11 +180,9 @@ impl UploadManager {
             match result {
                 Ok(()) => {
                     *state.status.lock().expect("status lock poisoned") = TransferStatus::Completed;
-                    events::emit_progress(
-                        &manager.app,
-                        "transfer-completed",
-                        progress::make(&state),
-                    );
+                    manager.events.emit(DomainEvent::TransferCompleted {
+                        progress: progress::make(&state),
+                    });
 
                     let _ = manager
                         .transfer_events
@@ -189,7 +191,9 @@ impl UploadManager {
                 Err(e) => {
                     *state.status.lock().expect("status lock poisoned") = TransferStatus::Failed;
                     tracing::error!(transfer_id=%state.transfer_id,error=%e,"transfer failed");
-                    events::emit_progress(&manager.app, "transfer-failed", progress::make(&state));
+                    manager.events.emit(DomainEvent::TransferFailed {
+                        progress: progress::make(&state),
+                    });
                     let _ = manager.transfer_events.send(TransferEvent::Failed(
                         state.transfer_id.clone(),
                         e.to_string(),
@@ -203,14 +207,18 @@ impl UploadManager {
         let s = self.get(id)?;
         s.paused.store(true, Ordering::Relaxed);
         *s.status.lock().expect("status lock poisoned") = TransferStatus::Paused;
-        events::emit_progress(&self.app, "transfer-paused", progress::make(&s));
+        self.events.emit(DomainEvent::TransferPaused {
+            progress: progress::make(&s),
+        });
         Ok(s.snapshot())
     }
     pub fn resume(&self, id: &str) -> Result<TransferStatusResponse> {
         let s = self.get(id)?;
         s.paused.store(false, Ordering::Relaxed);
         *s.status.lock().expect("status lock poisoned") = TransferStatus::Uploading;
-        events::emit_progress(&self.app, "transfer-resumed", progress::make(&s));
+        self.events.emit(DomainEvent::TransferResumed {
+            progress: progress::make(&s),
+        });
         Ok(s.snapshot())
     }
     pub async fn cancel(&self, id: &str) -> Result<TransferStatusResponse> {
@@ -218,7 +226,9 @@ impl UploadManager {
         s.cancelled.store(true, Ordering::Relaxed);
         *s.status.lock().expect("status lock poisoned") = TransferStatus::Cancelled;
         let _ = tokio::fs::remove_dir_all(self.upload_root.join("incoming").join(id)).await;
-        events::emit_progress(&self.app, "transfer-cancelled", progress::make(&s));
+        self.events.emit(DomainEvent::TransferCancelled {
+            progress: progress::make(&s),
+        });
         self.transfers
             .lock()
             .expect("transfer lock poisoned")
