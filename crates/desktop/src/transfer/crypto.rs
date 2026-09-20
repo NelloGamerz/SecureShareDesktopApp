@@ -12,7 +12,7 @@
 //!   `docs/DECISIONS.md:13`.
 //!
 //! Neither is fixed here. v2 is a separate implementation in
-//! [`crate::transfer::crypto_v2`], compiled only under the `protocol-v2`
+//! `crate::transfer::crypto_v2`, compiled only under the `protocol-v2`
 //! feature, and the two never share a key derivation — see the module header
 //! there for the domain separation that makes that true.
 //!
@@ -171,7 +171,7 @@ pub fn decode_private_key(encoded: &str) -> Result<StaticSecret, String> {
 /// that task 4.1 closes for v2, and `the_v1_kdf_is_hkdf_sha256_without_a_salt`
 /// is the missing-salt gap that task 4.2 closes for v2. Neither may be
 /// "fixed" here: v1 cannot change, and the v2 fixes land in
-/// [`crate::transfer::crypto_v2`] behind the `protocol-v2` feature.
+/// `crate::transfer::crypto_v2` behind the `protocol-v2` feature.
 #[cfg(test)]
 mod tests {
     use super::*;

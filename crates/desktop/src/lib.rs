@@ -11,6 +11,29 @@ mod transfer;
 mod utils;
 mod websocket;
 
+/// The wire-touching pieces, exposed for the integration tests in `tests/`.
+///
+/// `tests/compat_v1.rs` runs the **real** v1 sender path — the real header set
+/// from [`wire::http_client`], the real frozen crypto from [`wire::crypto`] —
+/// against a receiver built from the frozen v1 schema, so that the compatibility
+/// floor is asserted against the actual code rather than against a
+/// re-implementation of it inside the test. An integration test is a separate
+/// crate and is compiled without `--cfg test`, so `#[cfg(test)]` cannot reach
+/// these, and the modules they live in are private.
+///
+/// **This is not an API surface.** It is `#[doc(hidden)]`, nothing outside
+/// `tests/` should use it, and Phase 5 replaces it with the `vilsend-sdk`
+/// facade. It exists only because "the test re-implements the thing it is
+/// testing" is not a test.
+#[doc(hidden)]
+pub mod wire {
+    pub use crate::models::chunk::ChunkJob;
+    pub use crate::transfer::{constants, crypto, http_client, merger};
+
+    #[cfg(feature = "protocol-v2")]
+    pub use crate::transfer::crypto_v2;
+}
+
 use axum::extract::DefaultBodyLimit;
 use services::local_transfer_file_service::LocalTransferFileService;
 use sqlx::sqlite::SqlitePoolOptions;
