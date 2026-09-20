@@ -73,6 +73,7 @@ impl From<VilsendError> for AppError {
     fn from(error: VilsendError) -> Self {
         match error {
             VilsendError::Unauthenticated => Self::NotAuthenticated,
+            VilsendError::Authentication(message) => Self::Auth(message),
             VilsendError::NotConnected => Self::NotConnected,
             VilsendError::NoRoute => Self::Network("no route to peer".into()),
             VilsendError::Network(detail) => Self::Network(detail),
@@ -90,13 +91,13 @@ impl From<AppError> for VilsendError {
         match error {
             AppError::NotAuthenticated => Self::Unauthenticated,
             /*
-             * `AppError::Auth` carries the message the UI renders verbatim.
-             * `VilsendError::Unauthenticated` has no payload, so the message is
-             * dropped in this direction — the kind is the contract that crosses
-             * a boundary and the text is shell-local presentation. Where the
-             * message matters, the call site keeps the `AppError`.
+             * `AppError::Auth` carries the message the UI renders verbatim, and
+             * `VilsendError::Authentication` carries it across. Both report
+             * `ErrorKind::Unauthenticated`, so a shell that only cares about
+             * the class is unaffected, and one that wants to show the reason
+             * still has it. The round trip is lossless in both directions.
              */
-            AppError::Auth(_) => Self::Unauthenticated,
+            AppError::Auth(message) => Self::Authentication(message),
             AppError::NotConnected => Self::NotConnected,
             AppError::Internal(detail) => Self::Internal(detail),
             AppError::Network(detail) => Self::Network(detail),
@@ -139,6 +140,28 @@ mod tests {
         assert_eq!(
             AppError::from(VilsendError::NotFound("transfer-1".into())).to_string(),
             "internal error: not found: transfer-1"
+        );
+    }
+
+    #[test]
+    fn an_auth_failure_keeps_its_message_through_vilsend_error() {
+        // The message on `AppError::Auth` is rendered verbatim in the UI. The
+        // boundary type must not be a one-way door that swallows it.
+        let original = AppError::Auth("your session expired".into());
+
+        let bridged: VilsendError = original.into();
+
+        assert_eq!(bridged.kind(), ErrorKind::Unauthenticated);
+        assert_eq!(bridged.to_string(), "your session expired");
+
+        let back: AppError = bridged.into();
+
+        assert_eq!(back.to_string(), "your session expired");
+        // And `AppError` still crosses the IPC boundary as the flat string the
+        // webview already parses.
+        assert_eq!(
+            serde_json::to_string(&back).expect("serialisable"),
+            "\"your session expired\""
         );
     }
 

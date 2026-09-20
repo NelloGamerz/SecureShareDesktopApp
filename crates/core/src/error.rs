@@ -63,8 +63,18 @@ pub enum ErrorKind {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum VilsendError {
+    /// There is no session at all.
     #[error("not authenticated")]
     Unauthenticated,
+
+    /// A sign-in attempt failed, and `0` is the reason to show. Its kind is
+    /// [`ErrorKind::Unauthenticated`] like the variant above, because a shell
+    /// handles both the same way — send the user to sign in — and only the
+    /// message differs. The message is why this variant exists: without it, a
+    /// shell-furnished reason would be dropped on the way through the boundary
+    /// type.
+    #[error("{0}")]
+    Authentication(String),
 
     #[error("not connected")]
     NotConnected,
@@ -104,7 +114,7 @@ impl VilsendError {
     /// The stable classification of this error.
     pub fn kind(&self) -> ErrorKind {
         match self {
-            Self::Unauthenticated => ErrorKind::Unauthenticated,
+            Self::Unauthenticated | Self::Authentication(_) => ErrorKind::Unauthenticated,
             Self::NotConnected => ErrorKind::NotConnected,
             Self::NoRoute => ErrorKind::NoRoute,
             Self::IntegrityMismatch(_) => ErrorKind::IntegrityMismatch,
@@ -123,36 +133,85 @@ impl VilsendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
-    fn every_variant() -> Vec<VilsendError> {
+    fn every_variant() -> Vec<(&'static str, VilsendError)> {
         vec![
-            VilsendError::Unauthenticated,
-            VilsendError::NotConnected,
-            VilsendError::NoRoute,
-            VilsendError::IntegrityMismatch("chunk 4".into()),
-            VilsendError::InsufficientStorage,
-            VilsendError::Cancelled,
-            VilsendError::InvalidInput("endpoint is empty".into()),
-            VilsendError::NotFound("transfer-1".into()),
-            VilsendError::Network("connection reset".into()),
-            VilsendError::Storage("disk is full".into()),
-            VilsendError::Serialization("invalid utf-8".into()),
-            VilsendError::Internal("unreachable".into()),
+            ("Unauthenticated", VilsendError::Unauthenticated),
+            (
+                "Authentication",
+                VilsendError::Authentication("bad credentials".into()),
+            ),
+            ("NotConnected", VilsendError::NotConnected),
+            ("NoRoute", VilsendError::NoRoute),
+            (
+                "IntegrityMismatch",
+                VilsendError::IntegrityMismatch("chunk 4".into()),
+            ),
+            ("InsufficientStorage", VilsendError::InsufficientStorage),
+            ("Cancelled", VilsendError::Cancelled),
+            (
+                "InvalidInput",
+                VilsendError::InvalidInput("endpoint is empty".into()),
+            ),
+            ("NotFound", VilsendError::NotFound("transfer-1".into())),
+            ("Network", VilsendError::Network("connection reset".into())),
+            ("Storage", VilsendError::Storage("disk is full".into())),
+            (
+                "Serialization",
+                VilsendError::Serialization("invalid utf-8".into()),
+            ),
+            ("Internal", VilsendError::Internal("unreachable".into())),
         ]
     }
 
+    /// Every variant maps to a kind, and the only kind two variants share is
+    /// `Unauthenticated` — claimed by `Unauthenticated` (no session) and
+    /// `Authentication` (a sign-in attempt failed, with the reason). A shell
+    /// sends the user to sign in for either, so they are one class at the
+    /// boundary, and the message is the only difference. Any *other* collision
+    /// means a condition has lost its own discriminant.
     #[test]
-    fn every_variant_has_its_own_kind() {
-        let kinds: HashSet<ErrorKind> = every_variant().iter().map(VilsendError::kind).collect();
+    fn only_the_authentication_variants_share_a_kind() {
+        let mut seen: Vec<ErrorKind> = Vec::new();
+        let mut collisions: Vec<(&'static str, ErrorKind)> = Vec::new();
 
-        assert_eq!(kinds.len(), every_variant().len());
+        for (name, error) in every_variant() {
+            let kind = error.kind();
+
+            if seen.contains(&kind) {
+                collisions.push((name, kind));
+            } else {
+                seen.push(kind);
+            }
+        }
+
+        assert_eq!(
+            collisions,
+            vec![("Authentication", ErrorKind::Unauthenticated)],
+            "every variant must have its own kind, except the authentication pair"
+        );
+
+        // And every kind the enum declares is claimed by exactly one variant,
+        // so nothing is left as dead vocabulary by accident.
+        assert_eq!(seen.len(), every_variant().len() - 1);
+    }
+
+    #[test]
+    fn an_authentication_failure_carries_the_reason_to_show() {
+        let error = VilsendError::Authentication("bad credentials".into());
+
+        assert_eq!(error.kind(), ErrorKind::Unauthenticated);
+        assert_eq!(error.to_string(), "bad credentials");
     }
 
     #[test]
     fn the_kinds_a_shell_switches_on_are_what_they_say() {
         assert_eq!(
             VilsendError::Unauthenticated.kind(),
+            ErrorKind::Unauthenticated
+        );
+        assert_eq!(
+            VilsendError::Authentication("x".into()).kind(),
             ErrorKind::Unauthenticated
         );
         assert_eq!(VilsendError::NoRoute.kind(), ErrorKind::NoRoute);
