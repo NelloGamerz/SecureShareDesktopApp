@@ -12,7 +12,7 @@ project/
 │   ├── providers/               Clerk/auth/query/theme providers and guards
 │   ├── services/                Frontend service adapters
 │   └── store/                   Zustand UI, auth, notifications, requests
-├── src-tauri/
+├── crates/desktop/
 │   ├── src/lib.rs               Tauri setup, plugins, state, receiver, commands
 │   ├── src/commands/            IPC command handlers
 │   ├── src/services/             Auth, WebSocket, Cloudflared, secure storage
@@ -24,7 +24,9 @@ project/
 │   └── tauri*.conf.json          Platform packaging overrides
 ├── .github/workflows/release.yml CI release matrix
 ├── package.json                  Frontend scripts/dependencies
-├── src-tauri/Cargo.toml          Rust dependencies/features
+├── Cargo.toml                    Cargo workspace manifest (members under crates/)
+├── Cargo.lock                    Locked Rust dependency versions (workspace-wide)
+├── crates/desktop/Cargo.toml     Desktop shell dependencies/features
 └── docs/                         Architecture and engineering documentation
 ```
 

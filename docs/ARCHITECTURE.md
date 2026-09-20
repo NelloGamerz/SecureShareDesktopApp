@@ -5,7 +5,7 @@
 VilSend is a desktop client composed of four runtime boundaries:
 
 1. React/Vite UI in `src/`.
-2. Tauri v2 IPC and application lifecycle in `src-tauri/src/lib.rs`.
+2. Tauri v2 IPC and application lifecycle in `crates/desktop/src/lib.rs`.
 3. Rust local runtime for credentials, WebSocket connectivity, Cloudflared, SQLite metadata, and file transfer.
 4. External central API/WebSocket services, defaulting in production to `https://api.vilsend.in` and `wss://api.vilsend.in/ws`.
 
@@ -27,7 +27,7 @@ flowchart TD
 
 ## Startup
 
-`src-tauri/src/lib.rs` creates the app configuration, app-data directory, SQLite pool, `LocalTransferFileService`, `AppState`, event dispatcher, Cloudflared state, and an Axum receiver. The receiver binds all interfaces on port 7878. The frontend is served from Vite in development and `dist` in a production Tauri build.
+`crates/desktop/src/lib.rs` creates the app configuration, app-data directory, SQLite pool, `LocalTransferFileService`, `AppState`, event dispatcher, Cloudflared state, and an Axum receiver. The receiver binds all interfaces on port 7878. The frontend is served from Vite in development and `dist` in a production Tauri build.
 
 `src/hooks/useDesktopServices.ts` synchronizes services after Clerk/profile loading: it registers the device through the central API when needed, starts Cloudflared, and starts the Rust WebSocket. `src/contexts/auth-context.tsx` sends the Clerk token to Rust and refreshes the Rust-held token every 30 seconds.
 

@@ -10,7 +10,11 @@ server-frontend/
 ├── docs/                    Project architecture and engineering documentation
 ├── public/                  Static frontend assets copied by Vite
 ├── src/                     React and TypeScript frontend
-├── src-tauri/               Tauri configuration and Rust desktop runtime
+├── crates/                  Cargo workspace members
+│   └── desktop/             Tauri configuration and Rust desktop runtime
+├── Cargo.toml               Cargo workspace manifest
+├── Cargo.lock               Locked Rust dependency versions
+├── target/                  Generated Rust build output (workspace root)
 ├── dist/                    Generated frontend production build
 ├── node_modules/            Installed npm dependencies
 ├── package.json             Frontend scripts and dependencies
@@ -25,7 +29,7 @@ server-frontend/
 └── README.md                Minimal starter README
 ```
 
-`dist/`, `node_modules/`, and `src-tauri/target/` are generated directories. They should not be edited manually.
+`dist/`, `node_modules/`, and `target/` are generated directories. They should not be edited manually.
 
 ## Frontend: `src/`
 
@@ -81,10 +85,10 @@ src/
 
 Feature pages should call feature APIs or hooks. Feature APIs should use `src/lib/api.ts` for central HTTP calls or `src/api/tauri.ts` for desktop capabilities. Components should not call Rust commands directly when a feature/service adapter can own that contract.
 
-## Tauri and Rust: `src-tauri/`
+## Tauri and Rust: `crates/desktop/`
 
 ```text
-src-tauri/
+crates/desktop/
 ├── src/
 │   ├── lib.rs                Tauri builder, plugins, app state, receiver startup
 │   ├── main.rs               Native application entry point
@@ -104,9 +108,7 @@ src-tauri/
 ├── icons/                    Desktop and mobile application icons
 ├── msix/                     Microsoft Store packaging assets
 ├── gen/                      Generated Tauri schemas
-├── target/                   Generated Rust build output
 ├── Cargo.toml                Rust dependencies and feature flags
-├── Cargo.lock                Locked Rust dependency versions
 ├── tauri.conf.json           Base Tauri configuration
 ├── tauri.linux.conf.json     Linux packaging override
 ├── tauri.macos.conf.json     macOS packaging override

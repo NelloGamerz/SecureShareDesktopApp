@@ -186,7 +186,7 @@ a test runs in CI — then every later phase is repetition of a proven move.
 
 | # | Task |
 |---|---|
-| 2.1 | Create the virtual workspace: root `Cargo.toml` with `[workspace]`, move `src-tauri/` → `crates/desktop/`, move `Cargo.lock` to the root. **Update the CI cache path** (`.github/workflows/release.yml:939-950`) in the same commit. |
+| 2.1 | Create the virtual workspace: root `Cargo.toml` with `[workspace]`, move `src-tauri/` → `crates/desktop/`, move `Cargo.lock` to the root. **Update the CI cache path** — the `Cache Rust` step of both the `release` and `build-windows-store` jobs in `.github/workflows/release.yml`, which caches `src-tauri/target` and hashes `src-tauri/Cargo.lock` — in the same commit. |
 | 2.2 | Add `rust-toolchain.toml` pinning the toolchain. |
 | 2.3 | Create `crates/core` (`vilsend-core`): domain types (`TransferId`, `DeviceId`, `PeerRef`, `TransferProgress`, `TransferStatus`) + `VilsendError` + the `EventSink` port + `DomainEvent`. |
 | 2.4 | Move `TransferProgress`, `TransferStatus`, `ConnectionStatus`, and the transfer-event names out of the shell into `core`, replacing string literals with a `DomainEvent` enum. |

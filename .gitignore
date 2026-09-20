@@ -13,6 +13,11 @@ dist-ssr
 *.local
 .env
 
+# The workspace target directory. Cargo places it at the workspace root, which
+# is now the repository root — `crates/desktop/.gitignore` still covers the
+# crate-local one for builds made with an explicit --target-dir.
+/target/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

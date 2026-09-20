@@ -2,7 +2,7 @@
 
 ## Tauri build
 
-`src-tauri/tauri.conf.json` builds the Vite `dist` directory, enables all bundle targets, includes updater artifacts, and points the updater at `https://update.vilsend.in/latest.json`. Platform overrides exist for Linux, macOS, Windows, and Windows Store.
+`crates/desktop/tauri.conf.json` builds the Vite `dist` directory, enables all bundle targets, includes updater artifacts, and points the updater at `https://update.vilsend.in/latest.json`. Platform overrides exist for Linux, macOS, Windows, and Windows Store.
 
 The normal GitHub workflow triggers on `v*` tags, uses Node 22 and Rust stable, caches npm/Cargo, and runs a matrix for Ubuntu, Windows, and macOS. It passes Clerk/API/app environment values as build-time variables and uses Tauri signing secrets.
 
