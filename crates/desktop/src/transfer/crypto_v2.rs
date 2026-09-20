@@ -10,7 +10,7 @@
 //! | | v1 | v2 | Task |
 //! |---|---|---|---|
 //! | AEAD associated data | none — a ciphertext is bound to nothing | [`ChunkAad`] binds transfer, file, index, path and protocol version | 4.1 |
-//! | KDF salt | none — two sessions reaching the same ECDH secret share a key | `derive_transfer_key_v2` salts with both handshake nonces | 4.2 |
+//! | KDF salt | none — two sessions reaching the same ECDH secret share a key | [`derive_transfer_key_v2`] salts with both handshake nonces | 4.2 |
 //! | Nonce repeats | undetectable — no call has anywhere to record one | `NonceWindow`, bounded | 4.4 |
 //!
 //! # Why the two implementations never share a key
@@ -38,6 +38,8 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use vilsend_core::VilsendError;
 
 /// The domain separator that opens every v2 chunk AAD.
@@ -166,6 +168,73 @@ impl<'a> ChunkAad<'a> {
 fn push_length_prefixed(output: &mut Vec<u8>, value: &str) {
     output.extend_from_slice(&(value.len() as u32).to_le_bytes());
     output.extend_from_slice(value.as_bytes());
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Key derivation (task 4.2)
+ * ----------------------------------------------------------------------
+ */
+
+/// The HKDF `info` string for the v2 transfer key.
+///
+/// Deliberately not the v1 string. `info` is HKDF's domain separator, so two
+/// callers of the same KDF that intend different keys must use different
+/// `info` — and here the two callers are the same protocol at two versions,
+/// which is exactly the case it is for. Frozen.
+pub const KDF_INFO_V2: &[u8] = b"vilsend-transfer-key-v2";
+
+/// Derive the v2 transfer key from the ECDH secret and **both** handshake
+/// nonces.
+///
+/// v1 passes no salt at all — `Hkdf::new(None, ..)`, which is a salt of 32 zero
+/// bytes — so two sessions that happen to reach the same ECDH secret derive the
+/// same key, and every derived key is a function of the secret alone. The
+/// nonces here come from `HELLO` and `HELLO_ACK`, and the transcript carrying
+/// them is signed by the receiver's device key (ADR-0007 decision 1), so an
+/// attacker who cannot forge that signature cannot choose them.
+///
+/// `sender_nonce` is the nonce from `HELLO`, `receiver_nonce` the one from
+/// `HELLO_ACK`. The salt is their concatenation in that order, and the order is
+/// part of the frozen format: swapping them derives a different key, which a
+/// test asserts.
+///
+/// # Why the nonces are not hashed first
+///
+/// HKDF's `salt` is itself passed through HMAC, so an arbitrarily-sized salt is
+/// already reduced to the hash width. Two 16-byte nonces concatenated give a
+/// 32-byte salt — exactly one SHA-256 block, the size HKDF is built for. Adding
+/// a hash would change the bytes without changing the security, and every byte
+/// here is frozen.
+///
+/// # Why the slice parameters are not `[u8; 16]`
+///
+/// `02-transport-layer.md` §4.3 fixes the handshake nonce at 16 bytes, and a
+/// fixed-size parameter would be the more precise signature. It is a slice here
+/// so that a test can prove the salt is genuinely consumed and that its order
+/// genuinely matters, using short distinguishing inputs. The handshake is the
+/// caller that supplies the real width.
+pub fn derive_transfer_key_v2(
+    shared_secret: &[u8; 32],
+    sender_nonce: &[u8],
+    receiver_nonce: &[u8],
+) -> Result<[u8; 32], VilsendError> {
+    let mut salt = Vec::with_capacity(sender_nonce.len() + receiver_nonce.len());
+
+    salt.extend_from_slice(sender_nonce);
+    salt.extend_from_slice(receiver_nonce);
+
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
+
+    let mut key = [0u8; 32];
+
+    hkdf.expand(KDF_INFO_V2, &mut key)
+        .map_err(|error| VilsendError::Internal(format!("hkdf failed: {error}")))?;
+
+    // Never the key, never the salt: sizes only.
+    tracing::debug!(salt_bytes = salt.len(), "v2 transfer key derived");
+
+    Ok(key)
 }
 
 /*
@@ -300,6 +369,123 @@ mod tests {
     #[test]
     fn the_forwarded_feature_raises_the_protocol_version() {
         assert_eq!(vilsend_core::PROTOCOL_VERSION, vilsend_core::PROTOCOL_V2);
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * Key derivation (task 4.2)
+     * ------------------------------------------------------------------
+     */
+
+    /// The ECDH secret every KDF test below starts from.
+    const SECRET: [u8; 32] = [0x42; 32];
+
+    /// The nonces from `HELLO` and `HELLO_ACK`.
+    const NONCE_S: [u8; 16] = [0x01; 16];
+    const NONCE_R: [u8; 16] = [0x02; 16];
+
+    fn v2_key_of(secret: &[u8; 32], sender: &[u8], receiver: &[u8]) -> [u8; 32] {
+        derive_transfer_key_v2(secret, sender, receiver).unwrap()
+    }
+
+    /// The exact key v2 derives, as a literal — the same treatment the v1 KDF
+    /// gets in `crypto`'s tests, and for the same reason: a change to the salt
+    /// framing, the `info` string or the hash must fail here rather than
+    /// silently produce a wire no peer can read.
+    #[test]
+    fn the_v2_kdf_vector_is_frozen() {
+        assert_eq!(
+            hex::encode(v2_key_of(&SECRET, &NONCE_S, &NONCE_R)),
+            "b3ed1bb478aaa9ef379dd62c6a9df76b35c7d502550848da9cffeb7f368c7e3f"
+        );
+    }
+
+    #[test]
+    fn the_v2_kdf_is_deterministic() {
+        assert_eq!(
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R),
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R)
+        );
+    }
+
+    /// Both nonces are consumed, and their order is part of the format. Neither
+    /// is decorative: an attacker who could feed a chosen nonce to a key
+    /// derivation with a fixed secret could otherwise force a known key.
+    #[test]
+    fn the_v2_kdf_consumes_both_nonces_and_their_order_matters() {
+        let base = v2_key_of(&SECRET, &NONCE_S, &NONCE_R);
+
+        assert_ne!(base, v2_key_of(&SECRET, &[0x03; 16], &NONCE_R));
+        assert_ne!(base, v2_key_of(&SECRET, &NONCE_S, &[0x03; 16]));
+        assert_ne!(
+            base,
+            v2_key_of(&SECRET, &NONCE_R, &NONCE_S),
+            "swapping the nonces must derive a different key"
+        );
+    }
+
+    /// The gap the task exists to close. v1 derives the same key every time for
+    /// a given secret; v2 does not, because the nonces are in the salt.
+    #[test]
+    fn two_sessions_with_the_same_ecdh_secret_derive_different_keys() {
+        let first = v2_key_of(&SECRET, &[0x01; 16], &[0x02; 16]);
+        let second = v2_key_of(&SECRET, &[0x04; 16], &[0x05; 16]);
+
+        assert_ne!(first, second);
+
+        // Which v1 does not do — two sessions, one secret, one key, always.
+        assert_eq!(
+            v1::derive_transfer_key(&SECRET).unwrap(),
+            v1::derive_transfer_key(&SECRET).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_different_ecdh_secret_derives_a_different_key() {
+        assert_ne!(
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R),
+            v2_key_of(&[0x43; 32], &NONCE_S, &NONCE_R)
+        );
+    }
+
+    /// The two KDFs do not agree for the same secret, so a v2 key can never
+    /// collide with a v1 one — before the AEAD is even reached.
+    #[test]
+    fn the_v2_kdf_is_not_the_v1_kdf() {
+        assert_ne!(
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R),
+            v1::derive_transfer_key(&SECRET).unwrap()
+        );
+    }
+
+    /// An empty salt is HKDF-equivalent to no salt (HMAC zero-pads an empty key
+    /// and a 32-zero-byte key to the same block), so this is the strongest
+    /// available statement that the `info` string alone still separates the two
+    /// domains. It is not reachable in the protocol — the handshake nonces are
+    /// always 16 bytes — so it is a property of the KDF rather than a case the
+    /// receiver will ever see.
+    #[test]
+    fn the_info_string_alone_separates_v1_from_v2() {
+        let empty_salt = v2_key_of(&SECRET, &[], &[]);
+
+        assert_ne!(empty_salt, v1::derive_transfer_key(&SECRET).unwrap());
+
+        // And with no salt at all, the salt is genuinely doing nothing.
+        assert_eq!(
+            empty_salt,
+            v2_key_of(&SECRET, &[], &[]),
+            "an empty salt is still deterministic"
+        );
+    }
+
+    /// A 16-byte pair is what the handshake actually supplies, and it produces a
+    /// full-width key.
+    #[test]
+    fn a_handshake_shaped_salt_derives_a_full_width_key() {
+        let key = v2_key_of(&SECRET, &NONCE_S, &NONCE_R);
+
+        assert_eq!(key.len(), 32);
+        assert_ne!(key, [0u8; 32]);
     }
 
     /*
