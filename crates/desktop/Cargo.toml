@@ -75,3 +75,13 @@ windows = { version = "0.62", features = ["Win32_System_Power"] }
 [features]
 default = ["enable-updater"]
 enable-updater = []
+# The v2 wire: associated data on every chunk, a salted KDF, a bounded
+# nonce-repeat window, and the `/v2/*` endpoints that serve them. Off by
+# default — `05-migration-plan.md` requires every new wire behaviour to ship
+# behind a flag that is off for one release, and ADR-0010 makes the v1 surface
+# permanent, so a default build must keep speaking v1.
+#
+# The flag is declared here and owned by `vilsend-core` so that a single
+# `--features protocol-v2` raises `vilsend_core::PROTOCOL_VERSION` and compiles
+# the v2 crypto together; they can never disagree about which version they are.
+protocol-v2 = ["vilsend-core/protocol-v2"]

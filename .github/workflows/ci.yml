@@ -227,8 +227,22 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
-      - name: Clippy
+      # Linted and tested in both feature configurations, because neither is a
+      # subset of the other. `protocol-v2` is off in every shipped build and on
+      # in every v2 build, so a warning, a compile error or a failing test in
+      # either one is invisible from the other — and the v2 crypto is not
+      # compiled at all without the flag, which would silently skip the vectors,
+      # the tamper tests and the wire-compatibility fixture.
+      #
+      # `06-testing-and-quality.md` §6.2 names `--all-features` for this.
+      - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Tests (default features)
         run: cargo test --workspace
+
+      - name: Tests (all features)
+        run: cargo test --workspace --all-features
