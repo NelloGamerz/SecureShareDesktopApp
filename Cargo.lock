@@ -6119,9 +6119,19 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "vilsend-core",
  "windows 0.62.2",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "vilsend-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
