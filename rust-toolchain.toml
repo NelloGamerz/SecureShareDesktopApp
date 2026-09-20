@@ -1,0 +1,13 @@
+# The toolchain this repository builds with.
+#
+# 1.93.0 is what CI resolves today (`dtolnay/rust-toolchain@stable` at the time
+# of writing) and what the committed `Cargo.lock` was produced with. Pinning it
+# here means a toolchain release cannot change the build without a commit:
+# `rustup` reads this file inside the repository, so it takes precedence over
+# whatever `rustup default` says, in CI as much as on a workstation.
+#
+# Bumping this is a deliberate act. When you do bump it, bump the CI action and
+# regenerate `Cargo.lock` in the same commit.
+[toolchain]
+channel = "1.93.0"
+components = ["rustfmt", "clippy"]
