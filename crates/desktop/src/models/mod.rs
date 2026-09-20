@@ -6,14 +6,9 @@ pub mod transfer;
 
 pub use session::Session;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum ConnectionStatus {
-    Disconnected,
-    Connecting,
-    Connected,
-    Reconnecting,
-    Error(String),
-}
+/// Re-exported so the rest of the shell keeps its existing import path.
+/// The type, and its wire encoding, now live in `vilsend-core`.
+pub use vilsend_core::ConnectionStatus;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

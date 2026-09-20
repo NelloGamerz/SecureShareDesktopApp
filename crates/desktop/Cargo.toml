@@ -21,6 +21,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# The platform-agnostic domain crate. The edge runs shell -> core and never the
+# other way; `cargo tree -p vilsend-core` is asserted in CI (ADR-0002).
+vilsend-core = { path = "../core" }
 # The `devtools` feature is deliberately NOT enabled: it is what lets a
 # release build open a web inspector. Debug builds keep devtools regardless.
 tauri = { version = "2", features = [] }

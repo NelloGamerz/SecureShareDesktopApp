@@ -1,17 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum TransferStatus {
-    Queued,
-    Uploading,
-    Paused,
-    Completed,
-    Failed,
-    Cancelled,
-    Pending,
-    Downloading,
-}
+/// Re-exported so the rest of the shell keeps its existing import path.
+/// The type, and its wire encoding, now live in `vilsend-core`.
+pub use vilsend_core::TransferStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]

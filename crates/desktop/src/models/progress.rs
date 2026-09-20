@@ -1,50 +1,25 @@
-use serde::Serialize;
 use std::sync::atomic::Ordering;
 
-use crate::{models::transfer::TransferStatus, transfer::state::DownloadState};
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub struct TransferProgress {
-    pub transfer_id: String,
-    pub uploaded_bytes: u64,
-    pub total_bytes: u64,
-    pub percentage: f64,
-    pub speed: f64,
-    pub eta: Option<u64>,
-    pub status: TransferStatus,
-}
+use crate::transfer::state::DownloadState;
 
+/// Re-exported so the rest of the shell keeps its existing import path.
+/// The type, and its wire encoding, now live in `vilsend-core`.
+pub use vilsend_core::TransferProgress;
 
+/// Samples a download into a progress payload.
+///
+/// The arithmetic moved to `vilsend_core::download_progress`, which takes the
+/// elapsed time as an argument so that it can be tested against a fake clock
+/// rather than a real `Instant`. The reads are kept in their original order.
 pub fn make_download(state: &DownloadState) -> TransferProgress {
     let received = state.received_bytes.load(Ordering::Relaxed);
+    let elapsed_secs = state.started_at.elapsed().as_secs_f64();
 
-    let percentage = if state.total_bytes == 0 {
-        0.0
-    } else {
-        (received as f64 / state.total_bytes as f64) * 100.0
-    };
-
-    let elapsed = state.started_at.elapsed().as_secs_f64();
-
-    let speed = if elapsed > 0.0 {
-        received as f64 / elapsed
-    } else {
-        0.0
-    };
-
-    let eta = if speed > 0.0 && state.total_bytes > received {
-        Some(((state.total_bytes - received) as f64 / speed) as u64)
-    } else {
-        None
-    };
-
-    TransferProgress {
-        transfer_id: state.transfer_id.clone(),
-        uploaded_bytes: received,
-        total_bytes: state.total_bytes,
-        percentage,
-        speed,
-        eta,
-        status: state.status.lock().unwrap().clone(),
-    }
+    vilsend_core::download_progress(
+        state.transfer_id.clone(),
+        received,
+        state.total_bytes,
+        elapsed_secs,
+        state.status.lock().unwrap().clone(),
+    )
 }

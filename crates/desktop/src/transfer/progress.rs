@@ -1,25 +1,22 @@
-use crate::{models::progress::TransferProgress, transfer::state::UploadState};
+use crate::transfer::state::UploadState;
 use std::sync::atomic::Ordering;
+use vilsend_core::TransferProgress;
+
+/// Samples an upload into a progress payload.
+///
+/// The arithmetic moved to `vilsend_core::upload_progress`, which takes the
+/// elapsed time as an argument so that it can be tested against a fake clock
+/// rather than a real `Instant`. The reads are kept in their original order:
+/// the elapsed time is measured before the byte counter is read.
 pub fn make(state: &UploadState) -> TransferProgress {
-    let elapsed = state.started_at.elapsed().as_secs_f64().max(0.001);
+    let elapsed_secs = state.started_at.elapsed().as_secs_f64();
     let uploaded = state.uploaded_bytes.load(Ordering::Relaxed);
-    let speed = uploaded as f64 / elapsed;
-    let remaining = state.total_bytes.saturating_sub(uploaded);
-    TransferProgress {
-        transfer_id: state.transfer_id.clone(),
-        uploaded_bytes: uploaded,
-        total_bytes: state.total_bytes,
-        percentage: if state.total_bytes == 0 {
-            100.0
-        } else {
-            uploaded as f64 * 100.0 / state.total_bytes as f64
-        },
-        speed,
-        eta: if speed > 0.0 {
-            Some((remaining as f64 / speed).ceil() as u64)
-        } else {
-            None
-        },
-        status: state.status.lock().unwrap().clone(),
-    }
+
+    vilsend_core::upload_progress(
+        state.transfer_id.clone(),
+        uploaded,
+        state.total_bytes,
+        elapsed_secs,
+        state.status.lock().unwrap().clone(),
+    )
 }
