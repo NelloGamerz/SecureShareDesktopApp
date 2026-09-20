@@ -246,3 +246,16 @@ jobs:
 
       - name: Tests (all features)
         run: cargo test --workspace --all-features
+
+      # The wire-compatibility floor (ADR-0010; `06-testing-and-quality.md`
+      # §6.2). It already runs inside the `--all-features` pass above; it is
+      # named separately because it is the one suite whose failure means the
+      # installed base is broken, and that should be legible without reading
+      # the whole log.
+      #
+      # `--features protocol-v2` is what makes it an assertion rather than a
+      # formality: with the v2 wire compiled in, this proves the build still
+      # speaks v1 to a v1 receiver. Every later Phase 4 sub-phase must keep
+      # this green.
+      - name: Wire compatibility against the pinned v1 receiver
+        run: cargo test -p vilsend --test compat_v1 --features protocol-v2
