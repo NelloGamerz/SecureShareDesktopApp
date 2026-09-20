@@ -259,3 +259,136 @@ jobs:
       # this green.
       - name: Wire compatibility against the pinned v1 receiver
         run: cargo test -p vilsend --test compat_v1 --features protocol-v2
+
+      # The desktop shell is a consumer of `vilsend-sdk`, and of nothing below
+      # it (`05-migration-plan.md`, Phase 5 acceptance: "The desktop app has no
+      # direct dependency on `vilsend-engine` — only on `vilsend-sdk`").
+      #
+      # **This passes vacuously today.** `vilsend-engine` does not exist:
+      # Phase 3 has not run, and `crates/` holds `core`, `sdk` and `desktop`.
+      # The lint is here now so that the day the engine appears, the desktop
+      # crate is already held to the rule rather than the rule being remembered
+      # afterwards. It is the same negated form as the architecture lint above,
+      # and for the same reason — a bare `grep` passes exactly when it should
+      # fail.
+      - name: The desktop crate must not depend on the engine
+        run: "! cargo tree -p vilsend --prefix none | grep -E '^vilsend-engine( |$)'"
+
+      # Guards the guard, as above: `cargo tree -p vilsend` resolving nothing
+      # would satisfy the lint for the wrong reason.
+      - name: vilsend must still be in the workspace
+        run: cargo tree -p vilsend --prefix none | grep -q '^vilsend '
+
+  # ============================================================
+  # PUBLIC API
+  #
+  # `vilsend-sdk` is the semver-stable surface (ADR-0005, `04` §2.5), and two
+  # things about it are asserted rather than reviewed:
+  #
+  #   * a committed snapshot of the public API, diffed byte for byte, so that an
+  #     accidental change is visible in a review diff rather than in a
+  #     consumer's build;
+  #   * `cargo-semver-checks` against the last revision that had the crate, so a
+  #     change that IS breaking fails here rather than being discovered after
+  #     someone pinned it.
+  #
+  # Both need nightly: they read rustdoc's JSON, which is nightly-only. That is
+  # why this is its own job instead of a step in `rust`, which runs the pinned
+  # stable for everything else and must keep doing so.
+  # ============================================================
+  public-api:
+    name: Public API
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The whole history, because the baseline below is a revision that is
+      # already on the target branch. A depth-1 checkout turns "there is no
+      # baseline" into "the baseline is missing", which are different answers.
+      - name: Checkout the history
+        run: git fetch --no-tags --prune --unshallow || git fetch --no-tags --prune --depth=200
+
+      # Pinned by date, not `nightly`. Rustdoc's JSON format moves between
+      # nightlies, so an unpinned toolchain makes the committed snapshot depend
+      # on when CI happened to run — which is not a snapshot.
+      - name: Install a pinned nightly for rustdoc JSON
+        run: rustup toolchain install nightly-2026-09-19 --profile minimal
+
+      - name: Install cargo-public-api and cargo-semver-checks
+        run: |
+          cargo install cargo-public-api --locked
+          cargo install cargo-semver-checks --locked
+
+      # The snapshot is the review-visible half. `-ss` omits *blanket* impls
+      # (`impl<T> Into<T> for T` and friends, which drag every transitive
+      # dependency's name into the file) and auto-trait impls, and keeps
+      # everything else — including the derived `Debug`/`Clone` impls, losing
+      # which is a breaking change.
+      #
+      # `--simplified`'s full form (`-sss`) is deliberately **not** used: it
+      # would also drop the module paths, and a type moving between modules is
+      # exactly the kind of change a consumer has to adapt to.
+      #
+      # Regenerate with the same command and commit the result in the same
+      # commit as the change that caused it.
+      - name: The public API must match the committed snapshot
+        run: |
+          cargo public-api --manifest-path crates/sdk/Cargo.toml -ss > /tmp/public-api.txt
+          diff -u crates/sdk/public-api.txt /tmp/public-api.txt
+
+      # The baseline is the last revision that actually contained the crate. On
+      # the first revision that does, there is nothing to compare against, and
+      # saying so is the honest outcome — a silently-skipped step and a
+      # passing step look identical in a log.
+      - name: Find the last revision that had crates/sdk
+        id: baseline
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "rev=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git cat-file -e "${base}:crates/sdk/Cargo.toml" 2>/dev/null; then
+            echo "rev=${base}" >> "$GITHUB_OUTPUT"
+          else
+            echo "rev=" >> "$GITHUB_OUTPUT"
+            echo "::notice::$base predates crates/sdk, so there is no baseline to compare against."
+          fi
+
+      # `-p vilsend-sdk` is load-bearing, not tidiness. `vilsend-sdk` is
+      # `publish = false` (ADR-0005), and cargo-semver-checks **silently skips
+      # an unpublished workspace member that was not explicitly selected**: it
+      # prints `Skipping vilsend-sdk v0.1.0 (current)` and exits 0 having
+      # checked nothing. Selecting the package is what stops that, and the
+      # assertion below is what turns a skip back into a failure — because a
+      # skipped step and a passing step look identical in a log, which is the
+      # exact failure mode rule 7 is about.
+      #
+      # Verified locally both ways: without `-p`, the output is
+      # `Skipping vilsend-sdk v0.1.0 (current)` and there is no summary line;
+      # with it, `196 checks: 196 pass, 58 skip`.
+      - name: Semver compatibility against the baseline
+        if: steps.baseline.outputs.rev != ''
+        run: |
+          set -o pipefail
+
+          cargo semver-checks check-release \
+            -p vilsend-sdk \
+            --manifest-path crates/sdk/Cargo.toml \
+            --baseline-rev "${{ steps.baseline.outputs.rev }}" | tee /tmp/semver.txt
+
+          if ! grep -q 'Summary ' /tmp/semver.txt; then
+            echo "::error::cargo-semver-checks printed no summary — it checked nothing."
+            echo "The usual cause is a missing \`-p vilsend-sdk\`: see the comment above."
+            exit 1
+          fi
+
+      - name: No baseline to check against (first revision with the crate)
+        if: steps.baseline.outputs.rev == ''
+        run: |
+          echo "::notice::cargo-semver-checks was not run: crates/sdk does not exist at the baseline."
+          echo "This is expected on the revision that introduces the crate, and only on it."
