@@ -1,44 +1,24 @@
-//! Golden payload fixtures for the Phase 2 walking-skeleton refactor.
+//! Golden payload fixtures for the shell's side of the event port.
 //!
-//! Phase 2 moves `TransferProgress`, `TransferStatus` and `ConnectionStatus`
-//! out of this crate and into `vilsend-core`, and routes every emitted event
-//! through an `EventSink` port. The whole point of that change is that the
-//! webview sees exactly the same bytes afterwards, so this module pins the
-//! JSON that goes on the wire *today* and asserts it again afterwards.
+//! Phase 2 moved `TransferProgress`, `TransferStatus` and `ConnectionStatus`
+//! into `vilsend-core` and put every emitted event behind an `EventSink`. The
+//! point of that change is that the webview sees exactly the same bytes
+//! afterwards, so this module pins what [`TauriEventSink`] is handed for each
+//! domain event against fixtures captured *before* the refactor.
 //!
 //! The fixtures live in `tests/fixtures/golden-payloads/` at the repository
-//! root, deliberately outside this crate: they are shared with the
-//! `vilsend-core` test that pins the same encodings after the move.
+//! root and are shared with `vilsend-core`, which pins the encodings of the
+//! types themselves. This module pins the mapping on top of them.
 //!
 //! Regenerate with `UPDATE_GOLDEN=1 cargo test -p vilsend golden`.
 //!
-//! The fixtures pin the *serialisation*, not the arithmetic that produces the
-//! numbers — `transfer/progress.rs` and `models/progress.rs` derive their
-//! speed and ETA from an `Instant`, which cannot be reproduced byte-for-byte.
-//! The arithmetic is pinned separately, against a supplied elapsed time, in
-//! `vilsend-core`.
+//! [`TauriEventSink`]: crate::events::TauriEventSink
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde_json::Value;
+use vilsend_core::{DomainEvent, TransferProgress, TransferStatus};
 
-use crate::models::progress::TransferProgress;
-use crate::models::transfer::TransferStatus;
-use crate::models::ConnectionStatus;
-
-/// Every transfer event the application emits, with the payload it carries.
-///
-/// All six share one payload type, which is why one `EventSink` port can
-/// serve the whole transfer module.
-pub const TRANSFER_EVENT_NAMES: [&str; 6] = [
-    "transfer-progress",
-    "transfer-completed",
-    "transfer-failed",
-    "transfer-paused",
-    "transfer-resumed",
-    "transfer-cancelled",
-];
+use crate::events::sink::wire_payload;
 
 fn fixtures_dir() -> PathBuf {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -72,7 +52,8 @@ fn assert_fixture(name: &str, actual: String) {
         .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
 
     assert_eq!(
-        expected, actual,
+        expected,
+        actual,
         "wire format for {name} changed — this is a breaking change for the webview"
     );
 }
@@ -82,23 +63,6 @@ fn check_serialised<T: serde::Serialize>(name: &str, value: &T) {
     json.push('\n');
 
     assert_fixture(name, json);
-}
-
-/// All variants of a `Serialize`-only enum, keyed by variant name.
-fn variants<T, F>(entries: F) -> BTreeMap<String, Value>
-where
-    T: serde::Serialize,
-    F: IntoIterator<Item = (&'static str, T)>,
-{
-    entries
-        .into_iter()
-        .map(|(name, value)| {
-            (
-                name.to_string(),
-                serde_json::to_value(value).expect("variant is serialisable"),
-            )
-        })
-        .collect()
 }
 
 /// An in-flight upload at the half-way mark.
@@ -114,7 +78,7 @@ fn uploading_progress() -> TransferProgress {
     }
 }
 
-/// An in-flight download at the quarter mark, before the first chunk lands.
+/// An in-flight download at the quarter mark.
 fn downloading_progress() -> TransferProgress {
     TransferProgress {
         transfer_id: "3c59dc04-8e88-4b0a-9f5e-6d7c8b9a0f11".into(),
@@ -127,8 +91,7 @@ fn downloading_progress() -> TransferProgress {
     }
 }
 
-/// A transfer that finished with no measurable elapsed time: `speed` is zero
-/// and `eta` is absent, which is the shape the UI branches on.
+/// A transfer that finished with no measurable elapsed time.
 fn completed_progress() -> TransferProgress {
     TransferProgress {
         transfer_id: "8f14e45f-ea42-4d7e-9b3a-1b2c3d4e5f60".into(),
@@ -141,48 +104,80 @@ fn completed_progress() -> TransferProgress {
     }
 }
 
-#[test]
-fn transfer_progress_wire_format() {
-    check_serialised("transfer-progress-uploading.json", &uploading_progress());
-    check_serialised(
-        "transfer-progress-downloading.json",
-        &downloading_progress(),
-    );
-    check_serialised("transfer-progress-completed.json", &completed_progress());
+/// Every transfer event the application emits, carrying `progress`.
+fn every_event(progress: &TransferProgress) -> Vec<DomainEvent> {
+    vec![
+        DomainEvent::TransferProgress {
+            progress: progress.clone(),
+        },
+        DomainEvent::TransferCompleted {
+            progress: progress.clone(),
+        },
+        DomainEvent::TransferFailed {
+            progress: progress.clone(),
+        },
+        DomainEvent::TransferPaused {
+            progress: progress.clone(),
+        },
+        DomainEvent::TransferResumed {
+            progress: progress.clone(),
+        },
+        DomainEvent::TransferCancelled {
+            progress: progress.clone(),
+        },
+    ]
 }
 
 #[test]
-fn transfer_status_wire_format() {
-    let all = variants([
-        ("Queued", TransferStatus::Queued),
-        ("Uploading", TransferStatus::Uploading),
-        ("Paused", TransferStatus::Paused),
-        ("Completed", TransferStatus::Completed),
-        ("Failed", TransferStatus::Failed),
-        ("Cancelled", TransferStatus::Cancelled),
-        ("Pending", TransferStatus::Pending),
-        ("Downloading", TransferStatus::Downloading),
-    ]);
-
-    check_serialised("transfer-status.json", &all);
-}
-
-#[test]
-fn connection_status_wire_format() {
-    let all = variants([
-        ("Disconnected", ConnectionStatus::Disconnected),
-        ("Connecting", ConnectionStatus::Connecting),
-        ("Connected", ConnectionStatus::Connected),
-        ("Reconnecting", ConnectionStatus::Reconnecting),
-        ("Error", ConnectionStatus::Error("websocket closed".into())),
-    ]);
-
-    check_serialised("connection-status.json", &all);
-}
-
-#[test]
-fn transfer_event_names_are_stable() {
-    let names: Vec<&str> = TRANSFER_EVENT_NAMES.to_vec();
+fn the_sink_uses_the_names_the_frontend_listens_for() {
+    let names: Vec<&str> = every_event(&uploading_progress())
+        .iter()
+        .map(|event| wire_payload(event).0)
+        .collect();
 
     check_serialised("transfer-event-names.json", &names);
+}
+
+#[test]
+fn the_sink_sends_an_upload_payload_unchanged() {
+    let event = DomainEvent::TransferProgress {
+        progress: uploading_progress(),
+    };
+    let (name, payload) = wire_payload(&event);
+
+    assert_eq!(name, "transfer-progress");
+    check_serialised("transfer-progress-uploading.json", payload);
+}
+
+#[test]
+fn the_sink_sends_a_download_payload_unchanged() {
+    let event = DomainEvent::TransferProgress {
+        progress: downloading_progress(),
+    };
+    let (name, payload) = wire_payload(&event);
+
+    assert_eq!(name, "transfer-progress");
+    check_serialised("transfer-progress-downloading.json", payload);
+}
+
+#[test]
+fn the_sink_sends_a_completion_payload_unchanged() {
+    let event = DomainEvent::TransferCompleted {
+        progress: completed_progress(),
+    };
+    let (name, payload) = wire_payload(&event);
+
+    assert_eq!(name, "transfer-completed");
+    check_serialised("transfer-progress-completed.json", payload);
+}
+
+#[test]
+fn every_event_keeps_its_payload_through_the_sink() {
+    let progress = uploading_progress();
+
+    for event in every_event(&progress) {
+        let (_, payload) = wire_payload(&event);
+
+        assert_eq!(payload, &progress);
+    }
 }
