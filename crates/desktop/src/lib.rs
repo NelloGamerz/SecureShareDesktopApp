@@ -28,7 +28,7 @@ mod websocket;
 #[doc(hidden)]
 pub mod wire {
     pub use crate::models::chunk::ChunkJob;
-    pub use crate::transfer::{constants, crypto, http_client, merger};
+    pub use crate::transfer::{crypto, http_client, upload};
 
     #[cfg(feature = "protocol-v2")]
     pub use crate::transfer::crypto_v2;
