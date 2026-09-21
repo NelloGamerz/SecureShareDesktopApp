@@ -7,6 +7,10 @@ version = "1.0.4"
 description = "Secure file sharing built for modern teams — fast, encrypted, and simple across every device."
 authors = ["you"]
 edition = "2021"
+# This is the application, not a library anyone depends on. It ships as an
+# installer, an updater feed and a Microsoft Store package; `cargo publish`
+# would push a Tauri shell to crates.io and call it a crate.
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

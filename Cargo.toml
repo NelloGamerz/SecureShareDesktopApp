@@ -15,4 +15,4 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/desktop"]
+members = ["crates/core", "crates/desktop", "crates/sdk"]
