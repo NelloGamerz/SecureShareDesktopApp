@@ -9,10 +9,10 @@ pub use vilsend_sdk::VilsendError
 pub vilsend_sdk::AuthState::SignedIn
 pub vilsend_sdk::AuthState::SignedOut
 impl core::clone::Clone for vilsend_sdk::AuthState
-pub fn vilsend_sdk::AuthState::clone(&self) -> Self
+pub fn vilsend_sdk::AuthState::clone(&self) -> vilsend_sdk::AuthState
 impl core::cmp::Eq for vilsend_sdk::AuthState
 impl core::cmp::PartialEq for vilsend_sdk::AuthState
-pub fn vilsend_sdk::AuthState::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::AuthState::eq(&self, &vilsend_sdk::AuthState) -> bool
 impl core::fmt::Debug for vilsend_sdk::AuthState
 pub fn vilsend_sdk::AuthState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for vilsend_sdk::AuthState
@@ -26,10 +26,10 @@ pub vilsend_sdk::DegradedReason::PreferredRouteUnavailable
 pub vilsend_sdk::DegradedReason::Retrying
 pub vilsend_sdk::DegradedReason::SwitchedMidTransfer
 impl core::clone::Clone for vilsend_sdk::DegradedReason
-pub fn vilsend_sdk::DegradedReason::clone(&self) -> Self
+pub fn vilsend_sdk::DegradedReason::clone(&self) -> vilsend_sdk::DegradedReason
 impl core::cmp::Eq for vilsend_sdk::DegradedReason
 impl core::cmp::PartialEq for vilsend_sdk::DegradedReason
-pub fn vilsend_sdk::DegradedReason::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::DegradedReason::eq(&self, &vilsend_sdk::DegradedReason) -> bool
 impl core::fmt::Debug for vilsend_sdk::DegradedReason
 pub fn vilsend_sdk::DegradedReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::DegradedReason
@@ -41,10 +41,10 @@ pub fn vilsend_sdk::Outcome::bytes(&self) -> u64
 pub fn vilsend_sdk::Outcome::chunks(&self) -> u64
 pub fn vilsend_sdk::Outcome::transfer_id(&self) -> &vilsend_core::ids::TransferId
 impl core::clone::Clone for vilsend_sdk::Outcome
-pub fn vilsend_sdk::Outcome::clone(&self) -> Self
+pub fn vilsend_sdk::Outcome::clone(&self) -> vilsend_sdk::Outcome
 impl core::cmp::Eq for vilsend_sdk::Outcome
 impl core::cmp::PartialEq for vilsend_sdk::Outcome
-pub fn vilsend_sdk::Outcome::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::Outcome::eq(&self, &vilsend_sdk::Outcome) -> bool
 impl core::fmt::Debug for vilsend_sdk::Outcome
 pub fn vilsend_sdk::Outcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::Outcome
@@ -53,10 +53,10 @@ pub vilsend_sdk::TransportKind::Lan
 pub vilsend_sdk::TransportKind::Memory
 pub vilsend_sdk::TransportKind::Tunnel
 impl core::clone::Clone for vilsend_sdk::TransportKind
-pub fn vilsend_sdk::TransportKind::clone(&self) -> Self
+pub fn vilsend_sdk::TransportKind::clone(&self) -> vilsend_sdk::TransportKind
 impl core::cmp::Eq for vilsend_sdk::TransportKind
 impl core::cmp::PartialEq for vilsend_sdk::TransportKind
-pub fn vilsend_sdk::TransportKind::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::TransportKind::eq(&self, &vilsend_sdk::TransportKind) -> bool
 impl core::fmt::Debug for vilsend_sdk::TransportKind
 pub fn vilsend_sdk::TransportKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::hash::Hash for vilsend_sdk::TransportKind
@@ -67,10 +67,10 @@ pub struct vilsend_sdk::AuthFacade
 impl vilsend_sdk::AuthFacade
 pub fn vilsend_sdk::AuthFacade::state(&self) -> vilsend_sdk::AuthState
 impl core::clone::Clone for vilsend_sdk::AuthFacade
-pub fn vilsend_sdk::AuthFacade::clone(&self) -> Self
+pub fn vilsend_sdk::AuthFacade::clone(&self) -> vilsend_sdk::AuthFacade
 impl core::cmp::Eq for vilsend_sdk::AuthFacade
 impl core::cmp::PartialEq for vilsend_sdk::AuthFacade
-pub fn vilsend_sdk::AuthFacade::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::AuthFacade::eq(&self, &vilsend_sdk::AuthFacade) -> bool
 impl core::fmt::Debug for vilsend_sdk::AuthFacade
 pub fn vilsend_sdk::AuthFacade::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for vilsend_sdk::AuthFacade
@@ -82,14 +82,14 @@ pub fn vilsend_sdk::Destination::is_root(&self) -> bool
 pub fn vilsend_sdk::Destination::named(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn vilsend_sdk::Destination::root() -> Self
 impl core::clone::Clone for vilsend_sdk::Destination
-pub fn vilsend_sdk::Destination::clone(&self) -> Self
+pub fn vilsend_sdk::Destination::clone(&self) -> vilsend_sdk::Destination
 impl core::cmp::Eq for vilsend_sdk::Destination
 impl core::cmp::Ord for vilsend_sdk::Destination
-pub fn vilsend_sdk::Destination::cmp(&self, &Self) -> core::cmp::Ordering
+pub fn vilsend_sdk::Destination::cmp(&self, &vilsend_sdk::Destination) -> core::cmp::Ordering
 impl core::cmp::PartialEq for vilsend_sdk::Destination
-pub fn vilsend_sdk::Destination::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::Destination::eq(&self, &vilsend_sdk::Destination) -> bool
 impl core::cmp::PartialOrd for vilsend_sdk::Destination
-pub fn vilsend_sdk::Destination::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+pub fn vilsend_sdk::Destination::partial_cmp(&self, &vilsend_sdk::Destination) -> core::option::Option<core::cmp::Ordering>
 impl core::convert::From<&str> for vilsend_sdk::Destination
 pub fn vilsend_sdk::Destination::from(&str) -> Self
 impl core::convert::From<alloc::string::String> for vilsend_sdk::Destination
@@ -121,7 +121,7 @@ pub fn vilsend_sdk::FakeClock::advance(&self, core::time::Duration) -> u64
 pub fn vilsend_sdk::FakeClock::new() -> Self
 pub fn vilsend_sdk::FakeClock::set(&self, u64) -> u64
 impl core::default::Default for vilsend_sdk::FakeClock
-pub fn vilsend_sdk::FakeClock::default() -> Self
+pub fn vilsend_sdk::FakeClock::default() -> vilsend_sdk::FakeClock
 impl core::fmt::Debug for vilsend_sdk::FakeClock
 pub fn vilsend_sdk::FakeClock::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl vilsend_sdk::Clock for vilsend_sdk::FakeClock
@@ -131,14 +131,14 @@ impl vilsend_sdk::FileRef
 pub fn vilsend_sdk::FileRef::as_str(&self) -> &str
 pub fn vilsend_sdk::FileRef::new(impl core::convert::Into<alloc::string::String>) -> Self
 impl core::clone::Clone for vilsend_sdk::FileRef
-pub fn vilsend_sdk::FileRef::clone(&self) -> Self
+pub fn vilsend_sdk::FileRef::clone(&self) -> vilsend_sdk::FileRef
 impl core::cmp::Eq for vilsend_sdk::FileRef
 impl core::cmp::Ord for vilsend_sdk::FileRef
-pub fn vilsend_sdk::FileRef::cmp(&self, &Self) -> core::cmp::Ordering
+pub fn vilsend_sdk::FileRef::cmp(&self, &vilsend_sdk::FileRef) -> core::cmp::Ordering
 impl core::cmp::PartialEq for vilsend_sdk::FileRef
-pub fn vilsend_sdk::FileRef::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::FileRef::eq(&self, &vilsend_sdk::FileRef) -> bool
 impl core::cmp::PartialOrd for vilsend_sdk::FileRef
-pub fn vilsend_sdk::FileRef::partial_cmp(&self, &Self) -> core::option::Option<core::cmp::Ordering>
+pub fn vilsend_sdk::FileRef::partial_cmp(&self, &vilsend_sdk::FileRef) -> core::option::Option<core::cmp::Ordering>
 impl core::convert::From<&str> for vilsend_sdk::FileRef
 pub fn vilsend_sdk::FileRef::from(&str) -> Self
 impl core::convert::From<alloc::string::String> for vilsend_sdk::FileRef
@@ -166,9 +166,9 @@ pub fn vilsend_sdk::MemoryFiles::paths(&self) -> alloc::vec::Vec<alloc::string::
 pub fn vilsend_sdk::MemoryFiles::remove(&self, &str) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn vilsend_sdk::MemoryFiles::total_bytes(&self) -> u64
 impl core::clone::Clone for vilsend_sdk::MemoryFiles
-pub fn vilsend_sdk::MemoryFiles::clone(&self) -> Self
+pub fn vilsend_sdk::MemoryFiles::clone(&self) -> vilsend_sdk::MemoryFiles
 impl core::default::Default for vilsend_sdk::MemoryFiles
-pub fn vilsend_sdk::MemoryFiles::default() -> Self
+pub fn vilsend_sdk::MemoryFiles::default() -> vilsend_sdk::MemoryFiles
 impl core::fmt::Debug for vilsend_sdk::MemoryFiles
 pub fn vilsend_sdk::MemoryFiles::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct vilsend_sdk::Policy
@@ -177,10 +177,10 @@ pub vilsend_sdk::Policy::concurrency: u8
 pub vilsend_sdk::Policy::max_retries: u32
 pub vilsend_sdk::Policy::verify_chunks: bool
 impl core::clone::Clone for vilsend_sdk::Policy
-pub fn vilsend_sdk::Policy::clone(&self) -> Self
+pub fn vilsend_sdk::Policy::clone(&self) -> vilsend_sdk::Policy
 impl core::cmp::Eq for vilsend_sdk::Policy
 impl core::cmp::PartialEq for vilsend_sdk::Policy
-pub fn vilsend_sdk::Policy::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::Policy::eq(&self, &vilsend_sdk::Policy) -> bool
 impl core::default::Default for vilsend_sdk::Policy
 pub fn vilsend_sdk::Policy::default() -> Self
 impl core::fmt::Debug for vilsend_sdk::Policy
@@ -208,10 +208,10 @@ impl vilsend_sdk::Progress
 pub fn vilsend_sdk::Progress::fraction(&self) -> core::option::Option<f64>
 pub fn vilsend_sdk::Progress::is_terminal(&self) -> bool
 impl core::clone::Clone for vilsend_sdk::Progress
-pub fn vilsend_sdk::Progress::clone(&self) -> Self
+pub fn vilsend_sdk::Progress::clone(&self) -> vilsend_sdk::Progress
 impl core::cmp::Eq for vilsend_sdk::Progress
 impl core::cmp::PartialEq for vilsend_sdk::Progress
-pub fn vilsend_sdk::Progress::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::Progress::eq(&self, &vilsend_sdk::Progress) -> bool
 impl core::fmt::Debug for vilsend_sdk::Progress
 pub fn vilsend_sdk::Progress::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::Progress
@@ -222,10 +222,10 @@ pub vilsend_sdk::ReceiveRequest::policy: core::option::Option<vilsend_sdk::Polic
 impl vilsend_sdk::ReceiveRequest
 pub fn vilsend_sdk::ReceiveRequest::from(vilsend_core::ids::PeerRef, vilsend_sdk::Destination) -> Self
 impl core::clone::Clone for vilsend_sdk::ReceiveRequest
-pub fn vilsend_sdk::ReceiveRequest::clone(&self) -> Self
+pub fn vilsend_sdk::ReceiveRequest::clone(&self) -> vilsend_sdk::ReceiveRequest
 impl core::cmp::Eq for vilsend_sdk::ReceiveRequest
 impl core::cmp::PartialEq for vilsend_sdk::ReceiveRequest
-pub fn vilsend_sdk::ReceiveRequest::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::ReceiveRequest::eq(&self, &vilsend_sdk::ReceiveRequest) -> bool
 impl core::fmt::Debug for vilsend_sdk::ReceiveRequest
 pub fn vilsend_sdk::ReceiveRequest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::ReceiveRequest
@@ -238,10 +238,10 @@ pub vilsend_sdk::ReceivedFile::bytes: u64
 pub vilsend_sdk::ReceivedFile::path: alloc::string::String
 pub vilsend_sdk::ReceivedFile::verified: bool
 impl core::clone::Clone for vilsend_sdk::ReceivedFile
-pub fn vilsend_sdk::ReceivedFile::clone(&self) -> Self
+pub fn vilsend_sdk::ReceivedFile::clone(&self) -> vilsend_sdk::ReceivedFile
 impl core::cmp::Eq for vilsend_sdk::ReceivedFile
 impl core::cmp::PartialEq for vilsend_sdk::ReceivedFile
-pub fn vilsend_sdk::ReceivedFile::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::ReceivedFile::eq(&self, &vilsend_sdk::ReceivedFile) -> bool
 impl core::fmt::Debug for vilsend_sdk::ReceivedFile
 pub fn vilsend_sdk::ReceivedFile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::ReceivedFile
@@ -251,10 +251,10 @@ pub vilsend_sdk::ReceivedOutcome::chunks: u64
 pub vilsend_sdk::ReceivedOutcome::files: alloc::vec::Vec<vilsend_sdk::ReceivedFile>
 pub vilsend_sdk::ReceivedOutcome::transfer_id: vilsend_core::ids::TransferId
 impl core::clone::Clone for vilsend_sdk::ReceivedOutcome
-pub fn vilsend_sdk::ReceivedOutcome::clone(&self) -> Self
+pub fn vilsend_sdk::ReceivedOutcome::clone(&self) -> vilsend_sdk::ReceivedOutcome
 impl core::cmp::Eq for vilsend_sdk::ReceivedOutcome
 impl core::cmp::PartialEq for vilsend_sdk::ReceivedOutcome
-pub fn vilsend_sdk::ReceivedOutcome::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::ReceivedOutcome::eq(&self, &vilsend_sdk::ReceivedOutcome) -> bool
 impl core::fmt::Debug for vilsend_sdk::ReceivedOutcome
 pub fn vilsend_sdk::ReceivedOutcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::ReceivedOutcome
@@ -268,10 +268,10 @@ pub vilsend_sdk::SendRequest::policy: core::option::Option<vilsend_sdk::Policy>
 impl vilsend_sdk::SendRequest
 pub fn vilsend_sdk::SendRequest::to(vilsend_core::ids::PeerRef, alloc::vec::Vec<vilsend_sdk::FileRef>) -> Self
 impl core::clone::Clone for vilsend_sdk::SendRequest
-pub fn vilsend_sdk::SendRequest::clone(&self) -> Self
+pub fn vilsend_sdk::SendRequest::clone(&self) -> vilsend_sdk::SendRequest
 impl core::cmp::Eq for vilsend_sdk::SendRequest
 impl core::cmp::PartialEq for vilsend_sdk::SendRequest
-pub fn vilsend_sdk::SendRequest::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::SendRequest::eq(&self, &vilsend_sdk::SendRequest) -> bool
 impl core::fmt::Debug for vilsend_sdk::SendRequest
 pub fn vilsend_sdk::SendRequest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::SendRequest
@@ -285,10 +285,10 @@ pub vilsend_sdk::SentOutcome::chunks: u64
 pub vilsend_sdk::SentOutcome::files: usize
 pub vilsend_sdk::SentOutcome::transfer_id: vilsend_core::ids::TransferId
 impl core::clone::Clone for vilsend_sdk::SentOutcome
-pub fn vilsend_sdk::SentOutcome::clone(&self) -> Self
+pub fn vilsend_sdk::SentOutcome::clone(&self) -> vilsend_sdk::SentOutcome
 impl core::cmp::Eq for vilsend_sdk::SentOutcome
 impl core::cmp::PartialEq for vilsend_sdk::SentOutcome
-pub fn vilsend_sdk::SentOutcome::eq(&self, &Self) -> bool
+pub fn vilsend_sdk::SentOutcome::eq(&self, &vilsend_sdk::SentOutcome) -> bool
 impl core::fmt::Debug for vilsend_sdk::SentOutcome
 pub fn vilsend_sdk::SentOutcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for vilsend_sdk::SentOutcome
