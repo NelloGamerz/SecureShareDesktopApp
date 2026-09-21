@@ -387,6 +387,22 @@ jobs:
       # Verified locally both ways: without `-p`, the output is
       # `Skipping vilsend-sdk v0.1.0 (current)` and there is no summary line;
       # with it, `196 checks: 196 pass, 58 skip`.
+      # - name: Semver compatibility against the baseline
+      #   if: steps.baseline.outputs.rev != ''
+      #   run: |
+      #     set -o pipefail
+
+      #     cargo semver-checks check-release \
+      #       -p vilsend-sdk \
+      #       --manifest-path crates/sdk/Cargo.toml \
+      #       --baseline-rev "${{ steps.baseline.outputs.rev }}" | tee /tmp/semver.txt
+
+      #     if ! grep -q 'Summary ' /tmp/semver.txt; then
+      #       echo "::error::cargo-semver-checks printed no summary — it checked nothing."
+      #       echo "The usual cause is a missing \`-p vilsend-sdk\`: see the comment above."
+      #       exit 1
+      #     fi
+
       - name: Semver compatibility against the baseline
         if: steps.baseline.outputs.rev != ''
         run: |
@@ -395,9 +411,10 @@ jobs:
           cargo semver-checks check-release \
             -p vilsend-sdk \
             --manifest-path crates/sdk/Cargo.toml \
-            --baseline-rev "${{ steps.baseline.outputs.rev }}" | tee /tmp/semver.txt
+            --baseline-rev "${{ steps.baseline.outputs.rev }}" \
+            --color=never | tee /tmp/semver.txt
 
-          if ! grep -q 'Summary ' /tmp/semver.txt; then
+          if ! grep -q 'Summary' /tmp/semver.txt; then
             echo "::error::cargo-semver-checks printed no summary — it checked nothing."
             echo "The usual cause is a missing \`-p vilsend-sdk\`: see the comment above."
             exit 1
