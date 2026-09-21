@@ -344,9 +344,14 @@ jobs:
       #
       # Regenerate with the same command and commit the result in the same
       # commit as the change that caused it.
+      # - name: The public API must match the committed snapshot
+      #   run: |
+      #     cargo public-api --manifest-path crates/sdk/Cargo.toml -ss > /tmp/public-api.txt
+      #     diff -u crates/sdk/public-api.txt /tmp/public-api.txt
+
       - name: The public API must match the committed snapshot
         run: |
-          cargo public-api --manifest-path crates/sdk/Cargo.toml -ss > /tmp/public-api.txt
+          cargo +nightly-2026-09-19 public-api --manifest-path crates/sdk/Cargo.toml -ss > /tmp/public-api.txt
           diff -u crates/sdk/public-api.txt /tmp/public-api.txt
 
       # The baseline is the last revision that actually contained the crate. On
