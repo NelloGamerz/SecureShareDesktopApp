@@ -1,0 +1,1451 @@
+//! The **v2** transfer crypto: associated data, a salted KDF, and a bounded
+//! nonce-repeat window.
+//!
+//! Compiled only under the `protocol-v2` feature, which is off by default. See
+//! [`crate::transfer::crypto`] for the frozen v1 implementation this sits
+//! beside; the two share no code and no key derivation, deliberately.
+//!
+//! # What v2 changes, and why each one is a security fix rather than a tweak
+//!
+//! | | v1 | v2 | Task |
+//! |---|---|---|---|
+//! | AEAD associated data | none — a ciphertext is bound to nothing | [`ChunkAad`] binds transfer, file, index, path and protocol version | 4.1 |
+//! | KDF salt | none — two sessions reaching the same ECDH secret share a key | [`derive_transfer_key_v2`] salts with both handshake nonces | 4.2 |
+//! | Nonce repeats | undetectable — no call has anywhere to record one | [`NonceWindow`], bounded, per transfer key | 4.4 |
+//!
+//! # Why the two implementations never share a key
+//!
+//! Three independent separations, so that a v2 ciphertext cannot be opened as a
+//! v1 one even by accident:
+//!
+//! 1. the AAD differs — v1 passes none, so the tag covers a v1 chunk with no
+//!    context and a v2 chunk with it;
+//! 2. the KDF salt differs — v1 passes `None`, v2 passes the two nonces;
+//! 3. the KDF `info` string differs — `b"carsdv-transfer-key-v1"` against
+//!    `b"vilsend-transfer-key-v2"`.
+//!
+//! (2) and (3) are not belt-and-braces on (1). A nonce reused across two
+//! different keys is not a nonce reuse at all, and the two paths must not be
+//! able to collide even if one of the separations is later changed.
+//!
+//! # What is *not* here
+//!
+//! Wiring. Nothing in this module is called by the transfer path yet: the v2
+//! endpoints that would call it are task 4.11, and the sender that would pick
+//! between v1 and v2 by capability probe is task 4.11 as well. Until then a
+//! build with `protocol-v2` on still speaks v1 on the wire, which is exactly
+//! what the compatibility fixture in `tests/compat_v1.rs` asserts.
+
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use vilsend_core::VilsendError;
+
+/// The domain separator that opens every v2 chunk AAD.
+///
+/// It exists so that a v2 AAD cannot be confused with any other byte string
+/// this protocol hashes, and so the encoding is self-describing to a reader
+/// holding only the bytes. It is **frozen**: changing it changes every v2 tag.
+const AAD_DOMAIN: &[u8] = b"vilsend-chunk-aad-v2";
+
+/// The AES-GCM nonce width, in bytes. Same in both versions.
+pub const NONCE_LEN: usize = 12;
+
+/// The AEAD authentication tag width, in bytes. Same in both versions.
+pub const TAG_LEN: usize = 16;
+
+/*
+ * ----------------------------------------------------------------------
+ * Associated data (task 4.1)
+ * ----------------------------------------------------------------------
+ */
+
+/// Everything a v2 chunk is cryptographically bound to.
+///
+/// ADR-0007 decision 4 gives the field list:
+/// `transfer_id ‖ file_id ‖ chunk_index ‖ relative_path ‖ proto_v`. This type
+/// is that list, and [`ChunkAad::encode`] is the one place its byte encoding is
+/// defined.
+///
+/// # Why the encoding is length-prefixed rather than plain concatenation
+///
+/// The ADR writes the fields joined by `‖`, which is notation for
+/// "concatenated", not a wire instruction. Concatenating variable-length
+/// strings with no delimiters is **ambiguous**, and ambiguity in a MAC's
+/// associated data is a real defect, not a style question: with plain
+/// concatenation, `transfer_id = "ab", file_id = "c"` and
+/// `transfer_id = "a", file_id = "bc"` produce identical AAD bytes, so a chunk
+/// sealed for one transfer would open for the other. Every field but
+/// `chunk_index` is variable-length, so that collision is reachable, and a test
+/// below asserts it stays unreachable.
+///
+/// So each string is written as a little-endian `u32` byte length followed by
+/// its bytes. The field order and the field set are exactly the ADR's; only the
+/// framing is pinned down.
+///
+/// `protocol_version` is carried even though v2 is the only version that
+/// produces this AAD. It is what stops a future v3 adopting the v2 AAD bytes by
+/// accident, and it is the ADR's list verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkAad<'a> {
+    pub transfer_id: &'a str,
+    pub file_id: &'a str,
+    pub chunk_index: u64,
+    pub relative_path: &'a str,
+    pub protocol_version: u16,
+}
+
+impl<'a> ChunkAad<'a> {
+    /// The AAD for a v2 chunk, with the protocol version filled in.
+    ///
+    /// This is the constructor callers should use. [`ChunkAad`] can also be
+    /// built with an explicit version, which is what lets a test assert what a
+    /// mismatched version does.
+    pub fn new(
+        transfer_id: &'a str,
+        file_id: &'a str,
+        chunk_index: u64,
+        relative_path: &'a str,
+    ) -> Self {
+        Self {
+            transfer_id,
+            file_id,
+            chunk_index,
+            relative_path,
+            protocol_version: vilsend_core::PROTOCOL_V2,
+        }
+    }
+
+    /// The canonical byte encoding of this AAD.
+    ///
+    /// ```text
+    /// b"vilsend-chunk-aad-v2"                  the domain separator, 20 bytes
+    /// ‖ u16_le(protocol_version)               2 bytes
+    /// ‖ u32_le(len(transfer_id))   ‖ transfer_id
+    /// ‖ u32_le(len(file_id))       ‖ file_id
+    /// ‖ u64_le(chunk_index)                    8 bytes
+    /// ‖ u32_le(len(relative_path)) ‖ relative_path
+    /// ```
+    ///
+    /// Little-endian, matching the integer encoding the v1 wire already uses
+    /// for `Chunk-Index` and `Total-Chunks`. Frozen: this is the input to every
+    /// v2 chunk tag.
+    ///
+    /// The string lengths are **byte** lengths, not character counts, so a
+    /// non-ASCII path is framed by what is actually written.
+    ///
+    /// The fields are written in order by position, not by matching a value
+    /// against the others, because two of them may legitimately be equal — a
+    /// transfer and a file can share an id — and a value-matching encoding
+    /// would then write the index twice.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            AAD_DOMAIN.len()
+                + 2
+                + 8
+                + [self.transfer_id, self.file_id, self.relative_path]
+                    .iter()
+                    .map(|value| 4 + value.len())
+                    .sum::<usize>(),
+        );
+
+        aad.extend_from_slice(AAD_DOMAIN);
+        aad.extend_from_slice(&self.protocol_version.to_le_bytes());
+
+        push_length_prefixed(&mut aad, self.transfer_id);
+        push_length_prefixed(&mut aad, self.file_id);
+
+        aad.extend_from_slice(&self.chunk_index.to_le_bytes());
+
+        push_length_prefixed(&mut aad, self.relative_path);
+
+        aad
+    }
+}
+
+/// Append `u32_le(value.len()) ‖ value`.
+fn push_length_prefixed(output: &mut Vec<u8>, value: &str) {
+    output.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    output.extend_from_slice(value.as_bytes());
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Key derivation (task 4.2)
+ * ----------------------------------------------------------------------
+ */
+
+/// The HKDF `info` string for the v2 transfer key.
+///
+/// Deliberately not the v1 string. `info` is HKDF's domain separator, so two
+/// callers of the same KDF that intend different keys must use different
+/// `info` — and here the two callers are the same protocol at two versions,
+/// which is exactly the case it is for. Frozen.
+pub const KDF_INFO_V2: &[u8] = b"vilsend-transfer-key-v2";
+
+/// Derive the v2 transfer key from the ECDH secret and **both** handshake
+/// nonces.
+///
+/// v1 passes no salt at all — `Hkdf::new(None, ..)`, which is a salt of 32 zero
+/// bytes — so two sessions that happen to reach the same ECDH secret derive the
+/// same key, and every derived key is a function of the secret alone. The
+/// nonces here come from `HELLO` and `HELLO_ACK`, and the transcript carrying
+/// them is signed by the receiver's device key (ADR-0007 decision 1), so an
+/// attacker who cannot forge that signature cannot choose them.
+///
+/// `sender_nonce` is the nonce from `HELLO`, `receiver_nonce` the one from
+/// `HELLO_ACK`. The salt is their concatenation in that order, and the order is
+/// part of the frozen format: swapping them derives a different key, which a
+/// test asserts.
+///
+/// # Why the nonces are not hashed first
+///
+/// HKDF's `salt` is itself passed through HMAC, so an arbitrarily-sized salt is
+/// already reduced to the hash width. Two 16-byte nonces concatenated give a
+/// 32-byte salt — exactly one SHA-256 block, the size HKDF is built for. Adding
+/// a hash would change the bytes without changing the security, and every byte
+/// here is frozen.
+///
+/// # Why the slice parameters are not `[u8; 16]`
+///
+/// `02-transport-layer.md` §4.3 fixes the handshake nonce at 16 bytes, and a
+/// fixed-size parameter would be the more precise signature. It is a slice here
+/// so that a test can prove the salt is genuinely consumed and that its order
+/// genuinely matters, using short distinguishing inputs. The handshake is the
+/// caller that supplies the real width.
+pub fn derive_transfer_key_v2(
+    shared_secret: &[u8; 32],
+    sender_nonce: &[u8],
+    receiver_nonce: &[u8],
+) -> Result<[u8; 32], VilsendError> {
+    let mut salt = Vec::with_capacity(sender_nonce.len() + receiver_nonce.len());
+
+    salt.extend_from_slice(sender_nonce);
+    salt.extend_from_slice(receiver_nonce);
+
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
+
+    let mut key = [0u8; 32];
+
+    hkdf.expand(KDF_INFO_V2, &mut key)
+        .map_err(|error| VilsendError::Internal(format!("hkdf failed: {error}")))?;
+
+    // Never the key, never the salt: sizes only.
+    tracing::debug!(salt_bytes = salt.len(), "v2 transfer key derived");
+
+    Ok(key)
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * AEAD (task 4.1)
+ * ----------------------------------------------------------------------
+ */
+
+/// A sealed v2 chunk, in the shape the wire carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedChunk {
+    /// 12 bytes. Random on the sender, and never reused under one key.
+    pub nonce: [u8; NONCE_LEN],
+    /// Ciphertext with the 16-byte tag appended.
+    pub ciphertext: Vec<u8>,
+}
+
+/// Seal one chunk.
+///
+/// The nonce is a parameter rather than generated here, for two reasons: it
+/// makes the function a pure function of its inputs, which is what a frozen
+/// test vector needs; and it keeps nonce *generation* in exactly one place, so
+/// the bounded repeat check added by task 4.4 cannot be bypassed by a caller
+/// that forgot about it.
+///
+/// For the same reason there is no nonce-less convenience wrapper. Reaching for
+/// this function directly is the thing that skips the discipline, so it should
+/// look like the deliberate act it is.
+pub fn seal(
+    key: &[u8; 32],
+    aad: &[u8],
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+) -> Result<SealedChunk, VilsendError> {
+    let cipher = Aes256Gcm::new(key.into());
+
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|error| VilsendError::Internal(format!("chunk seal failed: {error}")))?;
+
+    // Sizes only. Never the nonce, never a key, never the plaintext — see the
+    // redaction rule in the phase brief and `06-testing-and-quality.md` §6.4.
+    tracing::debug!(
+        plaintext_bytes = plaintext.len(),
+        ciphertext_bytes = ciphertext.len(),
+        aad_bytes = aad.len(),
+        "v2 chunk sealed"
+    );
+
+    Ok(SealedChunk {
+        nonce: *nonce,
+        ciphertext,
+    })
+}
+
+/// Open one chunk, rejecting anything whose tag does not verify.
+///
+/// A `nonce` that is not [`NONCE_LEN`] bytes is [`ErrorKind::InvalidInput`]
+/// rather than a panic. This is one place v2 is deliberately stricter than v1:
+/// `crypto::decrypt_chunk` builds a `Nonce` from whatever slice it is handed
+/// and panics on a length that is neither 12 nor 16, which makes the caller's
+/// length check load-bearing. `open` is total for every input.
+///
+/// A failed tag is [`ErrorKind::IntegrityMismatch`], so a shell can classify it
+/// without parsing a message (ADR-0003). The message is deliberately the same
+/// for a flipped ciphertext, a replay into another index, and a wrong key: an
+/// attacker must not be able to tell those apart from the response.
+pub fn open(
+    key: &[u8; 32],
+    aad: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, VilsendError> {
+    if nonce.len() != NONCE_LEN {
+        return Err(VilsendError::InvalidInput(format!(
+            "v2 chunk nonce must be {NONCE_LEN} bytes, got {}",
+            nonce.len()
+        )));
+    }
+
+    let cipher = Aes256Gcm::new(key.into());
+
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| VilsendError::IntegrityMismatch("v2 chunk tag did not verify".into()))
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Nonce discipline (task 4.4)
+ * ----------------------------------------------------------------------
+ */
+
+/// How many attempts [`NonceWindow::seal`] makes to draw a nonce that is not
+/// already in the window.
+///
+/// With a 96-bit nonce and a 4096-entry window a collision has probability
+/// about 2^-84, so this bound is unreachable in practice. It exists so the loop
+/// is bounded *by construction* rather than by the improbability of the event —
+/// a deterministic RNG (a test, a mocked source, a catastrophically broken
+/// entropy pool) must produce an error, not a spin.
+const MAX_NONCE_ATTEMPTS: usize = 8;
+
+/// A bounded sliding window of the nonces recently used under one transfer key.
+///
+/// **One per direction.** The sender holds a window so it never *emits* a
+/// repeat; the receiver holds a different window so it never *accepts* one. The
+/// two are not shared and not synchronised — a window that both drew from and
+/// checked against would reject the sender's own output, which is a mistake
+/// worth naming because it reads as natural until it is written down.
+///
+/// Both are keyed on the same transfer key, and both are dropped when the
+/// session ends.
+///
+/// # Why a window and not a set
+///
+/// `05-migration-plan.md`'s risk table names the cost: "Nonce-repeat checking
+/// costs memory on huge transfers — bound it: a sliding window, not a full
+/// set." A full set for a 100 GB transfer at 4 MiB chunks is 25,600 entries and
+/// grows without limit. A window of [`Self::DEFAULT_CAPACITY`] entries is 48 KiB
+/// flat, and it covers the last 4,096 chunks — at the default chunk size, a
+/// 16 GiB span. A replay is an attack presented promptly; a chunk from 16 GiB
+/// ago is not the threat model, and a test asserts that a nonce which has left
+/// the window is accepted again, so the eviction is deliberate and visible
+/// rather than an accident of the data structure.
+///
+/// # What this does *not* cover
+///
+/// The window is **in memory and per session**. A receiver that restarts loses
+/// it, so a chunk captured before the restart and replayed after it is not
+/// caught by this check — it is caught by the AAD, if the replay targets a
+/// different index or file, and by the resume bitmap (task 4.7) if it targets
+/// the same slot. Persisting the window is not part of task 4.4 and is recorded
+/// in the phase report as a known limit rather than silently claimed.
+///
+/// A sender that retries a chunk re-encrypts it — `upload_chunk` calls
+/// `encrypt_chunk` inside its retry loop — so a retry draws a fresh nonce and
+/// cannot be mistaken for a replay.
+#[derive(Debug)]
+pub struct NonceWindow {
+    capacity: usize,
+    ring: std::collections::VecDeque<[u8; NONCE_LEN]>,
+    seen: std::collections::HashSet<[u8; NONCE_LEN]>,
+}
+
+impl Default for NonceWindow {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_CAPACITY)
+    }
+}
+
+impl NonceWindow {
+    /// 4,096 nonces, 48 KiB. See the type docs for why that number.
+    pub const DEFAULT_CAPACITY: usize = 4096;
+
+    /// A window remembering the last `capacity` nonces.
+    ///
+    /// # Panics
+    ///
+    /// If `capacity` is zero. A zero-capacity window remembers nothing, so it
+    /// would silently accept every replay — a security control that is off is
+    /// worse than one that is absent, because the caller believes it is on.
+    /// This is a construction-time programmer error, not attacker-controlled
+    /// input, so it panics rather than returning a `Result` the caller would
+    /// have to thread through code that cannot fail for any other reason.
+    pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "a nonce window must remember at least one nonce"
+        );
+
+        Self {
+            capacity,
+            ring: std::collections::VecDeque::with_capacity(capacity),
+            seen: std::collections::HashSet::with_capacity(capacity),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// How many nonces are currently remembered. Never exceeds
+    /// [`Self::capacity`].
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
+    /// Record a nonce, rejecting one that is already in the window.
+    ///
+    /// Returns [`ErrorKind::IntegrityMismatch`] on a repeat. It is a replay, and
+    /// it is reported as an integrity failure for the same reason a failed tag
+    /// is: the caller must not be able to distinguish "this is a replay" from
+    /// "this did not authenticate" by the response.
+    pub fn observe(&mut self, nonce: &[u8; NONCE_LEN]) -> Result<(), VilsendError> {
+        if self.seen.contains(nonce) {
+            return Err(VilsendError::IntegrityMismatch(
+                "v2 chunk nonce repeated within the window".into(),
+            ));
+        }
+
+        self.record(nonce);
+
+        Ok(())
+    }
+
+    /// Seal a chunk with a freshly drawn nonce, guaranteed not to be one this
+    /// window has already used.
+    ///
+    /// The nonce is drawn **before** sealing and recorded **before** the AEAD
+    /// runs, so a failure inside `seal` still spends it. Handing a nonce back
+    /// to the pool after a partial use is how nonce reuse happens.
+    pub fn seal<R: rand::RngCore>(
+        &mut self,
+        rng: &mut R,
+        key: &[u8; 32],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<SealedChunk, VilsendError> {
+        for _ in 0..MAX_NONCE_ATTEMPTS {
+            let mut nonce = [0u8; NONCE_LEN];
+            rng.fill_bytes(&mut nonce);
+
+            if self.seen.contains(&nonce) {
+                continue;
+            }
+
+            self.record(&nonce);
+
+            // The free function, not a method: reaching it directly is the way
+            // to skip the discipline, and there is exactly one place that
+            // should.
+            return seal(key, aad, &nonce, plaintext);
+        }
+
+        Err(VilsendError::Internal(format!(
+            "could not draw an unused nonce in {MAX_NONCE_ATTEMPTS} attempts"
+        )))
+    }
+
+    /// Open a chunk, rejecting a nonce the window has already accepted.
+    ///
+    /// The tag is verified **first**, and the nonce is recorded **only on
+    /// success**. That ordering is deliberate: an unauthenticated chunk has not
+    /// spent its nonce, and letting a flood of forged chunks push real entries
+    /// out of the window would let an attacker evict the coverage that rejects
+    /// the replay they actually intend to send.
+    pub fn open(
+        &mut self,
+        key: &[u8; 32],
+        aad: &[u8],
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, VilsendError> {
+        if nonce.len() != NONCE_LEN {
+            return Err(VilsendError::InvalidInput(format!(
+                "v2 chunk nonce must be {NONCE_LEN} bytes, got {}",
+                nonce.len()
+            )));
+        }
+
+        let mut fixed = [0u8; NONCE_LEN];
+        fixed.copy_from_slice(nonce);
+
+        // The free function, not this method: `open(...)` with no receiver is
+        // the module-level AEAD, and calling it is the point.
+        let plaintext = open(key, aad, &fixed, ciphertext)?;
+
+        self.observe(&fixed)?;
+
+        Ok(plaintext)
+    }
+
+    /// Append `nonce`, evicting the oldest entry once the window is full. The
+    /// only caller that can have already checked for a repeat is
+    /// [`Self::observe`], which does it first.
+    fn record(&mut self, nonce: &[u8; NONCE_LEN]) {
+        if self.ring.len() == self.capacity {
+            if let Some(evicted) = self.ring.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+
+        self.ring.push_back(*nonce);
+        self.seen.insert(*nonce);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transfer::crypto as v1;
+    use vilsend_core::ErrorKind;
+
+    /// A raw key for the `seal`/`open` tests.
+    ///
+    /// Deliberately a literal and not a derived key: `seal` and `open` are
+    /// pure functions of their arguments, and using a fixed key keeps these
+    /// tests about the AEAD rather than about the KDF. The KDF's own tests use
+    /// derived keys.
+    const KEY: [u8; 32] = [0x42; 32];
+
+    fn aad_of(transfer_id: &str, file_id: &str, index: u64, path: &str) -> Vec<u8> {
+        ChunkAad::new(transfer_id, file_id, index, path).encode()
+    }
+
+    fn fixed_aad() -> Vec<u8> {
+        aad_of("t-1", "f-1", 3, "docs/report.pdf")
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * The feature gate reaches this crate
+     * ------------------------------------------------------------------
+     */
+
+    /// The desktop crate forwards `protocol-v2` to `vilsend-core`. If that
+    /// forwarding breaks, this module compiles but the protocol version the
+    /// shell reports is v1 — the two disagreeing about which version they are
+    /// is the failure ADR-0010 warns about. Asserted rather than assumed.
+    #[test]
+    fn the_forwarded_feature_raises_the_protocol_version() {
+        assert_eq!(vilsend_core::PROTOCOL_VERSION, vilsend_core::PROTOCOL_V2);
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * Key derivation (task 4.2)
+     * ------------------------------------------------------------------
+     */
+
+    /// The ECDH secret every KDF test below starts from.
+    const SECRET: [u8; 32] = [0x42; 32];
+
+    /// The nonces from `HELLO` and `HELLO_ACK`.
+    const NONCE_S: [u8; 16] = [0x01; 16];
+    const NONCE_R: [u8; 16] = [0x02; 16];
+
+    fn v2_key_of(secret: &[u8; 32], sender: &[u8], receiver: &[u8]) -> [u8; 32] {
+        derive_transfer_key_v2(secret, sender, receiver).unwrap()
+    }
+
+    /// The exact key v2 derives, as a literal — the same treatment the v1 KDF
+    /// gets in `crypto`'s tests, and for the same reason: a change to the salt
+    /// framing, the `info` string or the hash must fail here rather than
+    /// silently produce a wire no peer can read.
+    #[test]
+    fn the_v2_kdf_vector_is_frozen() {
+        assert_eq!(
+            hex::encode(v2_key_of(&SECRET, &NONCE_S, &NONCE_R)),
+            "b3ed1bb478aaa9ef379dd62c6a9df76b35c7d502550848da9cffeb7f368c7e3f"
+        );
+    }
+
+    #[test]
+    fn the_v2_kdf_is_deterministic() {
+        assert_eq!(
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R),
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R)
+        );
+    }
+
+    /// Both nonces are consumed, and their order is part of the format. Neither
+    /// is decorative: an attacker who could feed a chosen nonce to a key
+    /// derivation with a fixed secret could otherwise force a known key.
+    #[test]
+    fn the_v2_kdf_consumes_both_nonces_and_their_order_matters() {
+        let base = v2_key_of(&SECRET, &NONCE_S, &NONCE_R);
+
+        assert_ne!(base, v2_key_of(&SECRET, &[0x03; 16], &NONCE_R));
+        assert_ne!(base, v2_key_of(&SECRET, &NONCE_S, &[0x03; 16]));
+        assert_ne!(
+            base,
+            v2_key_of(&SECRET, &NONCE_R, &NONCE_S),
+            "swapping the nonces must derive a different key"
+        );
+    }
+
+    /// The gap the task exists to close. v1 derives the same key every time for
+    /// a given secret; v2 does not, because the nonces are in the salt.
+    #[test]
+    fn two_sessions_with_the_same_ecdh_secret_derive_different_keys() {
+        let first = v2_key_of(&SECRET, &[0x01; 16], &[0x02; 16]);
+        let second = v2_key_of(&SECRET, &[0x04; 16], &[0x05; 16]);
+
+        assert_ne!(first, second);
+
+        // Which v1 does not do — two sessions, one secret, one key, always.
+        assert_eq!(
+            v1::derive_transfer_key(&SECRET).unwrap(),
+            v1::derive_transfer_key(&SECRET).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_different_ecdh_secret_derives_a_different_key() {
+        assert_ne!(
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R),
+            v2_key_of(&[0x43; 32], &NONCE_S, &NONCE_R)
+        );
+    }
+
+    /// The two KDFs do not agree for the same secret, so a v2 key can never
+    /// collide with a v1 one — before the AEAD is even reached.
+    #[test]
+    fn the_v2_kdf_is_not_the_v1_kdf() {
+        assert_ne!(
+            v2_key_of(&SECRET, &NONCE_S, &NONCE_R),
+            v1::derive_transfer_key(&SECRET).unwrap()
+        );
+    }
+
+    /// An empty salt is HKDF-equivalent to no salt (HMAC zero-pads an empty key
+    /// and a 32-zero-byte key to the same block), so this is the strongest
+    /// available statement that the `info` string alone still separates the two
+    /// domains. It is not reachable in the protocol — the handshake nonces are
+    /// always 16 bytes — so it is a property of the KDF rather than a case the
+    /// receiver will ever see.
+    #[test]
+    fn the_info_string_alone_separates_v1_from_v2() {
+        let empty_salt = v2_key_of(&SECRET, &[], &[]);
+
+        assert_ne!(empty_salt, v1::derive_transfer_key(&SECRET).unwrap());
+
+        // And with no salt at all, the salt is genuinely doing nothing.
+        assert_eq!(
+            empty_salt,
+            v2_key_of(&SECRET, &[], &[]),
+            "an empty salt is still deterministic"
+        );
+    }
+
+    /// A 16-byte pair is what the handshake actually supplies, and it produces a
+    /// full-width key.
+    #[test]
+    fn a_handshake_shaped_salt_derives_a_full_width_key() {
+        let key = v2_key_of(&SECRET, &NONCE_S, &NONCE_R);
+
+        assert_eq!(key.len(), 32);
+        assert_ne!(key, [0u8; 32]);
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * AAD encoding
+     * ------------------------------------------------------------------
+     */
+
+    /// A literal byte string for a literal input, so a change to the framing is
+    /// a deliberate act. This is the input to every v2 tag: it never travels on
+    /// the wire by itself, but it is as frozen as anything that does.
+    #[test]
+    fn the_aad_encoding_is_pinned_byte_for_byte() {
+        let aad = ChunkAad {
+            transfer_id: "t-1",
+            file_id: "f-1",
+            chunk_index: 3,
+            relative_path: "a/b",
+            protocol_version: 2,
+        };
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"vilsend-chunk-aad-v2");
+        expected.extend_from_slice(&2u16.to_le_bytes());
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(b"t-1");
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(b"f-1");
+        expected.extend_from_slice(&3u64.to_le_bytes());
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(b"a/b");
+
+        assert_eq!(aad.encode(), expected);
+        assert_eq!(aad.encode().len(), 20 + 2 + 7 + 7 + 8 + 7);
+    }
+
+    /// The reason the encoding is length-prefixed at all.
+    ///
+    /// With plain concatenation these two inputs produce the same bytes —
+    /// `transfer_id = "ab", file_id = "c"` and `transfer_id = "a",
+    /// file_id = "bc"` both read `...abc` — so a chunk sealed for one transfer
+    /// would open for the other. This is what makes that unreachable, and it
+    /// fails the day someone "simplifies" the framing back to concatenation.
+    #[test]
+    fn shifting_a_character_across_a_field_boundary_changes_the_aad() {
+        assert_ne!(aad_of("ab", "c", 0, "p"), aad_of("a", "bc", 0, "p"));
+    }
+
+    /// The same hazard against the fixed-width index: no string can grow into
+    /// it, because every string is preceded by its own length.
+    #[test]
+    fn no_field_can_absorb_the_chunk_index() {
+        assert_ne!(aad_of("t", "f", 0, "ab"), aad_of("t", "f", 0, "a"));
+        assert_ne!(aad_of("t", "f", 0, ""), aad_of("t", "f", 1, ""));
+    }
+
+    /// A transfer and a file may share an id, and when they do the index must
+    /// still be written exactly once. A value-matching encoding writes it
+    /// twice; the length assertion is what catches that.
+    #[test]
+    fn the_index_is_written_exactly_once_when_two_ids_are_equal() {
+        let encoded = aad_of("x", "x", 0, "p");
+
+        // 20 domain + 2 version + (4+1) + (4+1) + 8 index + (4+1)
+        assert_eq!(encoded.len(), 45);
+
+        // And it is still sensitive to the index, so "written once" is not
+        // "written nowhere".
+        assert_ne!(encoded, aad_of("x", "x", 1, "p"));
+    }
+
+    /// Every field is actually covered. Table-driven so that dropping one from
+    /// `encode` fails here rather than silently weakening every tag.
+    #[test]
+    fn every_field_changes_the_aad() {
+        let base = fixed_aad();
+
+        let variants = [
+            ("transfer_id", aad_of("t-2", "f-1", 3, "docs/report.pdf")),
+            ("file_id", aad_of("t-1", "f-2", 3, "docs/report.pdf")),
+            ("chunk_index", aad_of("t-1", "f-1", 4, "docs/report.pdf")),
+            ("relative_path", aad_of("t-1", "f-1", 3, "docs/other.pdf")),
+            (
+                "protocol_version",
+                ChunkAad {
+                    protocol_version: 3,
+                    ..ChunkAad::new("t-1", "f-1", 3, "docs/report.pdf")
+                }
+                .encode(),
+            ),
+        ];
+
+        for (field, variant) in variants {
+            assert_ne!(base, variant, "changing {field} must change the AAD");
+        }
+    }
+
+    #[test]
+    fn the_aad_encoding_is_deterministic() {
+        assert_eq!(fixed_aad(), fixed_aad());
+    }
+
+    /// A path with multi-byte characters is framed by its byte length, so the
+    /// framing can never split a character.
+    #[test]
+    fn a_non_ascii_path_is_framed_by_byte_length() {
+        let encoded = aad_of("t-1", "f-1", 0, "док/отчёт.pdf");
+
+        // Offset of the path's length prefix: everything that precedes it.
+        let prefix = 20 + 2 + (4 + 3) + (4 + 3) + 8;
+        let declared = u32::from_le_bytes(encoded[prefix..prefix + 4].try_into().unwrap());
+
+        assert_eq!(declared as usize, "док/отчёт.pdf".len());
+        assert!(declared as usize > "док/отчёт.pdf".chars().count());
+    }
+
+    #[test]
+    fn an_empty_field_still_contributes_a_length_prefix() {
+        let encoded = aad_of("", "", 0, "");
+
+        assert_eq!(encoded.len(), 20 + 2 + 4 + 4 + 8 + 4);
+        assert_ne!(encoded, aad_of("", "", 0, "x"));
+    }
+
+    /// A chunk index beyond 32 bits occupies all eight of its bytes, so the
+    /// `u64` in the encoding is not decorative.
+    #[test]
+    fn a_large_chunk_index_uses_all_eight_bytes() {
+        let low = aad_of("t", "f", 0, "p");
+        let high = aad_of("t", "f", u32::MAX as u64 + 1, "p");
+
+        assert_eq!(low.len(), high.len());
+        assert_ne!(low, high);
+    }
+
+    /// A future protocol version must not be able to reuse these AAD bytes.
+    #[test]
+    fn a_different_protocol_version_produces_a_different_aad() {
+        let v2 = ChunkAad::new("t", "f", 0, "p").encode();
+
+        let v3 = ChunkAad {
+            protocol_version: 3,
+            ..ChunkAad::new("t", "f", 0, "p")
+        }
+        .encode();
+
+        assert_eq!(v2.len(), v3.len());
+        assert_ne!(v2, v3);
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * Seal and open
+     * ------------------------------------------------------------------
+     */
+
+    #[test]
+    fn a_chunk_round_trips_with_matching_aad() {
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0xAB; NONCE_LEN], b"the payload").unwrap();
+
+        assert_eq!(
+            open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext).unwrap(),
+            b"the payload"
+        );
+    }
+
+    #[test]
+    fn the_v2_nonce_is_twelve_bytes_and_the_tag_is_sixteen() {
+        let sealed = seal(&KEY, &fixed_aad(), &[0; NONCE_LEN], &[0xCD; 4096]).unwrap();
+
+        assert_eq!(sealed.nonce.len(), NONCE_LEN);
+        assert_eq!(sealed.ciphertext.len(), 4096 + TAG_LEN);
+    }
+
+    #[test]
+    fn an_empty_chunk_seals_and_opens() {
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x11; NONCE_LEN], &[]).unwrap();
+
+        assert_eq!(sealed.ciphertext.len(), TAG_LEN);
+        assert_eq!(
+            open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext).unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn seal_reports_the_nonce_it_was_given() {
+        let sealed = seal(&KEY, &fixed_aad(), &[7; NONCE_LEN], b"x").unwrap();
+
+        assert_eq!(sealed.nonce, [7; NONCE_LEN]);
+    }
+
+    /// The same inputs produce the same bytes. AES-GCM is deterministic once
+    /// the nonce is fixed, which is what makes the vector below possible — and
+    /// is exactly why the nonce must never repeat under one key.
+    #[test]
+    fn sealing_is_deterministic_for_a_fixed_nonce() {
+        let aad = fixed_aad();
+
+        let first = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"hello v2").unwrap();
+        let second = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"hello v2").unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * The frozen wire vector
+     * ------------------------------------------------------------------
+     */
+
+    /// Fixed key + fixed nonce + fixed AAD + fixed plaintext → fixed
+    /// ciphertext. This is `05-migration-plan.md`'s "Crypto vectors"
+    /// requirement: the regression test on the v2 wire format.
+    ///
+    /// If this fails, two builds of this repository disagree about what a v2
+    /// chunk looks like. That is a data-corruption bug shipped to users, not a
+    /// test to update; change the expected value only alongside a decision that
+    /// renumbers the protocol.
+    #[test]
+    fn the_v2_chunk_vector_is_frozen() {
+        let sealed = seal(&KEY, &fixed_aad(), &[0x0A; NONCE_LEN], b"hello v2").unwrap();
+
+        assert_eq!(hex::encode(sealed.nonce), "0a0a0a0a0a0a0a0a0a0a0a0a");
+
+        assert_eq!(
+            hex::encode(&sealed.ciphertext),
+            "674c2c79f58581ccd674a2782cd1810fdbce80b2608ef9c2"
+        );
+    }
+
+    /// A second vector over the AAD alone, so the assertion above is a function
+    /// of the AAD and not a constant that happens to be returned for anything.
+    #[test]
+    fn the_v2_aad_vector_is_frozen() {
+        assert_eq!(
+            hex::encode(fixed_aad()),
+            "76696c73656e642d6368756e6b2d6161642d7632020003000000742d3103000000662d3103000000000000000f000000646f63732f7265706f72742e706466"
+        );
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * Tamper tests — every one must fail closed
+     * ------------------------------------------------------------------
+     */
+
+    /// The acceptance criterion: "A captured v2 chunk replayed at a different
+    /// index is rejected."
+    #[test]
+    fn a_chunk_replayed_at_a_different_index_is_rejected() {
+        let captured = seal(
+            &KEY,
+            &aad_of("t-1", "f-1", 3, "docs/report.pdf"),
+            &[0x0A; NONCE_LEN],
+            b"chunk three",
+        )
+        .unwrap();
+
+        // The same bytes, presented as chunk 99.
+        let replayed = open(
+            &KEY,
+            &aad_of("t-1", "f-1", 99, "docs/report.pdf"),
+            &captured.nonce,
+            &captured.ciphertext,
+        );
+
+        assert_eq!(
+            replayed.unwrap_err().kind(),
+            ErrorKind::IntegrityMismatch,
+            "a replay into another index must be an integrity failure"
+        );
+    }
+
+    /// The same capture replayed into a different transfer, file or path. Each
+    /// is a separate route to the same vulnerability, so each is asserted.
+    #[test]
+    fn a_chunk_replayed_into_another_slot_is_rejected() {
+        let captured = seal(
+            &KEY,
+            &aad_of("t-1", "f-1", 3, "docs/report.pdf"),
+            &[0x0A; NONCE_LEN],
+            b"chunk three",
+        )
+        .unwrap();
+
+        let elsewhere = [
+            (
+                "another transfer",
+                aad_of("t-9", "f-1", 3, "docs/report.pdf"),
+            ),
+            ("another file", aad_of("t-1", "f-9", 3, "docs/report.pdf")),
+            ("another path", aad_of("t-1", "f-1", 3, "docs/secrets.pdf")),
+        ];
+
+        for (what, aad) in elsewhere {
+            let result = open(&KEY, &aad, &captured.nonce, &captured.ciphertext);
+
+            assert_eq!(
+                result.unwrap_err().kind(),
+                ErrorKind::IntegrityMismatch,
+                "replay into {what} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flipped_ciphertext_byte_fails_closed() {
+        let aad = fixed_aad();
+
+        let mut sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+        sealed.ciphertext[0] ^= 0x01;
+
+        assert_eq!(
+            open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::IntegrityMismatch
+        );
+    }
+
+    #[test]
+    fn a_flipped_tag_byte_fails_closed() {
+        let aad = fixed_aad();
+
+        let mut sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+        let last = sealed.ciphertext.len() - 1;
+        sealed.ciphertext[last] ^= 0x80;
+
+        assert!(open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext).is_err());
+    }
+
+    #[test]
+    fn a_flipped_nonce_byte_fails_closed() {
+        let aad = fixed_aad();
+
+        let mut sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+        sealed.nonce[0] ^= 0x01;
+
+        assert_eq!(
+            open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::IntegrityMismatch
+        );
+    }
+
+    #[test]
+    fn a_flipped_aad_byte_fails_closed() {
+        let mut aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        aad[0] ^= 0x01;
+
+        assert!(open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext).is_err());
+    }
+
+    /// And a flipped AAD byte in the *length prefix*, which is the part most
+    /// likely to be treated as harmless framing.
+    #[test]
+    fn a_flipped_aad_length_prefix_fails_closed() {
+        let mut aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        aad[22] ^= 0x01;
+
+        assert!(open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext).is_err());
+    }
+
+    #[test]
+    fn a_different_key_fails_closed() {
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        assert!(open(&[0x43; 32], &aad, &sealed.nonce, &sealed.ciphertext).is_err());
+    }
+
+    /// An empty AAD is not a "no AAD" escape hatch: the tag still covers it, so
+    /// a chunk sealed with an empty AAD cannot be opened with a real one.
+    #[test]
+    fn an_empty_aad_is_still_covered_by_the_tag() {
+        let sealed = seal(&KEY, &[], &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        assert!(open(&KEY, &[], &sealed.nonce, &sealed.ciphertext).is_ok());
+
+        assert!(open(&KEY, &fixed_aad(), &sealed.nonce, &sealed.ciphertext).is_err());
+    }
+
+    /// v2 is total where v1 panics. `crypto::decrypt_chunk` builds an AES-GCM
+    /// `Nonce` out of whatever slice it is handed and panics on a length that
+    /// is neither 12 nor 16; `open` classifies every input it can be given here.
+    #[test]
+    fn a_wrong_length_nonce_is_an_error_and_not_a_panic() {
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        for length in [0usize, 11, 13, 16, 32] {
+            let nonce = vec![0x0A; length];
+
+            assert_eq!(
+                open(&KEY, &aad, &nonce, &sealed.ciphertext)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput,
+                "a nonce of {length} bytes must be InvalidInput, not a panic"
+            );
+        }
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * Nonce discipline (task 4.4)
+     * ------------------------------------------------------------------
+     */
+
+    /// A test RNG that returns the same bytes every time it is asked.
+    ///
+    /// Exists to prove that [`NonceWindow::seal`]'s retry loop is bounded *by
+    /// construction*: a source that can only produce one nonce must yield an
+    /// error, not a spin.
+    struct ConstantRng(u8);
+
+    impl rand::RngCore for ConstantRng {
+        fn next_u32(&mut self) -> u32 {
+            u32::from_le_bytes([self.0; 4])
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            u64::from_le_bytes([self.0; 8])
+        }
+
+        fn fill_bytes(&mut self, destination: &mut [u8]) {
+            destination.fill(self.0);
+        }
+
+        fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(destination);
+
+            Ok(())
+        }
+    }
+
+    /// A small window, so that eviction is reachable in a test. The default is
+    /// 4,096 and asserting eviction at that size would mean 4,097 insertions.
+    fn small_window() -> NonceWindow {
+        NonceWindow::new(4)
+    }
+
+    fn nonce_of(byte: u8) -> [u8; NONCE_LEN] {
+        [byte; NONCE_LEN]
+    }
+
+    #[test]
+    fn the_default_capacity_is_what_the_docs_say() {
+        assert_eq!(NonceWindow::DEFAULT_CAPACITY, 4096);
+        assert_eq!(NonceWindow::default().capacity(), 4096);
+    }
+
+    #[test]
+    fn a_fresh_window_remembers_nothing() {
+        let window = small_window();
+
+        assert!(window.is_empty());
+        assert_eq!(window.len(), 0);
+        assert_eq!(window.capacity(), 4);
+    }
+
+    #[test]
+    fn a_repeated_nonce_is_rejected() {
+        let mut window = small_window();
+
+        assert!(window.observe(&nonce_of(0x01)).is_ok());
+
+        assert_eq!(
+            window.observe(&nonce_of(0x01)).unwrap_err().kind(),
+            ErrorKind::IntegrityMismatch,
+            "a repeat is a replay and must classify as an integrity failure"
+        );
+    }
+
+    /// The capacity-1 boundary: the window still does its one job.
+    #[test]
+    fn a_window_of_capacity_one_rejects_an_immediate_repeat() {
+        let mut window = NonceWindow::new(1);
+
+        assert!(window.observe(&nonce_of(0x01)).is_ok());
+        assert!(window.observe(&nonce_of(0x01)).is_err());
+        assert_eq!(window.len(), 1);
+    }
+
+    /// **The test that makes it a window rather than a set.**
+    ///
+    /// A nonce that has been evicted is accepted again. That is the deliberate
+    /// cost of bounding memory, stated as behaviour so that nobody later
+    /// "fixes" it into an unbounded set without a failing test.
+    #[test]
+    fn an_evicted_nonce_is_accepted_again_which_is_what_makes_it_a_window() {
+        let mut window = small_window();
+
+        for byte in 0..4 {
+            window.observe(&nonce_of(byte)).unwrap();
+        }
+
+        assert_eq!(window.len(), 4, "full, and no larger than its capacity");
+
+        // The fifth insertion evicts the first.
+        window.observe(&nonce_of(4)).unwrap();
+
+        assert_eq!(window.len(), 4);
+        assert!(
+            window.observe(&nonce_of(0)).is_ok(),
+            "a nonce that left the window is no longer remembered"
+        );
+
+        // The fourth is still inside it.
+        assert!(window.observe(&nonce_of(3)).is_err());
+    }
+
+    #[test]
+    fn the_window_never_grows_past_its_capacity() {
+        let mut window = NonceWindow::new(3);
+
+        for byte in 0..200u8 {
+            // Nonces are distinct per iteration; a repeat here would be a test
+            // bug, not a rejection.
+            let _ = window.observe(&nonce_of(byte));
+        }
+
+        assert_eq!(window.len(), 3, "bounded memory under an arbitrary run");
+    }
+
+    /// Concurrency is 4 by default, so chunks complete out of order. An
+    /// out-of-order run must not look like a replay.
+    #[test]
+    fn an_out_of_order_run_of_chunks_is_not_mistaken_for_a_replay() {
+        let mut sender = NonceWindow::default();
+        let mut rng = rand::thread_rng();
+        let aad = fixed_aad();
+
+        let sealed: Vec<_> = (0..4)
+            .map(|index| {
+                sender
+                    .seal(&mut rng, &KEY, &aad, format!("chunk {index}").as_bytes())
+                    .unwrap()
+            })
+            .collect();
+
+        let mut receiver = NonceWindow::default();
+
+        for (index, chunk) in sealed.iter().enumerate().rev() {
+            assert_eq!(
+                receiver
+                    .open(&KEY, &aad, &chunk.nonce, &chunk.ciphertext)
+                    .unwrap(),
+                format!("chunk {index}").as_bytes()
+            );
+        }
+    }
+
+    /// The same chunk twice: the acceptance criterion at the window level.
+    ///
+    /// Two windows, because a sender and a receiver are two sides: the sender
+    /// draws through its own and the receiver checks against its own.
+    #[test]
+    fn a_replayed_chunk_is_rejected_by_the_window() {
+        let mut receiver = NonceWindow::default();
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"chunk three").unwrap();
+
+        assert!(receiver
+            .open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+            .is_ok());
+
+        assert_eq!(
+            receiver
+                .open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::IntegrityMismatch
+        );
+    }
+
+    /// The ordering choice in [`NonceWindow::open`], asserted: a chunk whose
+    /// tag did not verify has not spent its nonce, so the legitimate copy of it
+    /// still opens.
+    ///
+    /// Without this, a forged chunk could consume the nonce of a real one and
+    /// turn a replay defence into a denial of service against the sender.
+    #[test]
+    fn a_tampered_chunk_does_not_spend_its_nonce() {
+        let mut receiver = NonceWindow::default();
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"chunk three").unwrap();
+
+        let mut tampered = sealed.ciphertext.clone();
+        tampered[0] ^= 0x01;
+
+        assert!(receiver.open(&KEY, &aad, &sealed.nonce, &tampered).is_err());
+        assert!(
+            receiver.is_empty(),
+            "nothing authenticated, nothing recorded"
+        );
+
+        assert_eq!(
+            receiver
+                .open(&KEY, &aad, &sealed.nonce, &sealed.ciphertext)
+                .unwrap(),
+            b"chunk three"
+        );
+    }
+
+    /// A chunk that authenticated is remembered, so the sender's own output
+    /// cannot be replayed back at it.
+    #[test]
+    fn sealing_records_the_nonce_so_a_replay_cannot_verify() {
+        let mut window = NonceWindow::default();
+        let mut rng = rand::thread_rng();
+
+        let sealed = window
+            .seal(&mut rng, &KEY, &fixed_aad(), b"payload")
+            .unwrap();
+
+        assert!(window.observe(&sealed.nonce).is_err());
+    }
+
+    #[test]
+    fn sealing_draws_a_different_nonce_each_time() {
+        let mut window = NonceWindow::default();
+        let mut rng = rand::thread_rng();
+        let aad = fixed_aad();
+
+        let first = window.seal(&mut rng, &KEY, &aad, b"payload").unwrap();
+        let second = window.seal(&mut rng, &KEY, &aad, b"payload").unwrap();
+
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.ciphertext, second.ciphertext);
+    }
+
+    /// The retry loop is bounded. A source that can only produce one nonce
+    /// collides with the previous draw and must return an error rather than
+    /// spin forever.
+    #[test]
+    fn sealing_is_bounded_when_the_rng_can_only_repeat_itself() {
+        let mut window = NonceWindow::default();
+        let mut rng = ConstantRng(0x5A);
+
+        assert!(window.seal(&mut rng, &KEY, &fixed_aad(), b"first").is_ok());
+
+        assert_eq!(
+            window
+                .seal(&mut rng, &KEY, &fixed_aad(), b"second")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Internal,
+            "a deterministic source must fail, not hang"
+        );
+
+        assert_eq!(window.len(), 1, "the failed draw recorded nothing");
+    }
+
+    #[test]
+    fn a_nonce_of_the_wrong_length_is_an_error_and_not_a_panic_through_the_window() {
+        let mut window = NonceWindow::default();
+        let aad = fixed_aad();
+
+        let sealed = seal(&KEY, &aad, &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        for length in [0usize, 11, 13, 16] {
+            let nonce = vec![0x0A; length];
+
+            assert_eq!(
+                window
+                    .open(&KEY, &aad, &nonce, &sealed.ciphertext)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+
+        assert!(window.is_empty(), "a rejected length records nothing");
+    }
+
+    /// A zero-capacity window is a security control that is silently off, so it
+    /// is refused at construction rather than accepted.
+    #[test]
+    #[should_panic(expected = "must remember at least one nonce")]
+    fn a_zero_capacity_window_panics() {
+        let _ = NonceWindow::new(0);
+    }
+
+    /// The window rejects a replay at the same index; the AAD rejects one at a
+    /// different index. Both routes end at `IntegrityMismatch`, and this asserts
+    /// they do so through the same entry point.
+    #[test]
+    fn a_chunk_replayed_at_another_index_is_rejected_through_the_window() {
+        let mut window = NonceWindow::default();
+
+        let sealed = seal(
+            &KEY,
+            &aad_of("t-1", "f-1", 3, "docs/report.pdf"),
+            &[0x0A; NONCE_LEN],
+            b"chunk three",
+        )
+        .unwrap();
+
+        let result = window.open(
+            &KEY,
+            &aad_of("t-1", "f-1", 99, "docs/report.pdf"),
+            &sealed.nonce,
+            &sealed.ciphertext,
+        );
+
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::IntegrityMismatch);
+        assert!(window.is_empty());
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * Domain separation from v1
+     * ------------------------------------------------------------------
+     */
+
+    /// A v2 chunk is not openable as a v1 one.
+    ///
+    /// The v1 function is handed the same key, so the AAD is the only
+    /// difference being exercised: v1 passes none, so its tag covers the
+    /// ciphertext with no context and cannot match a chunk sealed with any.
+    #[test]
+    fn a_v2_chunk_is_not_a_v1_chunk() {
+        let sealed = seal(&KEY, &fixed_aad(), &[0x0A; NONCE_LEN], b"payload").unwrap();
+
+        assert!(
+            v1::decrypt_chunk(&KEY, &sealed.nonce, &sealed.ciphertext).is_err(),
+            "a v2 chunk must not open on the v1 path"
+        );
+    }
+
+    /// And the reverse: a v1 chunk does not open on the v2 path.
+    #[test]
+    fn a_v1_chunk_is_not_a_v2_chunk() {
+        let legacy = v1::encrypt_chunk(&KEY, b"payload").unwrap();
+
+        assert!(
+            open(&KEY, &fixed_aad(), &legacy.nonce, &legacy.data).is_err(),
+            "a v1 chunk must not open on the v2 path"
+        );
+    }
+}

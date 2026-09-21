@@ -22,6 +22,12 @@ pub struct PublicKeyResponse {
 #[derive(Clone)]
 pub struct HttpClient(Client);
 
+impl Default for HttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HttpClient {
     pub fn new() -> Self {
         Self(Client::new())

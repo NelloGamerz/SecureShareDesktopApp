@@ -9,7 +9,8 @@
 //!   [`ConnectionStatus`]),
 //! - transfer progress and its arithmetic ([`TransferProgress`]),
 //! - the boundary error model ([`VilsendError`], [`ErrorKind`], ADR-0003),
-//! - the event port ([`DomainEvent`], [`EventSink`], ADR-0012).
+//! - the event port ([`DomainEvent`], [`EventSink`], ADR-0012),
+//! - the wire protocol version ([`PROTOCOL_VERSION`], ADR-0010).
 //!
 //! `cargo tree -p vilsend-core` is held in CI to `serde` and `thiserror` alone;
 //! the dependency direction in ADR-0002 is enforced by an architecture lint
@@ -19,10 +20,12 @@ pub mod error;
 pub mod event;
 pub mod ids;
 pub mod progress;
+pub mod protocol;
 pub mod status;
 
 pub use error::{ErrorKind, VilsendError};
 pub use event::{DomainEvent, EventSink, RecordingEventSink};
 pub use ids::{DeviceId, PeerRef, TransferId};
 pub use progress::{download_progress, upload_progress, TransferProgress};
+pub use protocol::{PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_VERSION};
 pub use status::{ConnectionStatus, TransferStatus};

@@ -20,3 +20,12 @@ thiserror = "2"
 [dev-dependencies]
 # Tests only: the golden payload fixtures are JSON files compared byte for byte.
 serde_json = "1"
+
+# Every new wire behaviour ships behind a flag that is off for one release
+# (`05-migration-plan.md`, cross-phase concerns). This one is **not** in
+# `default`: it is what raises `PROTOCOL_VERSION` to v2, and a default build
+# must claim v1 or the installed base breaks. The desktop crate forwards to it
+# so that one flag turns the whole v2 path on.
+[features]
+default = []
+protocol-v2 = []
