@@ -224,6 +224,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # ---> ADD PUBLIC API STEPS HERE <---
+      - name: Install nightly toolchain (for public-api)
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked
+
+      - name: Check public API of crates/sdk
+        run: cargo +nightly public-api --manifest-path crates/sdk/Cargo.toml -ss > /tmp/public-api.txt
+      # -----------------------------------
+
       - name: Formatting
         run: cargo fmt --all --check
 
