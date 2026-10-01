@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// The type, and its wire encoding, now live in `vilsend-core`.
 pub use vilsend_core::TransferStatus;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ConnectionType {
     Lan,

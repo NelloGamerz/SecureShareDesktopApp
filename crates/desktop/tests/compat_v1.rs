@@ -32,7 +32,7 @@
 
 mod v1_fixture;
 
-use server_frontend_lib::wire::{crypto, http_client::HttpClient, upload, ChunkJob};
+use server_frontend_lib::wire::{crypto, http_client::HttpClient, integrity, upload, ChunkJob};
 use v1_fixture::{start, Fixture, CHUNK_HEADERS};
 
 /// The bearer token the fixture's presence-only check accepts. v1 never reads
@@ -127,6 +127,10 @@ impl Sender {
                 TRANSFER_ID,
                 &crypto::encode_public_key(&ephemeral.public_key),
                 len as u64,
+                // Nothing to describe: this test is about the v1 request shape,
+                // and the field that carries digests is covered separately by
+                // `a_v1_receiver_ignores_the_digests_a_newer_sender_describes`.
+                None,
             )
             .await
             .expect("the fixture must accept the session");
@@ -531,4 +535,56 @@ async fn a_protocol_v2_build_speaks_v1_and_reports_it_as_the_fallback() {
         std::fs::read(fixture.receiver.root().join(DESTINATION)).expect("merged"),
         expected
     );
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Additive metadata a v1 receiver has to ignore
+ * ----------------------------------------------------------------------
+ */
+
+/// The start request now carries the digests the sender's files are supposed to
+/// hash to, so that a receiver which understands them can check the file it
+/// assembles against something the sender said.
+///
+/// A v1 receiver has never heard of that field. It ignores what it does not
+/// know — serde's default, and the reason the field is allowed to be added at
+/// all — and opens the session exactly as before. This test is what keeps that
+/// true: if the fixture ever stops accepting the request, every installed v1
+/// receiver has stopped accepting it too, and the transfer floor is gone.
+#[tokio::test]
+async fn a_v1_receiver_ignores_the_digests_a_newer_sender_describes() {
+    let fixture = start().await;
+
+    let client = HttpClient::new();
+    let endpoint = fixture.endpoint.clone();
+
+    let ephemeral = crypto::generate_ephemeral_keypair();
+
+    let described = integrity::ExpectedTransfer {
+        transfer_id: TRANSFER_ID.into(),
+        files: vec![integrity::ExpectedFile {
+            file_id: FILE_ID.into(),
+            relative_path: DESTINATION.into(),
+            size: 4,
+            sha256: "00".repeat(32),
+            chunks: vec![integrity::ExpectedChunk {
+                index: 0,
+                length: 4,
+                sha256: "11".repeat(32),
+            }],
+        }],
+    };
+
+    client
+        .start_transfer(
+            &endpoint,
+            TOKEN,
+            TRANSFER_ID,
+            &crypto::encode_public_key(&ephemeral.public_key),
+            4,
+            Some(&described),
+        )
+        .await
+        .expect("a v1 receiver must ignore metadata it does not know and open the session");
 }

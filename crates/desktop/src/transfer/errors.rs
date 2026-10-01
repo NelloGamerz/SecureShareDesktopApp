@@ -12,5 +12,16 @@ pub enum TransferError {
     Receiver(String),
     #[error("crypto error: {0}")]
     Crypto(String),
+    /// An assembled file is not the file the sender described.
+    ///
+    /// Its own error rather than a `Receiver(..)` string because the receiver
+    /// acts on it: the chunks behind the mismatch are dropped and asked for
+    /// again, and the file is never published.
+    #[error("integrity check failed for {path}: expected {expected}, got {actual}")]
+    IntegrityMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 pub type Result<T> = std::result::Result<T, TransferError>;

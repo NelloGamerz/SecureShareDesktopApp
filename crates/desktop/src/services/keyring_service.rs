@@ -221,6 +221,47 @@ impl KeyringService {
         Ok(())
     }
 
+    // Transfer secrets
+
+    /// The keychain entry a transfer's secrets live under.
+    ///
+    /// Namespaced by transfer id so that one transfer's key and token are a
+    /// single entry: they are always written and cleared together.
+    fn transfer_secret_key(transfer_id: &str) -> String {
+        format!("transfer_secret_{transfer_id}")
+    }
+
+    /// Persists a transfer's key and token so a restart can continue it.
+    ///
+    /// Kept here rather than beside the transfer's plan: the key is what
+    /// decrypts every byte of the transfer, and a state file is a plain
+    /// document in the application data directory.
+    pub fn save_transfer_secret(
+        app: &AppHandle,
+        transfer_id: &str,
+        encoded: &str,
+    ) -> Result<(), String> {
+        Self::set(app, &Self::transfer_secret_key(transfer_id), encoded)
+    }
+
+    /// Reads a transfer's secrets, resolving `Ok(None)` when none were stored.
+    ///
+    /// The read half of the pair above. Nothing retrieves a transfer's key yet
+    /// — that is what resuming an interrupted transfer will need — so this has
+    /// no caller in the upload path today.
+    #[allow(dead_code)]
+    pub fn get_transfer_secret(
+        app: &AppHandle,
+        transfer_id: &str,
+    ) -> Result<Option<String>, String> {
+        Self::get_optional(app, &Self::transfer_secret_key(transfer_id))
+    }
+
+    /// Removes a transfer's secrets. Absent is not an error.
+    pub fn delete_transfer_secret(app: &AppHandle, transfer_id: &str) -> Result<(), String> {
+        Self::remove(app, &Self::transfer_secret_key(transfer_id))
+    }
+
     pub fn save_device_private_key(app: &AppHandle, key: &str) -> Result<(), String> {
         Self::set(app, DEVICE_PRIVATE_KEY, key)
     }

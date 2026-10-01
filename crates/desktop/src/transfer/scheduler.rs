@@ -6,13 +6,31 @@ use crate::{
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Called once per acknowledged chunk, with the job that was sent and how many
+/// retries it took.
+///
+/// Takes the whole job rather than just its length so that the caller can record
+/// *which* chunk landed, not only how much — a byte count cannot tell a resume
+/// what is still missing.
+pub type ChunkAcknowledged = dyn Fn(&ChunkJob, u32) + Send + Sync;
+
 pub async fn run(
     jobs: Vec<ChunkJob>,
     workers: usize,
     state: Arc<UploadState>,
     token: String,
-    on_success: Arc<dyn Fn(usize, u32) + Send + Sync>,
+    on_success: Arc<ChunkAcknowledged>,
 ) -> std::result::Result<(), String> {
+    /*
+     * Read the key once, before any worker starts. It can change while workers
+     * run — a resume that re-establishes a session after the receiver restarted
+     * adopts the fresh key the receiver just derived — and a worker encrypting
+     * half a transfer with one key and half with another would produce a file
+     * the receiver cannot decrypt. The key a run starts with is the key that
+     * run uses.
+     */
+    let transfer_key = state.transfer_key();
+
     let (tx, rx) = mpsc::channel(jobs.len().max(1));
 
     for job in jobs {
@@ -64,13 +82,13 @@ pub async fn run(
                     &state.endpoint,
                     &token,
                     &job,
-                    &state.transfer_key,
+                    &transfer_key,
                     state.max_retries,
                 )
                 .await
                 {
                     Ok(retries) => {
-                        success(job.length, retries);
+                        success(&job, retries);
                     }
 
                     Err(e) => {

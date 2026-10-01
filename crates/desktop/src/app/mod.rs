@@ -8,6 +8,7 @@ use crate::services::oauth_service::OAuthService;
 use crate::services::{AuthService, EventService, WebSocketService};
 use crate::state::{AuthState, WebSocketState};
 use crate::transfer::manager::{TransferEvent, UploadManager};
+use crate::transfer::persist::{KeyringSecretStore, TransferStore};
 use crate::utils::config::AppConfig;
 
 /// The state the webview can reach.
@@ -30,6 +31,7 @@ impl AppState {
         events: Arc<dyn EventSink>,
         config: AppConfig,
         local_transfer_service: Arc<LocalTransferFileService>,
+        state_dir: std::path::PathBuf,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<TransferEvent>) {
         let config = Arc::new(config);
         let auth_state = Arc::new(AuthState::default());
@@ -38,12 +40,41 @@ impl AppState {
 
         let upload_root = std::env::temp_dir().join("transfer_uploads");
 
+        /*
+         * A transfer's plan goes on disk beside the application data; its key
+         * and token go to the keychain. They are deliberately not in the same
+         * place — see `transfer::persist`.
+         */
+        let transfer_store = Arc::new(TransferStore::new(
+            state_dir,
+            Arc::new(KeyringSecretStore::new(app_handle.clone())),
+        ));
+
         let upload_manager = Arc::new(UploadManager::new(
             events,
             upload_root,
             Arc::clone(&local_transfer_service),
             tx,
+            transfer_store,
         ));
+
+        /*
+         * Rebuild what a previous run left behind. Spawned rather than awaited
+         * because this constructor is synchronous; the restore holds the same
+         * lock `start` takes, so a transfer that begins in the meantime is not
+         * clobbered by what was on disk.
+         */
+        {
+            let restoring = Arc::clone(&upload_manager);
+
+            tauri::async_runtime::spawn(async move {
+                let restored = restoring.restore_persisted().await;
+
+                if restored > 0 {
+                    tracing::info!(restored, "restored transfers from a previous run");
+                }
+            });
+        }
 
         let event_dispatcher = Arc::new(EventDispatcher::new(Arc::clone(&upload_manager)));
 

@@ -28,13 +28,12 @@ mod websocket;
 #[doc(hidden)]
 pub mod wire {
     pub use crate::models::chunk::ChunkJob;
-    pub use crate::transfer::{crypto, http_client, upload};
+    pub use crate::transfer::{crypto, http_client, integrity, upload};
 
     #[cfg(feature = "protocol-v2")]
     pub use crate::transfer::crypto_v2;
 }
 
-use axum::extract::DefaultBodyLimit;
 use services::local_transfer_file_service::LocalTransferFileService;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -188,6 +187,10 @@ pub fn run() {
                 Arc::clone(&events),
                 config,
                 local_transfer_service.clone(),
+                // Where the sender's transfer state survives a restart. Beside
+                // the receiver's, but a separate directory: the two are
+                // different records with different lifecycles.
+                app_data_dir.join("transfer_state"),
             );
 
             let app_state = Arc::new(app_state);
@@ -321,10 +324,15 @@ pub fn run() {
              * Local receiver server
              */
             let receiver_state = transfer::writer::ReceiverState::new(
-                app.handle().clone(),
+                Arc::new(transfer::writer::TauriReceiverHost::new(
+                    app.handle().clone(),
+                )),
                 Arc::clone(&events),
                 transfer_root,
             );
+
+            // Held for the cleanup task below, which outlives the server's copy.
+            let cleanup_state = receiver_state.clone();
 
             tauri::async_runtime::spawn(async move {
                 let address =
@@ -334,21 +342,7 @@ pub fn run() {
                     Ok(listener) => {
                         tracing::info!("Transfer receiver started");
 
-                        let router = axum::Router::new()
-                            .route(
-                                "/transfer/public-key",
-                                axum::routing::get(transfer::writer::get_public_key),
-                            )
-                            .route(
-                                "/transfer/start",
-                                axum::routing::post(transfer::writer::start_transfer),
-                            )
-                            .route(
-                                "/transfer/chunk",
-                                axum::routing::post(transfer::writer::receive),
-                            )
-                            .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
-                            .with_state(receiver_state);
+                        let router = transfer::writer::router(receiver_state);
 
                         if let Err(error) = axum::serve(listener, router).await {
                             tracing::error!(
@@ -365,6 +359,31 @@ pub fn run() {
                         );
                     }
                 }
+            });
+
+            /*
+             * Partial transfers that nobody came back for.
+             *
+             * A transfer leaves its chunks on disk so that it can be resumed;
+             * once nobody is coming back for it they are just disk. The sweep
+             * runs once at startup and then on an interval, and never touches a
+             * transfer the receiver still has a live session for — see
+             * `transfer::cleanup`.
+             */
+            let ttl = transfer::cleanup::ttl_from_env();
+
+            tracing::info!(
+                ttl_secs = ttl.as_secs(),
+                "abandoned transfers will be removed after this long"
+            );
+
+            tauri::async_runtime::spawn(async move {
+                transfer::writer::run_cleanup(
+                    cleanup_state,
+                    ttl,
+                    transfer::cleanup::SWEEP_INTERVAL,
+                )
+                .await;
             });
 
             /*

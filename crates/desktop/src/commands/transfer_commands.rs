@@ -12,18 +12,21 @@ pub async fn start_transfer(
     manager.start(metadata).await.map_err(|e| e.to_string())
 }
 #[tauri::command]
-pub fn pause_transfer(
+pub async fn pause_transfer(
     manager: State<'_, Arc<UploadManager>>,
     transfer_id: String,
 ) -> std::result::Result<TransferStatusResponse, String> {
-    manager.pause(&transfer_id).map_err(|e| e.to_string())
+    manager.pause(&transfer_id).await.map_err(|e| e.to_string())
 }
 #[tauri::command]
-pub fn resume_transfer(
+pub async fn resume_transfer(
     manager: State<'_, Arc<UploadManager>>,
     transfer_id: String,
 ) -> std::result::Result<TransferStatusResponse, String> {
-    manager.resume(&transfer_id).map_err(|e| e.to_string())
+    manager
+        .resume(&transfer_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub async fn cancel_transfer(
