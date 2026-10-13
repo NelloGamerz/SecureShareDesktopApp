@@ -172,15 +172,15 @@ export function useDesktopServices() {
           // ---------------------------------------------------
 
           /*
-           * Cloudflared reads its hostname from the keychain, so repair a
-           * missing hostname before starting it rather than letting the spawn
-           * fail on a lookup error.
+           * Cloudflared reads its hostname and token from the keychain, so
+           * repair either one missing before starting it rather than letting
+           * the spawn fail on a lookup error.
            */
           const hostname = await ensureTunnelHostname();
 
           if (!hostname) {
             console.error(
-              "[DesktopServices] Tunnel hostname unavailable. Skipping Cloudflared start.",
+              "[DesktopServices] Tunnel credentials unavailable. Skipping Cloudflared start.",
             );
           }
 

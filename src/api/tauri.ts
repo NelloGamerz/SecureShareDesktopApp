@@ -108,6 +108,10 @@ export async function save_tunnel_token(token: string) {
   return invoke<void>("save_tunnel_token", { token });
 }
 
+export async function get_tunnel_token() {
+  return invoke<string>("get_tunnel_token");
+}
+
 export async function save_tunnel_hostname(hostname: string) {
   return invoke<void>("save_tunnel_hostname", { hostname });
 }
