@@ -1,7 +1,10 @@
 use crate::{
     models::{progress, transfer::TransferStatus},
     transfer::{
-        cleanup, crypto,
+        chunk_sink, cleanup,
+        compression::{self, ChunkEncoding},
+        constants::{MAX_CHUNK_BYTES_HEADER, MAX_CHUNK_SIZE},
+        crypto,
         errors::{Result as TransferResult, TransferError},
         http_client::StartTransferRequest,
         manifest, merger,
@@ -13,7 +16,7 @@ use vilsend_core::{DomainEvent, EventSink};
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     Json,
 };
 use tauri::Manager as _;
@@ -25,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64},
         Arc, Mutex,
@@ -144,7 +147,23 @@ pub struct ReceiverState {
     /// through the application handle.
     pub events: Arc<dyn EventSink>,
     pub root: PathBuf,
-    pub guard: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// One lock per transfer, for that transfer's own manifest read-modify-write.
+    ///
+    /// **Replaces a single process-wide guard.** The guard was held across the
+    /// whole chunk write — directory creation, the manifest read, the part
+    /// write, the merge — so every chunk of every transfer on the device
+    /// serialised through it, and a transfer whose socket stalled held it for as
+    /// long as it stalled.
+    ///
+    /// Per *transfer* rather than per file because one `manifest.json` holds
+    /// every file's entries, so two files of one transfer genuinely contend on
+    /// one document. Finer would mean restructuring the on-disk format, which is
+    /// frozen.
+    ///
+    /// The outer map is held only long enough to clone the inner `Arc`. Nothing
+    /// here is ever held across a network await — see
+    /// `crate::transfer::chunk_sink`, which is the only thing that takes it.
+    pub writers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub keys: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, [u8; 32]>>>,
 
     pub downloads: Arc<tokio::sync::RwLock<HashMap<String, Arc<DownloadState>>>>,
@@ -176,7 +195,7 @@ impl ReceiverState {
             host,
             events,
             root,
-            guard: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            writers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             keys: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             downloads: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             manifests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -184,8 +203,34 @@ impl ReceiverState {
         }
     }
 
+    /// The lock that serialises one transfer's chunk writes.
+    ///
+    /// The outer map is held only for the clone. A transfer's lock is created on
+    /// first use and lives until [`ReceiverState::forget_transfer`], so a long
+    /// process does not accumulate one per transfer id it has ever seen.
+    pub(crate) async fn transfer_lock(&self, transfer_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut writers = self.writers.lock().await;
+
+        writers
+            .entry(transfer_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Drop a finished or cancelled transfer's lock.
+    ///
+    /// Called wherever a transfer is removed from `downloads`, so the map tracks
+    /// the transfers that are live rather than every id ever seen. A lock still
+    /// held by an in-flight chunk is not *removed* from under it — the holder
+    /// owns an `Arc` — so forgetting one is safe: the next chunk for that id
+    /// simply gets a fresh lock, and a transfer that is finished has no next
+    /// chunk.
+    pub(crate) async fn forget_transfer(&self, transfer_id: &str) {
+        self.writers.lock().await.remove(transfer_id);
+    }
+
     /// The directory a transfer's parts and manifest live in.
-    fn transfer_dir(&self, transfer_id: &str) -> PathBuf {
+    pub(crate) fn transfer_dir(&self, transfer_id: &str) -> PathBuf {
         self.root.join("incoming").join(transfer_id)
     }
 }
@@ -202,7 +247,15 @@ pub fn router(state: ReceiverState) -> axum::Router {
         .route("/transfer/chunk", axum::routing::post(receive))
         .route("/transfer/status", axum::routing::get(transfer_status))
         .route("/transfer/cancel", axum::routing::post(cancel_transfer))
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        /*
+         * A chunk body is at most `MAX_CHUNK_SIZE`, plus the AEAD tag and the
+         * request-independent fixed overhead. Compression only ever shrinks a
+         * body, so this bound covers compressed and identity chunks alike.
+         * `/transfer/start` descriptions share the limit and are far smaller.
+         */
+        .layer(DefaultBodyLimit::max(
+            crate::transfer::constants::MAX_CHUNK_SIZE + 1024 * 1024,
+        ))
         .with_state(state)
 }
 
@@ -251,38 +304,6 @@ fn check_receiver_storage(path: &Path) -> Result<u64, String> {
     }
 
     Err("unable to determine receiver storage availability".into())
-}
-
-/// Report a storage failure while handling a chunk.
-///
-/// The download is marked failed and the frontend told, because a chunk that
-/// could not be written or could not be discarded leaves the transfer in a
-/// state the user needs to see rather than one that silently retries forever.
-fn storage_failure(
-    state: &ReceiverState,
-    download: &std::sync::Arc<DownloadState>,
-    transfer_id: &str,
-    chunk: u64,
-    message: &str,
-    error: std::io::Error,
-) -> (StatusCode, String) {
-    *download.status.lock().unwrap() = TransferStatus::Failed;
-
-    state.events.emit(DomainEvent::TransferFailed {
-        progress: progress::make_download(download),
-    });
-
-    tracing::error!(
-        transfer_id,
-        chunk,
-        error = %error,
-        "{message}"
-    );
-
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("{message}: {error}"),
-    )
 }
 
 pub async fn start_transfer(
@@ -646,6 +667,45 @@ pub async fn start_transfer(
     Ok(StatusCode::OK)
 }
 
+/// Which encoding a chunk request declares.
+///
+/// Absent is identity — the frozen v1 body. An unknown value is refused rather
+/// than guessed, because guessing wrong means writing bytes the sender did not
+/// mean.
+fn chunk_encoding(headers: &HeaderMap) -> std::result::Result<ChunkEncoding, String> {
+    let Some(value) = headers.get(compression::CHUNK_ENCODING_HEADER) else {
+        return Ok(ChunkEncoding::Identity);
+    };
+
+    let raw = value
+        .to_str()
+        .map_err(|_| "chunk encoding is not valid UTF-8".to_string())?;
+
+    ChunkEncoding::parse(raw).ok_or_else(|| format!("unsupported chunk encoding: {raw}"))
+}
+
+/// The plaintext length the sender described for one chunk, if it did.
+///
+/// This is the decompression bound. A sender built alongside this receiver
+/// always describes its chunks, so the fallback
+/// ([`compression::MAX_DECOMPRESSED_CHUNK_BYTES`]) is only reached by a peer
+/// that compressed without saying what it was sending.
+async fn expected_chunk_length(
+    state: &ReceiverState,
+    transfer_id: &str,
+    file_id: &str,
+    chunk_index: u64,
+) -> Option<u64> {
+    let manifests = state.manifests.lock().await;
+
+    manifests
+        .get(transfer_id)
+        .and_then(|record| record.expected.as_ref())
+        .and_then(|expected| expected.file(file_id))
+        .and_then(|file| file.chunk(chunk_index))
+        .map(|chunk| chunk.length)
+}
+
 pub async fn receive(
     State(state): State<ReceiverState>,
     headers: HeaderMap,
@@ -774,13 +834,14 @@ pub async fn receive(
         return Err((StatusCode::UNAUTHORIZED, "missing authorization".into()));
     }
 
-    let relative_path = Path::new(&relative);
-
-    if relative_path.is_absolute()
-        || relative_path
-            .components()
-            .any(|c| c == Component::ParentDir)
-    {
+    /*
+     * The containment rule lives in the shared core rather than here, so that
+     * the v2 framed session is held to exactly the same one. A path that is
+     * absolute, or that climbs out with `..`, would let a sender write anywhere
+     * the process can reach; a second protocol with its own copy of this check
+     * is a second chance to get it wrong.
+     */
+    if !chunk_sink::is_contained(&relative) {
         tracing::warn!(
             transfer_id=%transfer,
             path=%relative,
@@ -898,346 +959,112 @@ pub async fn receive(
         "chunk decrypted"
     );
 
-    let _guard = state.guard.lock().await;
-
-    let transfer_dir = state.transfer_dir(&transfer);
-
-    let parts = transfer_dir.join(&file);
-
-    fs::create_dir_all(&parts).await.map_err(|e| {
-        tracing::error!(
-            transfer_id=%transfer,
-            error=%e,
-            "failed creating chunk directory"
-        );
-
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("storage error: {e}"),
-        )
-    })?;
-
-    let part = parts.join(format!("{index}.part"));
-
-    while download.paused.load(Ordering::Relaxed) {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    if download.cancelled.load(Ordering::Relaxed) {
-        return Err((StatusCode::CONFLICT, "transfer cancelled".into()));
-    }
-
-    let chunk_hash = manifest::sha256_hex(&decrypted);
-    let chunk_length = decrypted.len() as u64;
-
     /*
-     * The manifest is this receiver's record of which chunks it actually has.
-     * It is read from disk the first time a transfer is touched after a
-     * restart, so that knowledge survives the process — and it is the only
-     * thing that makes a `.part` trustworthy; see `transfer::manifest`.
-     */
-    let mut manifests = state.manifests.lock().await;
-
-    if !manifests.contains_key(&transfer) {
-        let recovered = manifest::load_or_default(&transfer_dir, &transfer).await;
-
-        tracing::info!(
-            transfer_id=%transfer,
-            completed_chunks=recovered.chunks.len(),
-            "loaded transfer manifest"
-        );
-
-        manifests.insert(transfer.clone(), recovered);
-    }
-
-    let record = manifests
-        .get_mut(&transfer)
-        .expect("the manifest was inserted above");
-
-    /*
-     * A chunk may only be skipped when the manifest has an entry for it *and*
-     * the bytes on disk still match that entry. A `.part` with no entry — left
-     * by an older build, or by a crash before the manifest was committed — is
-     * not evidence of anything and gets written again.
-     */
-    let already_complete = match record.entry(&file, index) {
-        Some(entry) => {
-            entry.chunk_length == chunk_length
-                && entry.chunk_hash == chunk_hash
-                && manifest::part_matches(&part, entry).await
-        }
-
-        None => false,
-    };
-
-    if already_complete {
-        tracing::debug!(
-            transfer_id=%transfer,
-            chunk=index,
-            "chunk already present and matches the manifest"
-        );
-    } else {
-        /*
-         * Whatever is on disk under this name is not this chunk: there was no
-         * entry for it, or the entry disagreed with what arrived, or the bytes
-         * did not hash to what the entry recorded. Remove it before writing the
-         * replacement, so that a failure part-way through leaves nothing behind
-         * that a later run could read as progress.
-         */
-        manifest::discard_part(&part).await.map_err(|e| {
-            storage_failure(
-                &state,
-                &download,
-                &transfer,
-                index,
-                "failed discarding an invalid chunk",
-                e,
-            )
-        })?;
-
-        /*
-         * `write_part` writes a temporary and renames it into place once its
-         * bytes are flushed and synced, so a crash mid-write cannot leave a
-         * short `.part` under the real name — and when it returns, the bytes
-         * are durably on disk.
-         */
-        manifest::write_part(&part, &decrypted).await.map_err(|e| {
-            storage_failure(
-                &state,
-                &download,
-                &transfer,
-                index,
-                "failed writing chunk",
-                e,
-            )
-        })?;
-
-        /*
-         * Record the chunk only now, after its bytes are durably in place, so
-         * there is no ordering in which a crash leaves a manifest entry for a
-         * chunk the receiver cannot produce. `store` is itself atomic, so this
-         * step too leaves the previous manifest or this one, never a torn file.
-         */
-        record.record(manifest::ChunkEntry {
-            file_id: file.clone(),
-            chunk_index: index,
-            chunk_length,
-            chunk_hash,
-        });
-
-        manifest::store(&transfer_dir, record).await.map_err(|e| {
-            tracing::error!(
-                transfer_id=%transfer,
-                chunk=index,
-                error=%e,
-                "failed writing transfer manifest"
-            );
-
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("manifest write failed: {e}"),
-            )
-        })?;
-
-        // update progress only after the chunk is written and recorded
-        download
-            .received_bytes
-            .fetch_add(chunk_length, Ordering::Relaxed);
-
-        download.received_chunks.fetch_add(1, Ordering::Relaxed);
-
-        *download.status.lock().unwrap() = TransferStatus::Downloading;
-
-        state.events.emit(DomainEvent::TransferProgress {
-            progress: progress::make_download(&download),
-        });
-
-        tracing::info!(
-            transfer_id=%transfer,
-            chunk=index,
-            path=%part.display(),
-            "chunk saved"
-        );
-    }
-
-    /*
-     * Completion is a question for the manifest, not for the filesystem, and it
-     * is asked in two passes.
+     * Expand the chunk if the sender compressed it.
      *
-     * The first is cheap — an entry for every index, and nothing read from disk
-     * at all — and runs after each arriving chunk. Only when it passes is the
-     * second run, which hashes every chunk against its record. Doing the full
-     * check on every chunk would re-read the whole file each time and make a
-     * transfer quadratic in its own size; doing it once, here, costs a single
-     * pass over the file at the moment it matters, which is immediately before
-     * the bytes are merged into a finished file.
+     * The header is per chunk, and absent means identity — the same body every
+     * v1 peer has always sent. A receiver only advertises zstd on the handshake,
+     * so a compressed body here is one this receiver said it could decode.
+     *
+     * The expansion is bounded by the sender's own description of the chunk. A
+     * compressed body that would expand past it is refused rather than
+     * allocated: a few MiB on the wire must not become gigabytes in memory.
      */
-    let mut complete = manifest::all_chunks_recorded(record, &file, total);
+    let plaintext = match chunk_encoding(&headers) {
+        Ok(ChunkEncoding::Identity) => decrypted,
 
-    if complete {
-        let verification = manifest::verify_and_prune(record, &parts, &file, total).await;
+        Ok(ChunkEncoding::Zstd) => {
+            let limit = expected_chunk_length(&state, &transfer, &file, index)
+                .await
+                .unwrap_or(compression::MAX_DECOMPRESSED_CHUNK_BYTES as u64)
+                as usize;
 
-        complete = verification.complete;
+            match compression::decompress(&decrypted, limit) {
+                Ok(plaintext) => plaintext,
 
-        if verification.pruned {
-            /*
-             * Chunks that did not match their record have been removed from
-             * disk and from the manifest. Persist that, or a restart would
-             * reload the old entries and skip bytes we know are wrong.
-             */
-            manifest::store(&transfer_dir, record).await.map_err(|e| {
-                tracing::error!(
-                    transfer_id=%transfer,
-                    error=%e,
-                    "failed writing transfer manifest after pruning"
-                );
-
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("manifest write failed: {e}"),
-                )
-            })?;
-
-            let lost = (0..total)
-                .filter(|index| record.entry(&file, *index).is_none())
-                .collect::<Vec<_>>();
-
-            state.refused.lock().await.insert(transfer.clone());
-
-            tracing::warn!(
-                transfer_id=%transfer,
-                file_id=%file,
-                ?lost,
-                "chunks no longer match the manifest and were discarded; they have to be sent again"
-            );
-
-            /*
-             * The sender has to hear about this, and this response is the only
-             * thing that reaches it.
-             *
-             * A chunk the receiver was holding went bad and has been dropped.
-             * Answering `200` would let the sender count it as delivered — it
-             * has no other way to know — and it would finish a transfer whose
-             * file can never be assembled, with nothing left to prompt a resend.
-             * Refusing the request instead fails the sender's transfer, and its
-             * next resume asks what the receiver holds and is told the truth:
-             * the discarded chunks are missing, and it sends them again.
-             */
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "chunks {lost:?} of {file} no longer match what was recorded for them \
-                     and were discarded; they must be sent again"
-                ),
-            ));
-        }
-    }
-
-    if complete {
-        tracing::info!(
-            transfer_id=%transfer,
-            total_chunks=total,
-            "all chunks received"
-        );
-
-        let downloads = state
-            .host
-            .downloads_root()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-        let destination = downloads.join(relative_path);
-
-        match assemble_and_publish(record, &transfer_dir, &file, total, &destination).await {
-            Ok(Assembly::Published) => {
-                // Whatever was refused before, the file is delivered now.
-                state.refused.lock().await.remove(&transfer);
-
-                *download.status.lock().unwrap() = TransferStatus::Completed;
-
-                state.events.emit(DomainEvent::TransferCompleted {
-                    progress: progress::make_download(&download),
-                });
-
-                state.downloads.write().await.remove(&transfer);
-
-                tracing::info!(
-                    transfer_id=%transfer,
-                    destination=%destination.display(),
-                    "merge complete"
-                );
-
-                fs::remove_dir_all(&parts).await.map_err(|e| {
+                Err(error) => {
                     tracing::warn!(
                         transfer_id=%transfer,
-                        error=%e,
-                        "failed removing temp chunks"
+                        chunk=index,
+                        limit,
+                        error=%error,
+                        "chunk declared zstd but did not decompress"
                     );
 
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("cleanup failed: {e}"),
-                    )
-                })?;
-
-                /*
-                 * The parts are gone, so the manifest that described them is no
-                 * longer worth caching. It stays on disk — a transfer that
-                 * restarts under the same id will load it, find no backing
-                 * `.part` files, and re-write the chunks, which is the safe
-                 * answer.
-                 */
-                manifests.remove(&transfer);
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("chunk decompression failed: {error}"),
+                    ));
+                }
             }
+        }
 
-            /*
-             * The chunks were all here and none of them could be shown to be
-             * wrong on their own, and the file they assemble into is still not
-             * the one the sender described. Nothing is marked complete and the
-             * file is not delivered; the chunks behind the mismatch have already
-             * been dropped and written down, so a resume asks for exactly those.
-             */
-            Ok(Assembly::Rejected { chunks }) => {
-                tracing::error!(
-                    transfer_id=%transfer,
-                    file_id=%file,
-                    ?chunks,
-                    "the assembled file failed its integrity check; those chunks must be sent again"
-                );
+        Err(message) => {
+            tracing::warn!(
+                transfer_id=%transfer,
+                chunk=index,
+                %message,
+                "chunk declared an encoding this receiver does not know"
+            );
 
-                let (accounted_bytes, accounted_chunks) = record.accounted();
+            return Err((StatusCode::BAD_REQUEST, message));
+        }
+    };
 
-                download
-                    .received_bytes
-                    .store(accounted_bytes, Ordering::Relaxed);
-                download
-                    .received_chunks
-                    .store(accounted_chunks, Ordering::Relaxed);
+    tracing::info!(
+        transfer_id=%transfer,
+        chunk=index,
+        plaintext_size=plaintext.len(),
+        "chunk ready to store"
+    );
 
-                // Nothing else may be acknowledged for this transfer until the
-                // sender has been told; see the top of [`receive`].
-                state.refused.lock().await.insert(transfer.clone());
+    /*
+     * Everything above this line is v1's own: the frozen header set, the
+     * session lookup, the decryption. Everything below is the shared durable
+     * core, which is also what the v2 framed session calls — see
+     * `crate::transfer::chunk_sink`.
+     *
+     * One implementation of the write order is what keeps the two protocols
+     * from drifting apart on the one property that matters: a chunk is counted
+     * only once its bytes are fsynced, and its manifest entry is written only
+     * after them.
+     */
+    match chunk_sink::accept(&state, &download, &transfer, &file, index, &plaintext).await {
+        Ok(chunk_sink::Accepted::Stored | chunk_sink::Accepted::AlreadyPresent) => {}
 
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!(
-                        "integrity check failed for {file}: chunks {chunks:?} do not match \
-                         the sender's digests and must be sent again"
-                    ),
-                ));
-            }
+        Err(chunk_sink::SinkError::Cancelled(_)) => {
+            return Err((StatusCode::CONFLICT, "transfer cancelled".into()));
+        }
 
-            Err(e) => {
-                tracing::error!(
-                    transfer_id=%transfer,
-                    error=%e,
-                    "merge failed"
-                );
+        Err(error) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+        }
+    }
 
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("merge failed: {e}"),
-                ));
-            }
+    match chunk_sink::finish(&state, &download, &transfer, &file, total, &relative).await {
+        Ok(chunk_sink::Completion::Incomplete | chunk_sink::Completion::Published) => {}
+
+        /*
+         * Chunks the sender counted as delivered are not all still here, or the
+         * file they assemble into is not the one it described. Answering `200`
+         * would let it finish a transfer whose file can never be assembled;
+         * refusing fails its transfer, and its next resume asks what the
+         * receiver holds and is told the truth.
+         *
+         * The two refusals keep their own status codes, because `409` and `422`
+         * are frozen v1 and an installed client distinguishes them.
+         */
+        Ok(chunk_sink::Completion::Refused { kind, message, .. }) => {
+            let status = match kind {
+                chunk_sink::Refusal::Pruned => StatusCode::CONFLICT,
+                chunk_sink::Refusal::IntegrityMismatch => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+
+            return Err((status, message));
+        }
+
+        Err(error) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
         }
     }
 
@@ -1253,7 +1080,7 @@ pub async fn receive(
 pub async fn get_public_key(
     State(state): State<ReceiverState>,
     headers: HeaderMap,
-) -> Result<Json<PublicKeyResponse>, (StatusCode, String)> {
+) -> Result<(HeaderMap, Json<PublicKeyResponse>), (StatusCode, String)> {
     if headers.get("Authorization").is_none() {
         return Err((StatusCode::UNAUTHORIZED, "missing authorization".into()));
     }
@@ -1269,7 +1096,27 @@ pub async fn get_public_key(
 
     tracing::info!("device public key requested");
 
-    Ok(Json(PublicKeyResponse { public_key }))
+    /*
+     * Advertise the chunk encodings this receiver can decode, and the largest
+     * chunk body it will accept. The sender compresses and plans its chunk size
+     * only from these headers, so a sender pointed at an older receiver — or the
+     * frozen fixture — continues to send identity chunks at the legacy size.
+     * Response headers do not change the frozen body shape.
+     */
+    let mut advertised = HeaderMap::new();
+
+    advertised.insert(
+        HeaderName::from_static(compression::NEGOTIATION_HEADER),
+        HeaderValue::from_static(compression::ZSTD_NAME),
+    );
+
+    advertised.insert(
+        HeaderName::from_static(MAX_CHUNK_BYTES_HEADER),
+        HeaderValue::from_str(&MAX_CHUNK_SIZE.to_string())
+            .expect("a decimal number is a valid header value"),
+    );
+
+    Ok((advertised, Json(PublicKeyResponse { public_key })))
 }
 
 /// The bytes and chunks a recovered manifest is worth as progress.
@@ -1518,6 +1365,11 @@ pub async fn cancel_transfer(
     }
 
     state.keys.write().await.remove(&transfer);
+
+    // The transfer is gone, so its write lock is not worth keeping. Nothing is
+    // removed from under a holder: an in-flight chunk owns an `Arc` to it and
+    // finishes on the lock it already has.
+    state.forget_transfer(&transfer).await;
     state.manifests.lock().await.remove(&transfer);
 
     match cleanup::remove_transfer(&state.root, &transfer).await {
@@ -1628,6 +1480,47 @@ mod tests {
         integrity::ExpectedTransfer,
         manifest::test_support::{expected_file, TempDir},
     };
+
+    /// An absent encoding header is the frozen v1 body, and must keep being
+    /// read as identity rather than assumed to be compressed.
+    #[test]
+    fn a_chunk_without_an_encoding_header_is_identity() {
+        assert_eq!(
+            chunk_encoding(&HeaderMap::new()).expect("no header is identity"),
+            ChunkEncoding::Identity
+        );
+    }
+
+    #[test]
+    fn a_known_chunk_encoding_is_read_off_the_header() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert(
+            compression::CHUNK_ENCODING_HEADER,
+            axum::http::HeaderValue::from_static("zstd"),
+        );
+
+        assert_eq!(
+            chunk_encoding(&headers).expect("zstd is supported"),
+            ChunkEncoding::Zstd
+        );
+    }
+
+    /// An encoding this build cannot decode must be refused, not written as if
+    /// it were plaintext.
+    #[test]
+    fn an_unknown_chunk_encoding_is_refused() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert(
+            compression::CHUNK_ENCODING_HEADER,
+            axum::http::HeaderValue::from_static("gzip"),
+        );
+
+        let error = chunk_encoding(&headers).expect_err("gzip is not a chunk encoding here");
+
+        assert!(error.contains("gzip"), "got: {error}");
+    }
 
     /// Write a manifest and matching `.part` files, as a receiver that had
     /// received `chunks` would have left them.

@@ -28,10 +28,19 @@ mod websocket;
 #[doc(hidden)]
 pub mod wire {
     pub use crate::models::chunk::ChunkJob;
-    pub use crate::transfer::{crypto, http_client, integrity, upload};
+    pub use crate::transfer::{compression, crypto, http_client, integrity, session, upload};
 
     #[cfg(feature = "protocol-v2")]
     pub use crate::transfer::crypto_v2;
+
+    // The v2 wire framing: the codec and the two structured bodies. Exported
+    // here for the same reason `crypto_v2` is — an integration test is a
+    // separate crate, so `#[cfg(test)]` cannot reach it. It has no consumer in
+    // the transfer path yet; the framed session that will call it is the rest of
+    // stage 1b, and until then this is a tested, unlinked wire format, which is
+    // the same state `crypto_v2` shipped in.
+    #[cfg(feature = "protocol-v2")]
+    pub use crate::transfer::frame;
 }
 
 use services::local_transfer_file_service::LocalTransferFileService;

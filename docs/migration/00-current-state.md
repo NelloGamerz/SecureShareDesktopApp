@@ -174,8 +174,8 @@ layer**, not a file writer.
 
 | Aspect | Value | Evidence |
 |---|---|---|
-| Chunk size | 4 MiB default | `transfer/constants.rs:1` |
-| Concurrency | 4 workers default | `transfer/constants.rs:2` |
+| Chunk size | 16 MiB default (max 32 MiB) | `transfer/constants.rs:1` |
+| Concurrency | 8 in flight default (async task per chunk, semaphore-bounded) | `transfer/constants.rs:2` |
 | Max retries | 4 default | `transfer/constants.rs:3` |
 | Retry delays | `2^min(attempt,3)` → 1, 2, 4, 8 s | `transfer/retry.rs:1-3` |
 | Receiver port | 7878, bound `0.0.0.0` | `lib.rs:300`, `constants.rs:4` |

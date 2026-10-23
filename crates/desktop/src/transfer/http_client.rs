@@ -1,6 +1,10 @@
 use crate::{
     models::chunk::ChunkJob,
-    transfer::errors::{Result, TransferError},
+    transfer::{
+        compression::{ChunkEncoding, CHUNK_ENCODING_HEADER, NEGOTIATION_HEADER},
+        constants::{LEGACY_CHUNK_SIZE, MAX_CHUNK_BYTES_HEADER, MAX_CHUNK_SIZE},
+        errors::{Result, TransferError},
+    },
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
@@ -29,6 +33,25 @@ pub struct StartTransferRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PublicKeyResponse {
     pub public_key: String,
+}
+
+/// What `GET /transfer/public-key` told us: the key, and what the receiver can
+/// decode.
+///
+/// The encoding is a capability of the receiver, not of this transfer, which is
+/// why it rides on the handshake that every session performs. A receiver that
+/// predates chunk compression sends no [`NEGOTIATION_HEADER`], and the sender
+/// then keeps sending identity chunks.
+#[derive(Debug, Clone)]
+pub struct ReceiverKey {
+    pub public_key: String,
+    pub chunk_encoding: ChunkEncoding,
+    /// The largest chunk body the receiver said it will accept.
+    ///
+    /// Absent means an installed receiver: its body limit is 10 MiB, so the
+    /// sender plans [`LEGACY_CHUNK_SIZE`] chunks rather than assuming the new
+    /// default and being refused with `413`.
+    pub max_chunk_bytes: usize,
 }
 
 /// The receiver's answer to "which chunks of this transfer do you already
@@ -70,6 +93,33 @@ pub enum SessionStart {
     /// The receiver already had this transfer live, so it kept the key it
     /// already had. The sender must continue with the key it used before.
     AlreadyActive,
+}
+
+/// What a receiver advertised beside its public key.
+///
+/// Absent or unparseable headers are not errors: they are how an installed
+/// receiver answers, and the safe reading of silence is always the old
+/// behaviour — identity chunks at the legacy size.
+fn advertised_limits(headers: &reqwest::header::HeaderMap) -> (ChunkEncoding, usize) {
+    let encoding = headers
+        .get(NEGOTIATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(ChunkEncoding::parse)
+        .unwrap_or_default();
+
+    /*
+     * Clamped on this side as well: a peer cannot raise this sender's memory
+     * bound past `MAX_CHUNK_SIZE`, whatever number it puts in the header.
+     */
+    let max_chunk_bytes = headers
+        .get(MAX_CHUNK_BYTES_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_CHUNK_SIZE))
+        .unwrap_or(LEGACY_CHUNK_SIZE);
+
+    (encoding, max_chunk_bytes)
 }
 
 #[derive(Clone)]
@@ -246,6 +296,7 @@ impl HttpClient {
         job: &ChunkJob,
         body: Vec<u8>,
         nonce: Vec<u8>,
+        encoding: ChunkEncoding,
     ) -> Result<()> {
         let base = Self::normalize_endpoint(endpoint);
         let url = format!("{base}/transfer/chunk");
@@ -257,10 +308,11 @@ impl HttpClient {
             chunk=job.index,
             body_size=body.len(),
             nonce_size=nonce.len(),
+            encoding=encoding.as_str(),
             "sending encrypted chunk"
         );
 
-        let response = self
+        let mut request = self
             .0
             .post(url)
             .header("Authorization", format!("Bearer {token}"))
@@ -270,10 +322,18 @@ impl HttpClient {
             .header("Total-Chunks", job.total)
             .header("Relative-Path", &job.relative_path)
             .header("Chunk-Nonce", nonce_encoded)
-            .header("Encryption", "AES-256-GCM")
-            .body(body)
-            .send()
-            .await?;
+            .header("Encryption", "AES-256-GCM");
+
+        /*
+         * Only present when the body is compressed. An identity chunk carries
+         * no header, so the request is byte-for-byte what a receiver without
+         * compression support has always received.
+         */
+        if encoding != ChunkEncoding::Identity {
+            request = request.header(CHUNK_ENCODING_HEADER, encoding.as_str());
+        }
+
+        let response = request.body(body).send().await?;
 
         let status = response.status();
 
@@ -306,7 +366,7 @@ impl HttpClient {
         )))
     }
 
-    pub async fn get_public_key(&self, endpoint: &str, token: &str) -> Result<String> {
+    pub async fn get_public_key(&self, endpoint: &str, token: &str) -> Result<ReceiverKey> {
         let base = Self::normalize_endpoint(endpoint);
         let url = format!("{base}/transfer/public-key");
 
@@ -339,13 +399,77 @@ impl HttpClient {
             )));
         }
 
+        let (chunk_encoding, max_chunk_bytes) = advertised_limits(response.headers());
+
         let response: PublicKeyResponse = response
             .json()
             .await
             .map_err(|e| TransferError::Receiver(format!("invalid public key response: {}", e)))?;
 
-        tracing::debug!("receiver public key fetched successfully");
+        tracing::debug!(
+            chunk_encoding = chunk_encoding.as_str(),
+            max_chunk_bytes,
+            "receiver public key fetched successfully"
+        );
 
-        Ok(response.public_key)
+        Ok(ReceiverKey {
+            public_key: response.public_key,
+            chunk_encoding,
+            max_chunk_bytes,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    /// An installed receiver sends neither header. Reading that as anything but
+    /// the old behaviour would break every peer that has not been updated.
+    #[test]
+    fn silence_is_identity_at_the_legacy_size() {
+        assert_eq!(
+            advertised_limits(&HeaderMap::new()),
+            (ChunkEncoding::Identity, LEGACY_CHUNK_SIZE)
+        );
+    }
+
+    #[test]
+    fn advertised_limits_are_read_off_the_handshake() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert(
+            NEGOTIATION_HEADER,
+            HeaderValue::from_static(crate::transfer::compression::ZSTD_NAME),
+        );
+
+        headers.insert(MAX_CHUNK_BYTES_HEADER, HeaderValue::from_static("16777216"));
+
+        assert_eq!(
+            advertised_limits(&headers),
+            (ChunkEncoding::Zstd, 16 * 1024 * 1024)
+        );
+    }
+
+    /// A peer cannot talk this build into a larger memory bound than it allows,
+    /// and a nonsense value is ignored rather than adopted.
+    #[test]
+    fn an_oversized_or_malformed_chunk_limit_is_clamped_or_ignored() {
+        for (value, expected) in [
+            ("999999999999", MAX_CHUNK_SIZE),
+            ("0", LEGACY_CHUNK_SIZE),
+            ("not a number", LEGACY_CHUNK_SIZE),
+        ] {
+            let mut headers = HeaderMap::new();
+
+            headers.insert(MAX_CHUNK_BYTES_HEADER, HeaderValue::from_static(value));
+
+            assert_eq!(
+                advertised_limits(&headers).1,
+                expected,
+                "header value {value:?} was not handled as expected"
+            );
+        }
     }
 }

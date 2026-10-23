@@ -639,8 +639,8 @@ shape:
 
 | Concern | Current state | Target |
 |---|---|---|
-| Memory per transfer | `concurrency × (chunk + ciphertext)` — bounded, documented in `docs/PERFORMANCE.md:10` | Unchanged; keep 4 MiB chunks, add a global in-flight byte budget |
-| Concurrency | Fixed 4 workers; **one process-wide write mutex** serializes all receivers (`transfer/writer.rs` `state.guard`) | Per-transfer/per-file locks + a bounded global semaphore. Flagged P1 in `docs/IMPROVEMENT_ROADMAP.md:20` |
+| Memory per transfer | `concurrency × (chunk + ciphertext)` — bounded by a semaphore, documented in `docs/PERFORMANCE.md` | Unchanged shape; 16 MiB chunks / 8 in flight by default, negotiated down to the legacy 4 MiB for old receivers |
+| Concurrency | Task-per-chunk dispatch bounded by a semaphore (8 by default); **one process-wide write mutex** serializes all receivers (`transfer/writer.rs` `state.guard`) | Per-transfer/per-file locks + a bounded global semaphore. Flagged P1 in `docs/IMPROVEMENT_ROADMAP.md:20` |
 | Backpressure | `mpsc::unbounded_channel` in `manager.rs:158` and the WS sender (`websocket/sender.rs:4-7`) — **unbounded** | Bounded channels; `send().await` applies backpressure instead of growing the heap |
 | Completion detection | `(0..total).all(metadata(part).is_ok())` — one `stat` per chunk per completion (`transfer/writer.rs:723`) | Bitmap in SQLite + in-memory counter; O(1) |
 | Large files | Streaming, chunked — sound | Add whole-file BLAKE3 verification (currently **absent**: `transfer/checksum.rs` is a 0-byte stub) |

@@ -31,6 +31,7 @@
 use crate::models::file_info::FileInfo;
 use crate::models::transfer::ConnectionType;
 use crate::transfer::atomic_file;
+use crate::transfer::integrity::ExpectedTransfer;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -45,6 +46,13 @@ use vilsend_core::TransferStatus;
 /// A state file carrying any other version is treated as absent rather than
 /// guessed at, so a future format cannot be silently misread by this one.
 pub const STATE_VERSION: u32 = 1;
+
+/// The on-disk shape of a transfer's digest plan.
+///
+/// Kept in its own file rather than in [`PersistedTransfer`] because it is large
+/// — one digest per chunk — and the state file is rewritten at every checkpoint
+/// while a transfer runs. The plan changes once, when it is worked out.
+pub const PLAN_VERSION: u32 = 1;
 
 /// A transfer's secrets, kept in the keychain rather than beside its plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +192,14 @@ pub struct PersistedFile {
     pub relative_path: String,
     /// Its size in bytes when the transfer was planned.
     pub size: u64,
+    /// When it was last modified, in nanoseconds since the Unix epoch, as the
+    /// scan recorded it.
+    ///
+    /// `None` for a record written before this field existed, or on a platform
+    /// that reports no modification time. A missing stamp is never trusted: the
+    /// digest plan is recomputed rather than reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_nanos: Option<u64>,
 }
 
 /// One chunk the receiver has acknowledged.
@@ -191,6 +207,13 @@ pub struct PersistedFile {
 pub struct PersistedChunk {
     pub file_id: String,
     pub chunk_index: u64,
+}
+
+/// A transfer's digest plan, as its own file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedPlan {
+    version: u32,
+    expected: ExpectedTransfer,
 }
 
 /// Everything about a transfer that is safe to keep in the clear.
@@ -275,6 +298,7 @@ impl PersistedTransfer {
                 path: PathBuf::from(&file.path),
                 relative_path: file.relative_path.clone(),
                 size: file.size,
+                modified_nanos: file.modified_nanos,
             })
             .collect()
     }
@@ -295,6 +319,15 @@ fn state_path(state_dir: &Path, transfer_id: &str) -> io::Result<PathBuf> {
     }
 
     Ok(state_dir.join(format!("{transfer_id}.json")))
+}
+
+/// Where a transfer's digest plan lives, given the state directory.
+///
+/// The extension is deliberately not `json`: [`TransferStore::load_all`] reads
+/// every `*.json` as a transfer record, and a plan is not one. The base name is
+/// the transfer id that [`state_path`] already validated.
+fn plan_path(state_dir: &Path, transfer_id: &str) -> io::Result<PathBuf> {
+    Ok(state_path(state_dir, transfer_id)?.with_extension("plan"))
 }
 
 /// The sender's persisted transfers: clear records on disk, secrets in a
@@ -329,6 +362,94 @@ impl TransferStore {
         let bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
 
         atomic_file::write_atomic(&state_path(&self.state_dir, &record.transfer_id)?, &bytes).await
+    }
+
+    /// Write a transfer's digest plan, replacing any earlier one.
+    ///
+    /// The plan is what lets a resume skip re-reading files that have not
+    /// changed. A failure to write it is not fatal: the resume simply plans
+    /// again, which is the behaviour every build had before this file existed.
+    pub async fn save_plan(
+        &self,
+        transfer_id: &str,
+        expected: &ExpectedTransfer,
+    ) -> io::Result<()> {
+        fs::create_dir_all(&self.state_dir).await?;
+
+        let plan = PersistedPlan {
+            version: PLAN_VERSION,
+            expected: expected.clone(),
+        };
+
+        let bytes = serde_json::to_vec(&plan).map_err(io::Error::other)?;
+
+        atomic_file::write_atomic(&plan_path(&self.state_dir, transfer_id)?, &bytes).await
+    }
+
+    /// Read a transfer's digest plan, if one was written.
+    ///
+    /// An unreadable or future-versioned plan reads as absent rather than as an
+    /// error: the caller's response to both is the same — work the digests out
+    /// again — and that is always safe.
+    pub async fn load_plan(&self, transfer_id: &str) -> Option<ExpectedTransfer> {
+        let path = match plan_path(&self.state_dir, transfer_id) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(%error, "refusing to read a transfer plan file");
+                return None;
+            }
+        };
+
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(
+                    transfer_id,
+                    path = %path.display(),
+                    %error,
+                    "could not read a transfer plan file"
+                );
+
+                return None;
+            }
+        };
+
+        let plan: PersistedPlan = match serde_json::from_slice(&bytes) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(
+                    transfer_id,
+                    path = %path.display(),
+                    %error,
+                    "ignoring an unreadable transfer plan file; the digests will be worked out again"
+                );
+
+                return None;
+            }
+        };
+
+        if plan.version != PLAN_VERSION {
+            tracing::warn!(
+                transfer_id,
+                path = %path.display(),
+                version = plan.version,
+                "ignoring a transfer plan file from another version"
+            );
+
+            return None;
+        }
+
+        Some(plan.expected)
+    }
+
+    /// Remove a transfer's digest plan. Absent is not an error.
+    pub async fn remove_plan(&self, transfer_id: &str) -> io::Result<()> {
+        match fs::remove_file(plan_path(&self.state_dir, transfer_id)?).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Store a transfer's secrets.
@@ -435,12 +556,16 @@ impl TransferStore {
         records
     }
 
-    /// Forget a transfer: its record and its secrets.
+    /// Forget a transfer: its record, its plan and its secrets.
     ///
-    /// Both are removed even if one of them fails, so that a failure to clear
-    /// one half cannot leave the other behind forever.
+    /// All three are removed even if one of them fails, so that a failure to
+    /// clear one part cannot leave the others behind forever.
     pub async fn remove(&self, transfer_id: &str) -> io::Result<()> {
         let secrets = self.secrets.delete(transfer_id);
+
+        if let Err(error) = self.remove_plan(transfer_id).await {
+            tracing::warn!(transfer_id, %error, "could not remove a transfer's plan file");
+        }
 
         let path = state_path(&self.state_dir, transfer_id)?;
 
@@ -503,6 +628,7 @@ mod tests {
                 path: "/tmp/a.bin".into(),
                 relative_path: "a.bin".into(),
                 size: 2048,
+                modified_nanos: None,
             }],
             total_bytes: 2048,
             total_chunks: 2,
@@ -895,5 +1021,143 @@ mod tests {
         assert_eq!(infos[0].path, PathBuf::from("/tmp/a.bin"));
         assert_eq!(infos[0].relative_path, "a.bin");
         assert_eq!(infos[0].size, 2048);
+    }
+
+    /*
+     * ----------------------------------------------------------------------
+     * The digest plan is its own file
+     * ----------------------------------------------------------------------
+     */
+
+    fn plan_for(transfer_id: &str) -> ExpectedTransfer {
+        use crate::transfer::integrity::{ExpectedChunk, ExpectedFile};
+
+        ExpectedTransfer {
+            transfer_id: transfer_id.to_string(),
+            files: vec![ExpectedFile {
+                file_id: "f-1".into(),
+                relative_path: "a.bin".into(),
+                size: 8,
+                sha256: "ab".repeat(32),
+                chunks: vec![
+                    ExpectedChunk {
+                        index: 0,
+                        length: 4,
+                        sha256: "01".repeat(32),
+                    },
+                    ExpectedChunk {
+                        index: 1,
+                        length: 4,
+                        sha256: "02".repeat(32),
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_digest_plan_survives_a_restart() {
+        let scratch = TempDir::new();
+        let dir = scratch.path().join("state");
+        let expected = plan_for("t-1");
+
+        {
+            let store = store(&scratch);
+            store
+                .save_plan("t-1", &expected)
+                .await
+                .expect("saving the plan");
+        }
+
+        let reopened = TransferStore::in_memory(dir);
+
+        assert_eq!(
+            reopened.load_plan("t-1").await,
+            Some(expected),
+            "a resume must be able to reuse the digests a previous run worked out"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_transfer_removes_its_plan_too() {
+        let scratch = TempDir::new();
+        let store = store(&scratch);
+
+        store.save(&record("t-1")).await.expect("saving");
+        store
+            .save_plan("t-1", &plan_for("t-1"))
+            .await
+            .expect("saving the plan");
+
+        store.remove("t-1").await.expect("removing");
+
+        assert!(store.load_plan("t-1").await.is_none());
+        assert!(!scratch.path().join("state").join("t-1.plan").exists());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_plan_reads_as_absent() {
+        let scratch = TempDir::new();
+        let state_dir = scratch.path().join("state");
+        fs::create_dir_all(&state_dir).await.expect("mkdir");
+
+        fs::write(state_dir.join("t-1.plan"), b"not a plan")
+            .await
+            .expect("writing");
+
+        let store = TransferStore::in_memory(state_dir);
+
+        assert!(
+            store.load_plan("t-1").await.is_none(),
+            "a plan that cannot be read must be worked out again, not guessed at"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_file_is_not_mistaken_for_a_transfer_record() {
+        let scratch = TempDir::new();
+        let store = store(&scratch);
+
+        store.save(&record("t-1")).await.expect("saving");
+        store
+            .save_plan("t-1", &plan_for("t-1"))
+            .await
+            .expect("saving the plan");
+
+        let loaded = store.load_all().await;
+
+        assert_eq!(loaded.len(), 1, "only the record is a record");
+        assert_eq!(loaded[0].transfer_id, "t-1");
+    }
+
+    #[tokio::test]
+    async fn a_record_written_before_the_stamp_existed_still_loads() {
+        let scratch = TempDir::new();
+        let state_dir = scratch.path().join("state");
+        fs::create_dir_all(&state_dir).await.expect("mkdir");
+
+        let mut record = record("t-1");
+        record.files[0].modified_nanos = Some(123);
+
+        let mut value = serde_json::to_value(&record).expect("serialising");
+
+        value["files"][0]
+            .as_object_mut()
+            .expect("the file object")
+            .remove("modified_nanos");
+
+        fs::write(state_dir.join("t-1.json"), value.to_string())
+            .await
+            .expect("writing");
+
+        let loaded = TransferStore::in_memory(state_dir)
+            .load("t-1")
+            .await
+            .expect("an older record must still load");
+
+        assert_eq!(
+            loaded.files[0].modified_nanos, None,
+            "an absent stamp reads as unknown, which is never trusted"
+        );
     }
 }

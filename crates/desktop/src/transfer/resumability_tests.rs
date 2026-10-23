@@ -875,7 +875,13 @@ async fn a_chunk_that_goes_bad_mid_transfer_is_not_swallowed() {
 
     // Frozen before the transfer starts, so that the first chunk is written and
     // the rest are still on their way when the damage happens.
-    let guard = Arc::clone(&receiver.state.guard);
+    //
+    // The lock under test's transfer, not a process-wide one: the receiver
+    // serialises per transfer now, so this freezes exactly this transfer's chunk
+    // writes and nothing else. The invariant the test asserts is unchanged — a
+    // chunk that goes bad mid-flight is not swallowed — and the mechanism that
+    // makes the window reachable is the same, one scope narrower.
+    let guard = receiver.state.transfer_lock(TRANSFER).await;
     let held = guard.lock().await;
 
     let sender = harness.sender(&receiver).await;
@@ -1058,7 +1064,7 @@ async fn a_file_that_does_not_match_the_senders_digests_is_not_delivered() {
      * told to expect by way of its own record — and the file they assemble into
      * is not the one the sender described.
      */
-    let guard = Arc::clone(&receiver.state.guard);
+    let guard = receiver.state.transfer_lock(TRANSFER).await;
     let held = guard.lock().await;
 
     let sender = harness.sender(&receiver).await;
@@ -1120,4 +1126,61 @@ async fn a_file_that_does_not_match_the_senders_digests_is_not_delivered() {
 /// How many times chunk `index` reached the receiver.
 fn receiver_attempts(harness: &Harness, index: u64) -> usize {
     harness.faults.attempts_of(index)
+}
+
+/// The receiver's write locking is per transfer, and that is load-bearing.
+///
+/// The receiver used to serialise every chunk of every transfer through one
+/// process-wide `tokio::sync::Mutex`, held from before the directory was created
+/// until after the file had been merged. One transfer whose socket stalled held
+/// it for as long as it stalled, and every other transfer on the device waited.
+///
+/// That is survivable when each request is short and independent. It is not
+/// survivable for the long-lived stream a framed v2 session is, which is why the
+/// lock became per transfer. This asserts both halves of the contract, because
+/// the refactor is worthless if either fails: different transfers must not wait
+/// on each other, and one transfer's own chunks must still serialise — its
+/// manifest is one document, and two chunks reading and rewriting it at once
+/// would lose an entry.
+///
+/// It is the test that fails if someone reintroduces a shared lock.
+#[tokio::test]
+async fn one_transfers_write_lock_does_not_block_another() {
+    let harness = Harness::new(2).await;
+    let receiver = harness.receiver().await;
+
+    let first = receiver.state.transfer_lock("t-one").await;
+    let second = receiver.state.transfer_lock("t-two").await;
+
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "two transfers must not share a write lock, or one stalls the other"
+    );
+
+    let held = first.lock().await;
+
+    assert!(
+        second.try_lock().is_ok(),
+        "a different transfer must be able to write while the first holds its lock"
+    );
+
+    drop(held);
+
+    /*
+     * And the other half: the same transfer gets the same lock, so its own two
+     * chunks cannot interleave their manifest read-modify-write.
+     */
+    let again = receiver.state.transfer_lock("t-one").await;
+
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "a transfer must get the same lock every time, or its chunks would not serialise"
+    );
+
+    let _held = again.lock().await;
+
+    assert!(
+        first.try_lock().is_err(),
+        "one transfer's own chunks must serialise against each other"
+    );
 }

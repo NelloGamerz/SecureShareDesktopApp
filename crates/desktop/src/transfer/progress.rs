@@ -58,6 +58,7 @@ mod tests {
                 path: PathBuf::from(format!("file-{index}.bin")),
                 relative_path: format!("file-{index}.bin"),
                 size: *size,
+                modified_nanos: None,
             })
             .collect();
 
@@ -83,6 +84,7 @@ mod tests {
             running: AtomicBool::new(false),
             resume_lock: tokio::sync::Mutex::new(()),
             expected: Mutex::new(None),
+            plan_stamps: Mutex::new(std::collections::HashMap::new()),
         }
     }
 

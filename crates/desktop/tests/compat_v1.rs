@@ -32,7 +32,13 @@
 
 mod v1_fixture;
 
-use server_frontend_lib::wire::{crypto, http_client::HttpClient, integrity, upload, ChunkJob};
+use server_frontend_lib::wire::{
+    compression, crypto,
+    http_client::HttpClient,
+    integrity,
+    session::{LegacyV1Session, OpenRequest, ProtocolSession},
+    upload, ChunkJob,
+};
 use v1_fixture::{start, Fixture, CHUNK_HEADERS};
 
 /// The bearer token the fixture's presence-only check accepts. v1 never reads
@@ -92,68 +98,57 @@ fn jobs_of(source: &std::path::Path, len: usize) -> Vec<ChunkJob> {
 /// A sender with the v1 key material, exactly as `UploadManager::start` builds
 /// it. Returned so a test can drive individual chunks rather than only the
 /// whole-transfer helper below.
+///
+/// The wire is held as a `LegacyV1Session`, which is what `UploadManager` now
+/// drives. Using the session rather than an `HttpClient` directly is what keeps
+/// this file's claim true — that it exercises the *real* sender path and
+/// re-implements nothing — after the engine moved behind the session seam.
+///
+/// The raw `HttpClient` is kept beside it for the two tests that deliberately
+/// send a payload the session would never produce — a tampered ciphertext, and a
+/// chunk sealed with the v2 AEAD. The session seals plaintext, so a test that
+/// needs control of the *ciphertext* has to build the request itself; that is
+/// the same reason the header test below drives `reqwest` directly.
 struct Sender {
+    session: LegacyV1Session,
     client: HttpClient,
     endpoint: String,
     transfer_key: [u8; 32],
 }
 
 impl Sender {
-    /// Fetch the receiver's public key, derive the transfer key, and open the
-    /// session — the v1 handshake, three calls in order, using the product's
-    /// own crypto exactly as `UploadManager::start` does.
+    /// Run the v1 handshake — fetch the receiver's public key, agree a secret,
+    /// open the session — through the session, exactly as
+    /// `UploadManager::start` does, and keep the key it settled on.
     async fn connect(fixture: &Fixture, len: usize) -> Self {
-        let client = HttpClient::new();
-        let endpoint = fixture.endpoint.clone();
+        let session = LegacyV1Session::to(fixture.endpoint.clone(), TOKEN);
 
-        let receiver_public_key = client
-            .get_public_key(&endpoint, TOKEN)
-            .await
-            .expect("the fixture must serve its public key");
-
-        let receiver_public = crypto::decode_public_key(&receiver_public_key)
-            .expect("the fixture sends a 32-byte key");
-
-        let ephemeral = crypto::generate_ephemeral_keypair();
-
-        let shared = crypto::derive_shared_secret(&ephemeral.private_key, &receiver_public);
-
-        let transfer_key = crypto::derive_transfer_key(&shared).expect("a 32-byte HKDF output");
-
-        client
-            .start_transfer(
-                &endpoint,
-                TOKEN,
-                TRANSFER_ID,
-                &crypto::encode_public_key(&ephemeral.public_key),
-                len as u64,
+        let opened = session
+            .open(OpenRequest {
+                transfer_id: TRANSFER_ID,
+                file_size: len as u64,
                 // Nothing to describe: this test is about the v1 request shape,
                 // and the field that carries digests is covered separately by
                 // `a_v1_receiver_ignores_the_digests_a_newer_sender_describes`.
-                None,
-            )
+                expected: None,
+                existing_key: None,
+            })
             .await
             .expect("the fixture must accept the session");
 
         Self {
-            client,
-            endpoint,
-            transfer_key,
+            session,
+            client: HttpClient::new(),
+            endpoint: fixture.endpoint.clone(),
+            transfer_key: opened.transfer_key,
         }
     }
 
     /// Upload one chunk through the real sender path.
     async fn send(&self, job: &ChunkJob) {
-        upload::upload_chunk(
-            &self.client,
-            &self.endpoint,
-            TOKEN,
-            job,
-            &self.transfer_key,
-            0,
-        )
-        .await
-        .expect("the v1 receiver must accept this chunk");
+        upload::upload_chunk(&self.session, job, 0)
+            .await
+            .expect("the v1 receiver must accept this chunk");
     }
 }
 
@@ -335,7 +330,14 @@ async fn the_fixture_rejects_a_chunk_it_cannot_decrypt() {
 
     let result = sender
         .client
-        .send(&sender.endpoint, TOKEN, job, tampered, encrypted.nonce)
+        .send(
+            &sender.endpoint,
+            TOKEN,
+            job,
+            tampered,
+            encrypted.nonce,
+            compression::ChunkEncoding::Identity,
+        )
         .await;
 
     assert!(
@@ -556,10 +558,7 @@ async fn a_protocol_v2_build_speaks_v1_and_reports_it_as_the_fallback() {
 async fn a_v1_receiver_ignores_the_digests_a_newer_sender_describes() {
     let fixture = start().await;
 
-    let client = HttpClient::new();
-    let endpoint = fixture.endpoint.clone();
-
-    let ephemeral = crypto::generate_ephemeral_keypair();
+    let session = LegacyV1Session::to(fixture.endpoint.clone(), TOKEN);
 
     let described = integrity::ExpectedTransfer {
         transfer_id: TRANSFER_ID.into(),
@@ -576,15 +575,13 @@ async fn a_v1_receiver_ignores_the_digests_a_newer_sender_describes() {
         }],
     };
 
-    client
-        .start_transfer(
-            &endpoint,
-            TOKEN,
-            TRANSFER_ID,
-            &crypto::encode_public_key(&ephemeral.public_key),
-            4,
-            Some(&described),
-        )
+    session
+        .open(OpenRequest {
+            transfer_id: TRANSFER_ID,
+            file_size: 4,
+            expected: Some(&described),
+            existing_key: None,
+        })
         .await
         .expect("a v1 receiver must ignore metadata it does not know and open the session");
 }

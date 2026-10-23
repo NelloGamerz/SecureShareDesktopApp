@@ -1,10 +1,10 @@
 use crate::models::chunk::ChunkJob;
 use crate::services::local_transfer_file_service::LocalTransferFileService;
-use crate::transfer::crypto;
-use crate::transfer::http_client::{HttpClient, SessionStart};
-use crate::transfer::integrity;
+use crate::transfer::http_client::SessionStart;
+use crate::transfer::integrity::{self, ExpectedTransfer};
 use crate::transfer::persist::{PersistedTransfer, TransferSecrets, TransferStore};
 use crate::transfer::resume;
+use crate::transfer::session::{LegacyV1Session, OpenRequest, ProtocolSession};
 use crate::{
     models::transfer::{TransferMetadata, TransferStatus, TransferStatusResponse},
     transfer::{
@@ -105,6 +105,15 @@ impl UploadManager {
         let mut restored = 0;
 
         for record in self.store.load_all().await {
+            /*
+             * Read the digest plan before taking the transfer map's lock: it is
+             * an async read, and a `std::sync::Mutex` must never be held across
+             * an await. It is also optional — a transfer that never had one, or
+             * whose plan file was removed, is restored without it and plans
+             * again when it is first resumed.
+             */
+            let expected = self.store.load_plan(&record.transfer_id).await;
+
             let mut transfers = self.transfers.lock().expect("transfer lock poisoned");
 
             if transfers.contains_key(&record.transfer_id) {
@@ -123,7 +132,7 @@ impl UploadManager {
 
             transfers.insert(
                 record.transfer_id.clone(),
-                Arc::new(restored_state(&record)),
+                Arc::new(restored_state(&record, expected)),
             );
 
             restored += 1;
@@ -148,6 +157,14 @@ impl UploadManager {
         {
             return Err(TransferError::Invalid("transfer already active".into()));
         }
+        /*
+         * The phases below are timed individually. Starting a transfer of any
+         * size spends its time in two places — walking the files and hashing
+         * every byte — and neither emits a progress event, so these lines are
+         * what makes "why has it not started yet?" answerable from the log.
+         */
+        let startup_started = Instant::now();
+
         // let files = scanner::scan(&metadata.file_paths).await?;
         let local_files = self
             .local_files
@@ -168,33 +185,68 @@ impl UploadManager {
             .map(|f| f.file_path.clone())
             .collect::<Vec<_>>();
 
+        let scan_started = Instant::now();
         let files = scanner::scan(&paths).await?;
-        let chunk_size = metadata
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            files = files.len(),
+            elapsed_ms = scan_started.elapsed().as_millis() as u64,
+            "startup phase: files scanned"
+        );
+
+        /*
+         * The wire this transfer will run on, behind the session seam. Building
+         * it here rather than reaching for an `HttpClient` at each call site is
+         * what leaves room for a second session type later — a failover replaces
+         * this value, and nothing downstream changes.
+         */
+        let session = LegacyV1Session::to(metadata.endpoint.clone(), metadata.auth_token.clone());
+
+        /*
+         * What the receiver will accept, asked before anything is planned.
+         *
+         * Chunk size is baked into the jobs and into the digests the receiver is
+         * later checked against, so it cannot be revised after the handshake.
+         * Asking first is also what keeps this sender compatible: an installed
+         * receiver advertises nothing and gets the legacy 4 MiB chunks its 10 MiB
+         * body limit accepts, instead of 16 MiB chunks it would refuse with 413.
+         */
+        let capabilities_started = Instant::now();
+        let capabilities = session.capabilities().await?;
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            max_chunk_bytes = capabilities.max_chunk_bytes,
+            elapsed_ms = capabilities_started.elapsed().as_millis() as u64,
+            "startup phase: receiver capabilities read"
+        );
+
+        let requested_chunk_size = metadata
             .chunk_size
             .unwrap_or(constants::DEFAULT_CHUNK_SIZE)
             .max(1);
+
+        /*
+         * Clamp to what the receiver accepts, and to what this build's body
+         * limit and frame cap are derived from. Reporting the clamp is what turns
+         * a silent `413` on every chunk into one line in the log at plan time.
+         */
+        let chunk_size = requested_chunk_size
+            .min(capabilities.max_chunk_bytes)
+            .min(constants::MAX_CHUNK_SIZE);
+
+        if chunk_size != requested_chunk_size {
+            tracing::warn!(
+                transfer_id = %metadata.transfer_id,
+                requested_chunk_size,
+                receiver_max = capabilities.max_chunk_bytes,
+                chunk_size,
+                "chunk size exceeds what this receiver accepts; clamping it"
+            );
+        }
+
         let jobs = chunker::jobs(&metadata.transfer_id, &files, chunk_size);
-        let client = HttpClient::new();
-
-        let receiver_public_key = client
-            .get_public_key(&metadata.endpoint, &metadata.auth_token)
-            .await?;
-
-        let receiver_public =
-            crypto::decode_public_key(&receiver_public_key).map_err(TransferError::Crypto)?;
-
-        let ephemeral = crypto::generate_ephemeral_keypair();
-
-        let shared = crypto::derive_shared_secret(&ephemeral.private_key, &receiver_public);
-
-        let transfer_key = crypto::derive_transfer_key(&shared).map_err(TransferError::Invalid)?;
-
-        let hash = Sha256::digest(transfer_key);
-
-        tracing::info!(
-            transfer_key_hash=%hex::encode(hash),
-            "sender transfer key fingerprint"
-        );
 
         let total_bytes = files.iter().map(|f| f.size).sum();
 
@@ -203,19 +255,76 @@ impl UploadManager {
          * first chunk moves. The receiver is handed these with the session so
          * that it can tell the file it assembles from one that merely looks
          * assembled — it has no other expectation it did not write itself.
+         *
+         * The report is the only thing the UI hears between "start" and the
+         * first acknowledged chunk, and for a large file that gap is the whole
+         * complaint: it looks frozen. The bytes reported are bytes *hashed*,
+         * not sent, so the first upload event starts the bar again from zero.
          */
-        let expected = integrity::plan(&metadata.transfer_id, &files, chunk_size).await?;
+        let plan_started = Instant::now();
+        let progress_id = metadata.transfer_id.clone();
+        let progress_events = Arc::clone(&self.events);
+        let progress: integrity::PlanProgress = Arc::new(move |hashed, total| {
+            progress_events.emit(DomainEvent::TransferProgress {
+                progress: vilsend_core::upload_progress(
+                    progress_id.clone(),
+                    hashed,
+                    total,
+                    plan_started.elapsed().as_secs_f64(),
+                    TransferStatus::Queued,
+                ),
+            });
+        });
 
-        client
-            .start_transfer(
-                &metadata.endpoint,
-                &metadata.auth_token,
-                &metadata.transfer_id,
-                &crypto::encode_public_key(&ephemeral.public_key),
-                total_bytes,
-                Some(&expected),
-            )
+        let expected = integrity::plan_with_progress(
+            &metadata.transfer_id,
+            &files,
+            chunk_size,
+            Some(progress),
+        )
+        .await?;
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            chunks = expected.files.iter().map(|file| file.chunks.len()).sum::<usize>(),
+            elapsed_ms = plan_started.elapsed().as_millis() as u64,
+            "startup phase: digests planned"
+        );
+
+        /*
+         * The handshake, and the key it settles on.
+         *
+         * The session derives this, not the engine. The two versions derive it
+         * differently — v1's KDF has no salt, v2's is salted with nonces that
+         * only exist once the handshake has run — so an engine that derived it
+         * itself could only ever speak v1. See `transfer::session`.
+         */
+        let handshake_started = Instant::now();
+        let opened = session
+            .open(OpenRequest {
+                transfer_id: &metadata.transfer_id,
+                file_size: total_bytes,
+                expected: Some(&expected),
+                existing_key: None,
+            })
             .await?;
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            start = ?opened.start,
+            elapsed_ms = handshake_started.elapsed().as_millis() as u64,
+            "startup phase: handshake complete"
+        );
+
+        let transfer_key = opened.transfer_key;
+
+        let hash = Sha256::digest(transfer_key);
+
+        tracing::info!(
+            transfer_key_hash=%hex::encode(hash),
+            "sender transfer key fingerprint"
+        );
+
         let concurrency = metadata
             .concurrency
             .unwrap_or(constants::DEFAULT_CONCURRENCY);
@@ -246,7 +355,11 @@ impl UploadManager {
             completed: Mutex::new(std::collections::HashSet::new()),
             running: false.into(),
             resume_lock: tokio::sync::Mutex::new(()),
-            expected: Mutex::new(Some(expected)),
+            // Cloned so the plan can also be written beside the transfer's state
+            // without borrowing across the state it now lives in.
+            expected: Mutex::new(Some(expected.clone())),
+            // The scan's own stamps are the ones this plan was made against.
+            plan_stamps: Mutex::new(std::collections::HashMap::new()),
         });
         let response = state.snapshot();
         self.transfers
@@ -262,8 +375,16 @@ impl UploadManager {
          */
         self.store_secrets(&state);
         self.persist(&state).await;
+        self.persist_plan(&metadata.transfer_id, &expected).await;
 
-        self.spawn_scheduler(state, jobs);
+        self.spawn_scheduler(state, jobs, Arc::new(session));
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            total_bytes,
+            elapsed_ms = startup_started.elapsed().as_millis() as u64,
+            "transfer started"
+        );
 
         Ok(response)
     }
@@ -279,10 +400,14 @@ impl UploadManager {
     /// transfer id already in the map, and `resume` holds the transfer's
     /// [`UploadState::resume_lock`] while it decides, so two resumes cannot both
     /// find an idle transfer and start a run each.
-    fn spawn_scheduler(&self, state: Arc<UploadState>, jobs: Vec<ChunkJob>) {
+    fn spawn_scheduler(
+        &self,
+        state: Arc<UploadState>,
+        jobs: Vec<ChunkJob>,
+        session: Arc<dyn ProtocolSession>,
+    ) {
         let manager = self.clone();
         let concurrency = state.concurrency;
-        let token = state.auth_token();
 
         state.set_running(true);
 
@@ -309,7 +434,8 @@ impl UploadManager {
                 });
                 checkpointing.checkpoint(&s);
             });
-            let result = scheduler::run(jobs, concurrency, state.clone(), token, on_success).await;
+            let result =
+                scheduler::run(jobs, concurrency, state.clone(), session, on_success).await;
 
             if state.cancelled.load(Ordering::Relaxed) {
                 state.set_running(false);
@@ -331,6 +457,8 @@ impl UploadManager {
                     manager.events.emit(DomainEvent::TransferCompleted {
                         progress: progress::make(&state),
                     });
+
+                    manager.forget_plan(&state.transfer_id).await;
 
                     TransferEvent::Completed(state.transfer_id.clone())
                 }
@@ -383,6 +511,7 @@ impl UploadManager {
     /// Returns the response once the workers are running, so the caller sees the
     /// transfer as active immediately.
     async fn continue_transfer(&self, state: &Arc<UploadState>) -> Result<TransferStatusResponse> {
+        let resume_started = Instant::now();
         let transfer_id = state.transfer_id.clone();
 
         /*
@@ -439,7 +568,14 @@ impl UploadManager {
             );
         }
 
-        let client = HttpClient::new();
+        /*
+         * The wire this resume will run on. A resume that reopens a session the
+         * receiver still has keeps the key it already had — `reopen_session`
+         * decides that — so the session is built from the credentials this
+         * transfer is actually going to use, not from whatever the endpoint
+         * field says.
+         */
+        let session = LegacyV1Session::to(state.endpoint.clone(), token.clone());
 
         /*
          * What does the receiver already have? A receiver that has never heard
@@ -447,39 +583,78 @@ impl UploadManager {
          * read as holding nothing — the safe interpretation, since it costs a
          * resend rather than a skip.
          */
-        let report = client
-            .transfer_status(&state.endpoint, &token, &transfer_id)
-            .await?;
+        let status_started = Instant::now();
+        let report = session.resume_state(&transfer_id).await?;
 
-        let confirmation = resume::confirmed_chunks(report.as_ref(), &transfer_id, &jobs).await;
-
-        if !confirmation.is_trusted() {
-            tracing::warn!(
-                transfer_id = %transfer_id,
-                rejected = confirmation.rejected.len(),
-                "receiver reported chunks that do not match local metadata; \
-                 those chunks will be sent again rather than skipped"
-            );
-        }
+        tracing::info!(
+            transfer_id = %transfer_id,
+            elapsed_ms = status_started.elapsed().as_millis() as u64,
+            "resume phase: receiver state read"
+        );
 
         /*
-         * What the files hash to, if this session does not already know. A
-         * transfer a previous run started carries none in memory — the digests
-         * are derived from the files rather than written to the state file — so
-         * they are worked out here, from the files as they stand now, and
-         * described to the receiver along with the new session. A file that
-         * changed while the transfer was stopped is a file whose chunks no
-         * longer match what was sent before, and the receiver is told the new
-         * truth rather than the old one.
+         * Reuse the plan a previous run left when every file it described is
+         * still the file on disk. This is the phase that used to read and hash
+         * the whole transfer before every resume; with a current plan it costs
+         * one `stat` per file.
+         *
+         * A plan that has fallen behind — a file edited, replaced or removed
+         * since it was written — is not trusted at all. It is recomputed, file
+         * by file, and still reuses the entries whose files are unchanged.
          */
+        let plan_started = Instant::now();
+
+        // The files with whichever stamps the current plan was made against.
+        let files = state.files_with_stamps();
+
         let expected = match state.expected() {
-            Some(expected) => expected,
+            Some(expected)
+                if integrity::plan_is_current(
+                    &transfer_id,
+                    &expected,
+                    &files,
+                    state.chunk_size,
+                )
+                .await =>
+            {
+                tracing::info!(
+                    transfer_id = %transfer_id,
+                    elapsed_ms = plan_started.elapsed().as_millis() as u64,
+                    "resume phase: reused the persisted digest plan; no source file was re-read"
+                );
 
-            None => {
-                let expected =
-                    integrity::plan(&transfer_id, &state.files, state.chunk_size).await?;
+                expected
+            }
 
+            previous => {
+                /*
+                 * Stamp before hashing, not after: a stamp older than the bytes
+                 * a plan describes only ever costs a re-hash on the next resume,
+                 * whereas one newer than them would let a stale plan be reused.
+                 */
+                let stamps = integrity::current_stamps(&files).await;
+
+                let expected = integrity::plan_reusing(
+                    &transfer_id,
+                    &files,
+                    state.chunk_size,
+                    previous.as_ref(),
+                    // No progress report here: a resume's real progress is the
+                    // receiver's acknowledged chunks, and reporting bytes read
+                    // would overwrite that count with something smaller.
+                    None,
+                )
+                .await?;
+
+                state.set_plan_stamps(stamps);
                 state.set_expected(expected.clone());
+                self.persist_plan(&transfer_id, &expected).await;
+
+                tracing::info!(
+                    transfer_id = %transfer_id,
+                    elapsed_ms = plan_started.elapsed().as_millis() as u64,
+                    "resume phase: digest plan recomputed"
+                );
 
                 expected
             }
@@ -488,19 +663,69 @@ impl UploadManager {
         /*
          * Re-establish the session before sending. A receiver that restarted has
          * forgotten the transfer and needs the handshake again; one that never
-         * noticed our absence already has it live and refuses with `CONFLICT`,
-         * keeping the key it had.
+         * noticed our absence already has it live and answers `AlreadyActive`,
+         * keeping the key it had — which is why the key this transfer was using
+         * is handed in.
          */
-        let session = self
-            .reopen_session(state, &client, &token, &transfer_id, Some(&expected))
+        let handshake_started = Instant::now();
+        let opened = session
+            .open(OpenRequest {
+                transfer_id: &transfer_id,
+                file_size: state.total_bytes,
+                expected: Some(&expected),
+                existing_key: Some(key),
+            })
             .await?;
 
-        if session == SessionStart::Established {
+        tracing::info!(
+            transfer_id = %transfer_id,
+            start = ?opened.start,
+            elapsed_ms = handshake_started.elapsed().as_millis() as u64,
+            "resume phase: handshake complete"
+        );
+
+        if opened.start == SessionStart::Established {
             // The receiver derived a fresh key from the ephemeral key just sent,
             // so the one in memory is no longer the one it will decrypt with.
             tracing::info!(
                 transfer_id = %transfer_id,
                 "receiver re-established the session; continuing with a fresh transfer key"
+            );
+
+            state.set_credentials(TransferCredentials {
+                transfer_key: opened.transfer_key,
+                auth_token: token.clone(),
+            });
+
+            self.store_secrets(state);
+        }
+
+        /*
+         * Which report to believe.
+         *
+         * v1 answers `resume_state` before the handshake and leaves
+         * `opened.resume` empty; the v2 framed protocol carries the manifest in
+         * the handshake, so its resume point only exists once the session is up.
+         * Preferring `opened.resume` when it is present covers both without the
+         * engine having to know which protocol it is holding.
+         */
+        let report = opened.resume.as_ref().or(report.as_ref());
+
+        /*
+         * The plan has just been established to describe the files as they are
+         * now, so its per-chunk digests are what a read would produce. Checking
+         * claims against them is the same integrity check without reading the
+         * transfer back off the disk.
+         */
+        let confirmation =
+            resume::confirmed_chunks_with_plan(report, &transfer_id, &jobs, Some(&expected)).await;
+
+        if !confirmation.is_trusted() {
+            tracing::warn!(
+                transfer_id = %transfer_id,
+                rejected = confirmation.rejected.len(),
+                "receiver reported chunks that do not match local metadata; \
+                 those chunks will be sent again rather than skipped"
             );
         }
 
@@ -550,9 +775,11 @@ impl UploadManager {
             });
 
             self.persist(state).await;
+            self.forget_plan(&transfer_id).await;
 
             tracing::info!(
                 transfer_id = %transfer_id,
+                elapsed_ms = resume_started.elapsed().as_millis() as u64,
                 "receiver already holds every chunk; nothing to send"
             );
 
@@ -570,61 +797,17 @@ impl UploadManager {
          */
         state.paused.store(false, Ordering::Relaxed);
 
-        self.spawn_scheduler(Arc::clone(state), missing);
+        self.spawn_scheduler(Arc::clone(state), missing, Arc::new(session));
+
+        tracing::info!(
+            transfer_id = %transfer_id,
+            elapsed_ms = resume_started.elapsed().as_millis() as u64,
+            "transfer resumed"
+        );
 
         // Taken after the workers are up, so the status the caller is handed is
         // the one the transfer is actually in.
         Ok(state.snapshot())
-    }
-
-    /// Open, or re-open, the receiver's session for a transfer, and make sure
-    /// the key in memory is the one the receiver will decrypt with.
-    async fn reopen_session(
-        &self,
-        state: &Arc<UploadState>,
-        client: &HttpClient,
-        token: &str,
-        transfer_id: &str,
-        expected: Option<&integrity::ExpectedTransfer>,
-    ) -> Result<SessionStart> {
-        let ephemeral = crypto::generate_ephemeral_keypair();
-
-        let outcome = client
-            .start_transfer(
-                &state.endpoint,
-                token,
-                transfer_id,
-                &crypto::encode_public_key(&ephemeral.public_key),
-                state.total_bytes,
-                expected,
-            )
-            .await?;
-
-        if outcome == SessionStart::Established {
-            /*
-             * The receiver built its key from the ephemeral public key we just
-             * sent, so derive the matching one and adopt it. The chunks it
-             * already holds are unaffected: it stores them decrypted.
-             */
-            let receiver_public_key = client.get_public_key(&state.endpoint, token).await?;
-
-            let receiver_public =
-                crypto::decode_public_key(&receiver_public_key).map_err(TransferError::Crypto)?;
-
-            let shared = crypto::derive_shared_secret(&ephemeral.private_key, &receiver_public);
-
-            let transfer_key =
-                crypto::derive_transfer_key(&shared).map_err(TransferError::Invalid)?;
-
-            state.set_credentials(TransferCredentials {
-                transfer_key,
-                auth_token: token.to_string(),
-            });
-
-            self.store_secrets(state);
-        }
-
-        Ok(outcome)
     }
 
     /// Record a chunk as acknowledged and checkpoint, at most every
@@ -674,6 +857,32 @@ impl UploadManager {
                 %error,
                 "could not persist transfer state"
             );
+        }
+    }
+
+    /// Write the digest plan beside the transfer's state.
+    ///
+    /// Best-effort, like every other persistence step: a plan that cannot be
+    /// written costs a resume the work of hashing the files again, and nothing
+    /// else.
+    async fn persist_plan(&self, transfer_id: &str, expected: &ExpectedTransfer) {
+        if let Err(error) = self.store.save_plan(transfer_id, expected).await {
+            tracing::warn!(
+                transfer_id,
+                %error,
+                "could not persist the digest plan; a resume will work it out again"
+            );
+        }
+    }
+
+    /// Remove the digest plan of a transfer that no longer needs one.
+    ///
+    /// A delivered transfer will never be resumed, and the plan is one digest
+    /// per chunk. Best-effort: a leftover plan costs disk, not correctness, and
+    /// a reused transfer id is given a fresh one before it is resumed.
+    async fn forget_plan(&self, transfer_id: &str) {
+        if let Err(error) = self.store.remove_plan(transfer_id).await {
+            tracing::warn!(transfer_id, %error, "could not remove a completed transfer's plan");
         }
     }
 
@@ -799,13 +1008,9 @@ impl UploadManager {
          * still loses the transfer to the TTL sweep — only later, and with the
          * bytes sitting there in the meantime.
          */
-        let client = HttpClient::new();
+        let session = LegacyV1Session::to(s.endpoint.clone(), s.auth_token());
 
-        let notice = tokio::time::timeout(
-            RECEIVER_NOTICE_TIMEOUT,
-            client.cancel_transfer(&s.endpoint, &s.auth_token(), id),
-        )
-        .await;
+        let notice = tokio::time::timeout(RECEIVER_NOTICE_TIMEOUT, session.cancel(id)).await;
 
         match notice {
             Ok(Ok(())) => {}
@@ -847,7 +1052,10 @@ impl UploadManager {
 /// again — so a missing secret leaves an empty key rather than failing the
 /// whole restore. Nothing sends with that state; only a resume would, and
 /// resuming is a later step's problem.
-fn restored_state(record: &PersistedTransfer) -> UploadState {
+fn restored_state(
+    record: &PersistedTransfer,
+    expected: Option<crate::transfer::integrity::ExpectedTransfer>,
+) -> UploadState {
     let mut state = UploadState {
         transfer_id: record.transfer_id.clone(),
         // Left empty deliberately: the key and token were never on disk. A
@@ -874,10 +1082,16 @@ fn restored_state(record: &PersistedTransfer) -> UploadState {
         // Nothing is running after a restart.
         running: false.into(),
         resume_lock: tokio::sync::Mutex::new(()),
-        // Derived from the files rather than stored, so it is worked out when
-        // the transfer is next continued — by which time the files, not the
-        // record, are the authority on what is being sent.
-        expected: Mutex::new(None),
+        /*
+         * The digest plan a previous run worked out, when it left one. It is
+         * still only a cache: `continue_transfer` checks every file's stamp
+         * before trusting it, and works the plan out again if any file has
+         * changed since it was written.
+         */
+        expected: Mutex::new(expected),
+        // No refresh yet: the record's stamps are the plan's basis until a
+        // resume finds something changed.
+        plan_stamps: Mutex::new(std::collections::HashMap::new()),
     };
 
     /*
@@ -954,6 +1168,7 @@ mod tests {
                 path: "/tmp/a.bin".into(),
                 relative_path: "a.bin".into(),
                 size: 4096,
+                modified_nanos: None,
             }],
             total_bytes: 4096,
             total_chunks: 4,
@@ -998,6 +1213,53 @@ mod tests {
             "the acknowledged chunks must come back"
         );
         assert_eq!(status.total_bytes, 4096);
+    }
+
+    /// A structurally valid plan for the 4096-byte file in `record`, split into
+    /// four 1024-byte chunks.
+    fn stored_plan() -> ExpectedTransfer {
+        use crate::transfer::integrity::{ExpectedChunk, ExpectedFile};
+
+        ExpectedTransfer {
+            transfer_id: "t-1".into(),
+            files: vec![ExpectedFile {
+                file_id: "f-1".into(),
+                relative_path: "a.bin".into(),
+                size: 4096,
+                sha256: "ff".repeat(32),
+                chunks: (0..4)
+                    .map(|index| ExpectedChunk {
+                        index,
+                        length: 1024,
+                        sha256: format!("{index:02x}").repeat(32),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_restores_the_digest_plan_the_previous_run_left() {
+        let scratch = TempDir::new();
+        let store = Arc::new(TransferStore::in_memory(scratch.path().join("state")));
+
+        store
+            .save(&record("t-1", TransferStatus::Uploading, 0))
+            .await
+            .expect("saving");
+        store
+            .save_plan("t-1", &stored_plan())
+            .await
+            .expect("saving the plan");
+
+        let manager = build_manager(store).await;
+        assert_eq!(manager.restore_persisted().await, 1);
+
+        assert_eq!(
+            manager.get("t-1").expect("the transfer is back").expected(),
+            Some(stored_plan()),
+            "the plan has to come back with the transfer, or the resume hashes everything again"
+        );
     }
 
     #[tokio::test]
@@ -1209,6 +1471,10 @@ mod tests {
             .save(&record("t-1", TransferStatus::Uploading, 2))
             .await
             .expect("saving");
+        store
+            .save_plan("t-1", &stored_plan())
+            .await
+            .expect("saving the plan");
 
         let manager = build_manager(Arc::clone(&store)).await;
         manager.restore_persisted().await;
@@ -1218,6 +1484,10 @@ mod tests {
         assert!(
             !state_dir.join("t-1.json").exists(),
             "a cancelled transfer is not one anybody wants continued"
+        );
+        assert!(
+            !state_dir.join("t-1.plan").exists(),
+            "and neither is its digest plan"
         );
 
         // And a later restart does not bring it back.
@@ -1372,8 +1642,9 @@ mod resume_tests {
     async fn serve_stub() -> (Arc<StubReceiver>, String) {
         let receiver = Arc::new(StubReceiver::default());
 
-        *receiver.public_key.lock().expect("key lock") =
-            crypto::encode_public_key(&crypto::generate_ephemeral_keypair().public_key);
+        *receiver.public_key.lock().expect("key lock") = crate::transfer::crypto::encode_public_key(
+            &crate::transfer::crypto::generate_ephemeral_keypair().public_key,
+        );
 
         let router = Router::new()
             .route("/transfer/start", post(stub_start))
@@ -1405,9 +1676,17 @@ mod resume_tests {
                 path: path.to_path_buf(),
                 relative_path: "a.bin".into(),
                 size,
+                modified_nanos: None,
             }],
             chunk_size,
         )
+    }
+
+    /// The modification stamp a scan of `path` would record.
+    fn record_modified_nanos(path: &std::path::Path) -> Option<u64> {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| crate::models::file_info::modified_nanos(&metadata))
     }
 
     /// A persisted record for that file, as a previous run would have left it.
@@ -1432,6 +1711,7 @@ mod resume_tests {
                 path: path.to_string_lossy().into_owned(),
                 relative_path: "a.bin".into(),
                 size,
+                modified_nanos: record_modified_nanos(path),
             }],
             total_bytes: size,
             total_chunks,
@@ -2307,6 +2587,135 @@ mod resume_tests {
             receiver.received().len(),
             received_before,
             "resuming a transfer with no workers must not send anything by itself"
+        );
+    }
+
+    /*
+     * ----------------------------------------------------------------------
+     * A persisted digest plan is a cache, and a changed file invalidates it
+     * ----------------------------------------------------------------------
+     */
+
+    /// Move a file's modification time forward, the way an edit does.
+    fn edited_now(path: &std::path::Path) {
+        let later = std::time::SystemTime::now() + Duration::from_secs(30);
+
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("opening the source to stamp it")
+            .set_modified(later)
+            .expect("setting the modification time");
+    }
+
+    /// A manager over `store`, with no restore performed yet.
+    async fn manager_for(store: Arc<TransferStore>) -> UploadManager {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("an in-memory database");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        UploadManager::new(
+            Arc::new(RecordingEventSink::new()),
+            std::env::temp_dir().join("vilsend-resume-test-uploads"),
+            Arc::new(LocalTransferFileService::new(pool).await),
+            tx,
+            store,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_resume_re_hashes_a_source_file_that_changed_after_it_was_planned() {
+        let scratch = TempDir::new();
+        let (receiver, endpoint) = serve_stub().await;
+        let path = scratch.path().join("a.bin");
+
+        // The previous run: plan these bytes, and record the stamp it saw.
+        std::fs::write(&path, b"xxxxxxxxxx").expect("writing the source");
+        let planned_at = record_modified_nanos(&path);
+
+        let source = FileInfo {
+            id: "f-1".into(),
+            path: path.clone(),
+            relative_path: "a.bin".into(),
+            size: SIZE,
+            modified_nanos: planned_at,
+        };
+
+        let stale = integrity::plan("t-1", std::slice::from_ref(&source), CHUNK)
+            .await
+            .expect("planning");
+
+        // Same length, different bytes, a later stamp: what an edit looks like.
+        std::fs::write(&path, b"yyyyyyyyyy").expect("rewriting the source");
+        edited_now(&path);
+
+        let store = Arc::new(TransferStore::in_memory(scratch.path().join("state")));
+
+        let mut record = record(&path, SIZE, CHUNK, &[]);
+        record.endpoint = endpoint.clone();
+        record.files[0].modified_nanos = planned_at;
+
+        store.save(&record).await.expect("saving the record");
+        store
+            .save_plan("t-1", &stale)
+            .await
+            .expect("saving the plan");
+        store
+            .save_secrets(
+                "t-1",
+                &TransferSecrets {
+                    transfer_key: [0x7F; 32],
+                    auth_token: "a-token".into(),
+                },
+            )
+            .expect("saving secrets");
+
+        let manager = manager_for(Arc::clone(&store)).await;
+        assert_eq!(manager.restore_persisted().await, 1);
+
+        manager.resume("t-1").await.expect("resuming");
+
+        assert_eq!(settle(&manager).await.status, TransferStatus::Completed);
+
+        /*
+         * The refreshed stamp has to be kept with the transfer. Otherwise the
+         * recomputed plan describes the file correctly, but the record still
+         * says the old stamp matched nothing — so the next resume would hash
+         * the same unchanged file again.
+         */
+        let state = manager.get("t-1").expect("the transfer is still known");
+
+        assert_eq!(
+            state.files_with_stamps()[0].modified_nanos,
+            record_modified_nanos(&path),
+            "the stamp the new plan was made against must replace the stale one"
+        );
+        assert!(
+            integrity::plan_is_current(
+                "t-1",
+                &state.expected().expect("the plan is in memory"),
+                &state.files_with_stamps(),
+                CHUNK,
+            )
+            .await,
+            "so the plan is reusable on the next resume"
+        );
+
+        let described = receiver
+            .described
+            .lock()
+            .expect("described lock")
+            .clone()
+            .expect("the resume must describe its files");
+
+        assert_eq!(
+            described["files"][0]["sha256"],
+            crate::transfer::manifest::sha256_hex(b"yyyyyyyyyy"),
+            "a file edited after planning must be described by the bytes it holds now"
         );
     }
 }

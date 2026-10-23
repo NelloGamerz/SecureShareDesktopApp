@@ -38,6 +38,11 @@ export interface TransferResponse {
   updatedAt: string;
   uploadedBytes: number;
   totalBytes: number;
+  // Live fields; the REST payload does not carry them — the transfer-progress
+  // listener fills them in while a transfer is running.
+  percentage?: number;
+  speed?: number; // bytes per second
+  eta?: number | null; // seconds remaining
 }
 
 /**

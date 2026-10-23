@@ -31,3 +31,5 @@ dist-ssr
 /supabase
 src-*target*/
 src-tauri\target
+
+graphify-out/

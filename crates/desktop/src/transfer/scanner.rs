@@ -1,4 +1,7 @@
-use crate::{models::file_info::FileInfo, transfer::errors::Result};
+use crate::{
+    models::file_info::{modified_nanos, FileInfo},
+    transfer::errors::Result,
+};
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -34,6 +37,7 @@ async fn visit(path: &Path, base: &Path, out: &mut Vec<FileInfo>) -> Result<()> 
             path: path.to_path_buf(),
             relative_path: relative,
             size: meta.len(),
+            modified_nanos: modified_nanos(&meta),
         });
         return Ok(());
     }
@@ -59,6 +63,7 @@ async fn visit(path: &Path, base: &Path, out: &mut Vec<FileInfo>) -> Result<()> 
                     path: p,
                     relative_path: relative,
                     size: m.len(),
+                    modified_nanos: modified_nanos(&m),
                 })
             }
         }

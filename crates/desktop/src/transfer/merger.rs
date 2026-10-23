@@ -8,12 +8,18 @@
 //! must not leave its output looking finished.
 
 use crate::transfer::errors::{Result, TransferError};
-use crate::transfer::integrity::DigestingWriter;
+use sha2::{Digest, Sha256};
 use std::path::Path;
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
+use tokio::fs;
+
+/// The buffer a merge reads and writes in.
+///
+/// The copy runs on the blocking pool, so this is not a per-call allocation
+/// concern: one read and one write per buffer, with no async round trip in
+/// between. 4 MiB is large enough that the per-call cost is invisible beside
+/// the bytes moved, and small enough that a merge does not hold a distracting
+/// amount of memory.
+const COPY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Assemble a file from its parts, check it, and publish it.
 ///
@@ -59,35 +65,58 @@ async fn assemble(
     total: u64,
     expected: Option<&str>,
 ) -> Result<()> {
-    let mut output = fs::File::create(temporary).await?;
+    /*
+     * The whole copy is one blocking task.
+     *
+     * The previous loop awaited a separate read and a separate write for every
+     * 64 KiB, which on `tokio::fs` is two blocking-pool dispatches per buffer:
+     * a 10 GiB file paid for roughly 320,000 round trips before it was even
+     * written. Here one thread owns both files for the duration, reads and
+     * writes in `COPY_BUFFER_BYTES` steps, and hashes inline — so the async
+     * runtime is never blocked on the bytes and the per-call overhead is
+     * amortised over megabytes instead of kilobytes.
+     */
+    let temporary_for_copy = temporary.to_path_buf();
+    let parts_for_copy = parts.to_path_buf();
+    let expected_for_copy = expected.map(str::to_owned);
 
-    let actual = {
-        let mut writer = DigestingWriter::new(&mut output, expected);
+    let actual = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use std::io::{Read as _, Write as _};
+
+        let mut output = std::fs::File::create(&temporary_for_copy)?;
+        let mut hasher = expected_for_copy.as_ref().map(|_| Sha256::new());
+        let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
 
         for index in 0..total {
-            let mut input = fs::File::open(parts.join(format!("{index}.part"))).await?;
-            let mut buffer = vec![0; 64 * 1024];
+            let mut input = std::fs::File::open(parts_for_copy.join(format!("{index}.part")))?;
 
             loop {
-                let read = input.read(&mut buffer).await?;
+                let read = input.read(&mut buffer)?;
 
                 if read == 0 {
                     break;
                 }
 
-                writer.write(&buffer[..read]).await?;
+                if let Some(hasher) = hasher.as_mut() {
+                    hasher.update(&buffer[..read]);
+                }
+
+                output.write_all(&buffer[..read])?;
             }
         }
 
-        writer.digest()
-    };
+        output.flush()?;
+        output.sync_all()?;
 
-    output.flush().await?;
-    output.sync_all().await?;
+        Ok(hasher
+            .map(|hasher| hex::encode(hasher.finalize()))
+            .unwrap_or_default())
+    })
+    .await
+    .map_err(|error| TransferError::Invalid(format!("the file merge task failed: {error}")))?
+    .map_err(TransferError::Io)?;
 
     if let Some(expected) = expected {
-        let actual = actual.unwrap_or_default();
-
         if actual != expected {
             return Err(TransferError::IntegrityMismatch {
                 path: temporary.to_string_lossy().into_owned(),

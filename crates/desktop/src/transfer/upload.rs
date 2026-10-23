@@ -1,6 +1,6 @@
 use crate::{
     models::chunk::ChunkJob,
-    transfer::{crypto, errors::Result, http_client::HttpClient, retry},
+    transfer::{errors::Result, retry, session::ProtocolSession},
 };
 
 use tokio::{
@@ -8,12 +8,16 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
 };
 
+/// Read, encrypt and send one chunk, retrying the whole attempt on failure.
+///
+/// Takes a [`ProtocolSession`] rather than an [`crate::transfer::http_client::HttpClient`]
+/// plus an endpoint plus a token, so that which wire carries the chunk is the
+/// session's business and not this function's. The retry loop and the read are
+/// unchanged — only *where the bytes go*, and *how they are sealed*, moved
+/// behind the seam.
 pub async fn upload_chunk(
-    client: &HttpClient,
-    endpoint: &str,
-    token: &str,
+    session: &dyn ProtocolSession,
     job: &ChunkJob,
-    transfer_key: &[u8; 32],
     max_retries: u32,
 ) -> Result<u32> {
     let mut attempt = 0;
@@ -28,12 +32,16 @@ pub async fn upload_chunk(
 
             file.read_exact(&mut bytes).await?;
 
-            let encrypted = crypto::encrypt_chunk(transfer_key, &bytes)
-                .map_err(crate::transfer::errors::TransferError::Crypto)?;
-
-            client
-                .send(endpoint, token, job, encrypted.data, encrypted.nonce)
-                .await
+            /*
+             * Plaintext, not ciphertext.
+             *
+             * The session seals it, because the AEAD's associated data is a
+             * property of the protocol — v2 binds the transfer, file, index,
+             * path and protocol version into the tag, and v1 passes none — and
+             * because the two versions derive their key differently. Sealing
+             * here would mean the engine had to know which protocol it was on.
+             */
+            session.send_chunk(job, bytes).await
         }
         .await;
 

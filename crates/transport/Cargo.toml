@@ -1,0 +1,33 @@
+[package]
+name = "vilsend-transport"
+# Not shipped on its own: Phase 8a establishes the crate and proves the port in
+# `vilsend-core` is implementable. Versioned apart from the desktop app because
+# the desktop app's version is the updater's version.
+version = "0.1.0"
+edition = "2021"
+description = "Transport implementations for VilSend: the tunnel today, direct P2P later."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+# ADR-0002: an adapter depends on the domain and on nothing else in the
+# workspace. `vilsend-core` is the only VilSend edge here, and it is the one
+# that points inward.
+#
+# `tauri`, `axum`, `sqlx` and `keyring` are deliberately absent and are asserted
+# absent by the architecture lint in `.github/workflows/ci.yml`. That is why
+# tunnel configuration is *injected* rather than read from the OS keychain: a
+# transport that reached for `tauri::AppHandle` would drag the shell into its
+# dependency tree and stop the CLI and the SDK building it.
+#
+# `tokio` is here rather than in `vilsend-core` on purpose: the port is defined
+# with `std::time::Duration` and plain `async fn`s so the domain stays
+# runtime-agnostic, and every runtime-specific decision lives in an adapter.
+# `macros` and `rt-multi-thread` are for `#[tokio::test]`; the library spawns
+# only through the caller's runtime.
+[dependencies]
+vilsend-core = { path = "../core" }
+async-trait = "0.1"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }

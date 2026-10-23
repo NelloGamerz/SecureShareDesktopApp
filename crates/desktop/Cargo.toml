@@ -38,6 +38,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
+# `ProtocolSession` is an object-safe trait (`Box<dyn ProtocolSession>`), which
+# native `async fn` in traits is not, so the engine's seam needs this.
+async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["codec", "compat", "time"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
@@ -49,9 +52,16 @@ anyhow = "1"
 tauri-plugin-secure-storage = "1.4.0"
 rand_core = "0.6"
 base64 = "0.22"
+# The v2 frame codec builds and takes apart byte buffers directly. Already in
+# the tree through axum, but named here because the crate depends on it.
+bytes = "1"
 aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+# Chunk compression, applied after a chunk is read and before it is sealed.
+# A peer that does not advertise support never receives a compressed body, so
+# the frozen v1 wire is unchanged unless both ends opt in.
+zstd = "0.13"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tauri-plugin-log = "2.9.0"
 # `static_secrets` was previously enabled only as a side effect of the

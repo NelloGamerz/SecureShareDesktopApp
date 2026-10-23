@@ -2,7 +2,7 @@
 
 ## Current design
 
-React lazy-loads most feature pages and uses TanStack Query. Rust performs file reads and network I/O asynchronously. Default transfer settings are 4 MiB chunks, four concurrent workers, and four retries. Progress crosses the Rust/UI boundary as events.
+React lazy-loads most feature pages and uses TanStack Query. Rust performs file reads and network I/O asynchronously. Default transfer settings are 16 MiB chunks, eight concurrent chunk tasks (bounded by a semaphore), and four retries. At the default chunk size that is up to 128 MiB of chunk buffers per process — the reason the in-flight count is a semaphore rather than an unbounded fan-out.
 
 ## Likely bottlenecks
 

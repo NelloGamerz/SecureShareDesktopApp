@@ -79,6 +79,14 @@ pub struct UploadState {
     /// transfer nobody has asked to describe — a receiver that is told nothing
     /// checks nothing, which is what an old one expects.
     pub expected: std::sync::Mutex<Option<ExpectedTransfer>>,
+    /// The modification stamps a freshly computed digest plan was made against.
+    ///
+    /// [`Self::files`] carries the stamps the initial scan recorded. When a
+    /// resume finds a file changed and re-plans it, those stamps no longer
+    /// describe the plan, so the refreshed ones are kept here and override the
+    /// scan's when the state is next written or validated. Empty until a
+    /// re-plan happens.
+    pub plan_stamps: std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
 }
 impl UploadState {
     /// How many bytes one chunk of this transfer holds, or `None` when the plan
@@ -246,6 +254,42 @@ impl UploadState {
         *self.expected.lock().expect("expected lock poisoned") = Some(expected);
     }
 
+    /// The stamp the current digest plan was made against for `file`.
+    ///
+    /// The refreshed stamp wins over the one the original scan recorded, so a
+    /// plan recomputed after an edit is valid on the *next* resume too instead
+    /// of being re-hashed on every attempt.
+    pub fn planned_stamp(&self, file: &FileInfo) -> Option<u64> {
+        self.plan_stamps
+            .lock()
+            .expect("plan stamps lock poisoned")
+            .get(&file.id)
+            .copied()
+            .unwrap_or(file.modified_nanos)
+    }
+
+    /// Record the stamps a freshly computed digest plan was made against.
+    pub fn set_plan_stamps(&self, stamps: Vec<(String, Option<u64>)>) {
+        *self.plan_stamps.lock().expect("plan stamps lock poisoned") = stamps.into_iter().collect();
+    }
+
+    /// The planned files with the stamps the current plan was made against.
+    ///
+    /// A copy rather than a guard so callers can hold it across the awaits of
+    /// plan validation without holding a `std::sync::Mutex` across an await.
+    pub fn files_with_stamps(&self) -> Vec<FileInfo> {
+        self.files
+            .iter()
+            .map(|file| FileInfo {
+                id: file.id.clone(),
+                path: file.path.clone(),
+                relative_path: file.relative_path.clone(),
+                size: file.size,
+                modified_nanos: self.planned_stamp(file),
+            })
+            .collect()
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
@@ -299,6 +343,7 @@ impl UploadState {
                     path: file.path.to_string_lossy().into_owned(),
                     relative_path: file.relative_path.clone(),
                     size: file.size,
+                    modified_nanos: self.planned_stamp(file),
                 })
                 .collect(),
             total_bytes: self.total_bytes,

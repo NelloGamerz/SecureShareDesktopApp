@@ -26,9 +26,10 @@
 
 use crate::models::chunk::ChunkJob;
 use crate::transfer::http_client::TransferResumeResponse;
+use crate::transfer::integrity::ExpectedTransfer;
 use crate::transfer::manifest::sha256_hex;
 use crate::transfer::state::ChunkKey;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt},
@@ -81,10 +82,38 @@ pub enum Rejection {
 /// correctness.
 ///
 /// A report for a different transfer is ignored entirely.
+/// The no-plan form of [`confirmed_chunks_with_plan`]: every claim is checked
+/// against the bytes on disk.
+///
+/// Kept as the plain name a caller with no plan to offer wants (and the name the
+/// tests exercise the disk-reading path under); the upload path always has a
+/// plan by the time it validates claims.
+#[allow(dead_code)]
 pub async fn confirmed_chunks(
     report: Option<&TransferResumeResponse>,
     transfer_id: &str,
     jobs: &[ChunkJob],
+) -> Confirmation {
+    confirmed_chunks_with_plan(report, transfer_id, jobs, None).await
+}
+
+/// Confirm claims against a digest plan instead of reading every chunk back.
+///
+/// `expected` must be a plan this run has already established describes the
+/// files as they are now — see [`crate::transfer::integrity::plan_is_current`].
+/// When it is, the per-chunk digest in it *is* the digest a read would compute,
+/// so the read is skipped and only claims the plan cannot describe fall back to
+/// [`chunk_digest`]. Passing `None` is exactly [`confirmed_chunks`]: every claim
+/// is checked against the bytes on disk.
+///
+/// This is not a weaker check. The comparison a claim has to survive is
+/// unchanged — `chunk_hash == SHA-256(the bytes the sender would send)` — and a
+/// plan whose files have changed is never passed here; it is recomputed first.
+pub async fn confirmed_chunks_with_plan(
+    report: Option<&TransferResumeResponse>,
+    transfer_id: &str,
+    jobs: &[ChunkJob],
+    expected: Option<&ExpectedTransfer>,
 ) -> Confirmation {
     let Some(report) = report else {
         return Confirmation::default();
@@ -100,6 +129,16 @@ pub async fn confirmed_chunks(
         return Confirmation::default();
     }
 
+    /*
+     * Keyed once rather than scanned per claim. A report lists every chunk the
+     * receiver holds, so a linear `find` made resume validation quadratic in the
+     * transfer's own size.
+     */
+    let by_key: HashMap<(&str, u64), &ChunkJob> = jobs
+        .iter()
+        .map(|job| ((job.file_id.as_str(), job.index), job))
+        .collect();
+
     let mut confirmation = Confirmation::default();
 
     for file in &report.files {
@@ -108,9 +147,9 @@ pub async fn confirmed_chunks(
 
             let key = (file.file_id.clone(), chunk.chunk_index);
 
-            let Some(job) = jobs
-                .iter()
-                .find(|job| job.file_id == file.file_id && job.index == chunk.chunk_index)
+            let Some(job) = by_key
+                .get(&(file.file_id.as_str(), chunk.chunk_index))
+                .copied()
             else {
                 confirmation.rejected.push(RejectedClaim {
                     file_id: file.file_id.clone(),
@@ -134,25 +173,58 @@ pub async fn confirmed_chunks(
                 continue;
             }
 
-            match chunk_digest(job).await {
-                Ok(digest) if digest == chunk.chunk_hash => {
-                    confirmation.confirmed.insert(key);
-                }
+            /*
+             * Where the plan describes this chunk, its digest stands in for the
+             * one a read would compute. The plan is validated against the files
+             * before it is passed in, and the chunk's length was just checked, so
+             * this is the same comparison with the file already read once.
+             */
+            let planned = expected
+                .and_then(|plan| plan.file(&file.file_id))
+                .and_then(|plan| {
+                    /*
+                     * `ExpectedFile::chunk` is a linear scan; the plan is in
+                     * index order, so a report of every chunk would scan the
+                     * plan once per chunk. Index directly and fall back to the
+                     * lookup only if the order is not what this build writes.
+                     */
+                    plan.chunks
+                        .get(chunk.chunk_index as usize)
+                        .filter(|planned| planned.index == chunk.chunk_index)
+                        .or_else(|| plan.chunk(chunk.chunk_index))
+                })
+                .filter(|planned| planned.length == chunk.chunk_length)
+                .map(|planned| planned.sha256.clone());
 
-                Ok(digest) => confirmation.rejected.push(RejectedClaim {
+            let digest = match planned {
+                Some(digest) => digest,
+
+                None => match chunk_digest(job).await {
+                    Ok(digest) => digest,
+
+                    Err(error) => {
+                        confirmation.rejected.push(RejectedClaim {
+                            file_id: file.file_id.clone(),
+                            chunk_index: chunk.chunk_index,
+                            reason: Rejection::Unreadable(error.to_string()),
+                        });
+
+                        continue;
+                    }
+                },
+            };
+
+            if digest == chunk.chunk_hash {
+                confirmation.confirmed.insert(key);
+            } else {
+                confirmation.rejected.push(RejectedClaim {
                     file_id: file.file_id.clone(),
                     chunk_index: chunk.chunk_index,
                     reason: Rejection::HashMismatch {
                         expected: digest,
                         reported: chunk.chunk_hash.clone(),
                     },
-                }),
-
-                Err(error) => confirmation.rejected.push(RejectedClaim {
-                    file_id: file.file_id.clone(),
-                    chunk_index: chunk.chunk_index,
-                    reason: Rejection::Unreadable(error.to_string()),
-                }),
+                });
             }
         }
     }
@@ -235,6 +307,7 @@ mod tests {
             path,
             relative_path: name.to_string(),
             size: contents.len() as u64,
+            modified_nanos: None,
         };
 
         crate::transfer::chunker::jobs("t-1", &[file], chunk_size)
@@ -595,5 +668,116 @@ mod tests {
         };
 
         assert!(chunk_digest(&job).await.is_err());
+    }
+
+    /*
+     * ----------------------------------------------------------------------
+     * A claim can be checked against a plan instead of the disk
+     * ----------------------------------------------------------------------
+     */
+
+    /// The jobs for a source file, and the digest plan describing it.
+    async fn expected_for(
+        scratch: &TempDir,
+        name: &str,
+        contents: &[u8],
+        chunk_size: usize,
+    ) -> (Vec<ChunkJob>, ExpectedTransfer) {
+        let jobs = plan(scratch, name, contents, chunk_size);
+
+        let file = crate::models::file_info::FileInfo {
+            id: format!("f-{name}"),
+            path: scratch.path().join(name),
+            relative_path: name.to_string(),
+            size: contents.len() as u64,
+            modified_nanos: None,
+        };
+
+        let expected = crate::transfer::integrity::plan("t-1", &[file], chunk_size)
+            .await
+            .expect("planning");
+
+        (jobs, expected)
+    }
+
+    /// A receiver report made from the plan's own digests.
+    fn report_from_plan(expected: &ExpectedTransfer, indices: &[u64]) -> TransferResumeResponse {
+        let file = &expected.files[0];
+
+        TransferResumeResponse {
+            transfer_id: expected.transfer_id.clone(),
+            files: vec![crate::transfer::http_client::FileResumeState {
+                file_id: file.file_id.clone(),
+                chunks: file
+                    .chunks
+                    .iter()
+                    .filter(|chunk| indices.contains(&chunk.index))
+                    .map(|chunk| crate::transfer::http_client::ChunkResumeState {
+                        chunk_index: chunk.index,
+                        chunk_length: chunk.length,
+                        chunk_hash: chunk.sha256.clone(),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claim_matching_the_plan_is_confirmed_without_reading_the_source() {
+        let scratch = TempDir::new();
+        let (jobs, expected) = expected_for(&scratch, "a.bin", b"0123456789", 4).await;
+
+        /*
+         * The source is gone. A claim confirmed from it would have produced an
+         * `Unreadable` rejection, so a trusted confirmation proves the plan was
+         * used and the file was never opened.
+         */
+        std::fs::remove_file(&jobs[0].path).expect("removing the source");
+
+        let report = report_from_plan(&expected, &[0, 1, 2]);
+
+        let confirmation =
+            confirmed_chunks_with_plan(Some(&report), "t-1", &jobs, Some(&expected)).await;
+
+        assert!(confirmation.is_trusted());
+        assert_eq!(confirmation.confirmed.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_disagrees_with_the_plan_is_rejected() {
+        let scratch = TempDir::new();
+        let (jobs, expected) = expected_for(&scratch, "a.bin", b"0123456789", 4).await;
+
+        let mut report = report_from_plan(&expected, &[0]);
+        report.files[0].chunks[0].chunk_hash = sha256_hex(b"some other bytes");
+
+        std::fs::remove_file(&jobs[0].path).expect("removing the source");
+
+        let confirmation =
+            confirmed_chunks_with_plan(Some(&report), "t-1", &jobs, Some(&expected)).await;
+
+        assert!(!confirmation.is_trusted());
+        assert!(confirmation.confirmed.is_empty());
+        assert!(matches!(
+            confirmation.rejected[0].reason,
+            Rejection::HashMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_claim_the_plan_cannot_describe_falls_back_to_the_source() {
+        let scratch = TempDir::new();
+        let (jobs, mut expected) = expected_for(&scratch, "a.bin", b"0123456789", 4).await;
+
+        let report = report_from_plan(&expected, &[1]);
+
+        // A plan missing that one chunk says nothing about it; the read does.
+        expected.files[0].chunks.retain(|chunk| chunk.index != 1);
+
+        let confirmation =
+            confirmed_chunks_with_plan(Some(&report), "t-1", &jobs, Some(&expected)).await;
+
+        assert!(confirmation.is_trusted());
+        assert!(confirmation.confirmed.contains(&("f-a.bin".to_string(), 1)));
     }
 }

@@ -83,6 +83,20 @@ function formatFileSize(size: number) {
   return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+function formatDuration(seconds: number) {
+  if (seconds < 60) {
+    return `${Math.ceil(seconds)}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+
+  if (minutes < 60) {
+    return `${minutes}m ${Math.round(seconds % 60)}s`;
+  }
+
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
 const preparingStatus: Record<string, string> = {
   CONNECTING: "Connecting...",
   WAITING_SENDER: "Waiting for sender...",
@@ -344,6 +358,19 @@ export function TransfersPage() {
 
                                       <span>{Math.round(progress)}%</span>
                                     </div>
+
+                                    {typeof t.speed === "number" &&
+                                      t.speed > 0 && (
+                                        <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                                          <span>{formatFileSize(t.speed)}/s</span>
+
+                                          <span>
+                                            {t.eta != null
+                                              ? `${formatDuration(t.eta)} left`
+                                              : "estimating…"}
+                                          </span>
+                                        </div>
+                                      )}
                                   </>
                                 )}
                               </div>
