@@ -388,8 +388,11 @@ impl ProtocolSession for LegacyV1Session {
             ChunkEncoding::Identity => (plaintext, ChunkEncoding::Identity),
 
             ChunkEncoding::Zstd => {
+                // The strategy is chosen per file; today zstd or identity.
+                let strategy = compression::select(&job.relative_path);
+
                 let (original, compressed) = tokio::task::spawn_blocking(move || {
-                    let compressed = compression::compress(&plaintext);
+                    let compressed = strategy.compress(&plaintext);
 
                     (plaintext, compressed)
                 })
@@ -399,7 +402,7 @@ impl ProtocolSession for LegacyV1Session {
                 })?;
 
                 match compressed {
-                    Ok(Some(compressed)) => (compressed, ChunkEncoding::Zstd),
+                    Ok(Some(compressed)) => (compressed, strategy.encoding()),
 
                     Ok(None) => {
                         tracing::debug!(
