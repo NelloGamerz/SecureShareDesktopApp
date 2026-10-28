@@ -131,9 +131,56 @@ impl Default for HttpClient {
     }
 }
 
+/// The response header the receiver puts on a refused chunk to name the chunks
+/// it no longer holds.
+pub const MISSING_CHUNKS_HEADER: &str = "vilsend-missing-chunks";
+
 impl HttpClient {
+    /// One client per session, shared by every chunk.
+    ///
+    /// The pool is what makes a transfer one connection (or a few) instead of
+    /// one connect and TLS handshake per chunk; the idle timeout is long enough
+    /// that a slow chunk cannot evict the connection the next one will use.
     pub fn new() -> Self {
-        Self(Client::new())
+        let mut builder = Client::builder()
+            // Enough idle connections for a transfer's own concurrency, and a
+            // pool that outlives the gap between two chunks of a slow link.
+            .pool_max_idle_per_host(crate::transfer::constants::DEFAULT_CONCURRENCY * 2)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_nodelay(true);
+
+        /*
+         * HTTP/1.1 by default, deliberately.
+         *
+         * Over TLS, reqwest negotiates HTTP/2 with the receiver's edge, which
+         * multiplexes every chunk onto *one* TCP connection. That connection's
+         * throughput is then the transfer's ceiling no matter how wide the
+         * scheduler's window is. HTTP/1.1 lets the pool open one connection per
+         * in-flight chunk, so the window is backed by real connections.
+         *
+         * Plaintext LAN receivers speak HTTP/1.1 either way; this only changes
+         * the TLS path. `VILSEND_HTTP2=negotiate` restores the old ALPN
+         * behaviour so the two can be benchmarked against the same receiver.
+         */
+        match std::env::var("VILSEND_HTTP2").as_deref() {
+            Ok("prior-knowledge") => {
+                builder = builder.http2_prior_knowledge().http2_adaptive_window(true);
+            }
+
+            Ok("negotiate") => {
+                builder = builder.http2_adaptive_window(true);
+            }
+
+            _ => {
+                builder = builder.http1_only();
+            }
+        }
+
+        Self(
+            builder
+                .build()
+                .expect("the HTTP client configuration is valid"),
+        )
     }
 
     fn normalize_endpoint(endpoint: &str) -> String {
@@ -336,6 +383,28 @@ impl HttpClient {
         let response = request.body(body).send().await?;
 
         let status = response.status();
+
+        /*
+         * A refused chunk that names the chunks the receiver no longer holds.
+         * The sender resends exactly those; the rest of the file is kept.
+         */
+        if status == reqwest::StatusCode::CONFLICT {
+            let missing: Vec<u64> = response
+                .headers()
+                .get(MISSING_CHUNKS_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|index| index.trim().parse::<u64>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if !missing.is_empty() {
+                return Err(TransferError::ChunksMissing { missing });
+            }
+        }
 
         if status.is_success() {
             tracing::debug!(

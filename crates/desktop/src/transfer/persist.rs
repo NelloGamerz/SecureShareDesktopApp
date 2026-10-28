@@ -238,6 +238,14 @@ pub struct PersistedTransfer {
     /// What the sender last believed. Not evidence — see
     /// [`Self::resumable_status`].
     pub status: TransferStatus,
+    /// The telemetry as of the last checkpoint.
+    ///
+    /// Persisted so that a report recovered after a restart describes the run
+    /// that happened — its duration, its upload window, its per-file progress —
+    /// rather than the instant the process came back. Absent for records written
+    /// by builds that did not keep it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<crate::transfer::report::PersistedTelemetry>,
 }
 
 impl PersistedTransfer {
@@ -340,6 +348,14 @@ pub struct TransferStore {
 impl TransferStore {
     pub fn new(state_dir: PathBuf, secrets: Arc<dyn SecretStore>) -> Self {
         Self { state_dir, secrets }
+    }
+
+    /// Where finished performance reports are written.
+    ///
+    /// Beside the state records, in their own directory: a report is history,
+    /// not state, and nothing reads it back to resume anything.
+    pub fn reports_dir(&self) -> PathBuf {
+        self.state_dir.join("reports")
     }
 
     /// A store that keeps its records in `state_dir` and its secrets nowhere.
@@ -632,6 +648,7 @@ mod tests {
             }],
             total_bytes: 2048,
             total_chunks: 2,
+            report: None,
             completed_chunks: Vec::new(),
             status: TransferStatus::Uploading,
         }

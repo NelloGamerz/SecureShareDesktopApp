@@ -80,11 +80,14 @@ mod tests {
             max_retries: 3,
             status: Mutex::new(TransferStatus::Uploading),
             started_at: std::time::Instant::now(),
+            startup_started: std::time::Instant::now(),
             completed: Mutex::new(HashSet::new()),
             running: AtomicBool::new(false),
             resume_lock: tokio::sync::Mutex::new(()),
             expected: Mutex::new(None),
             plan_stamps: Mutex::new(std::collections::HashMap::new()),
+            report: crate::transfer::report::Telemetry::new(crate::transfer::report::Role::Sender),
+            phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
         }
     }
 

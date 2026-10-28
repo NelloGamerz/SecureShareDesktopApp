@@ -4,9 +4,9 @@
 
 1. Central API `/transfers` returns `TransferMetadata`: transfer ID, receiver ID, endpoint, auth token, optional chunk size, concurrency, and retry limits.
 2. `UploadManager` loads file paths from SQLite by transfer ID and scans them with `scanner.rs`.
-3. `chunker.rs` creates jobs using a default 16 MiB chunk size (configurable up to 32 MiB).
+3. `chunker.rs` creates jobs using a chunk size chosen from the transfer size: 256 KiB up to 16 MiB, 512 KiB above that. The backend may override it, but the sender never plans a chunk larger than 512 KiB.
 4. Rust fetches `/transfer/public-key`, derives an ephemeral X25519/HKDF transfer key, and calls `/transfer/start`.
-5. `scheduler.rs` dispatches each chunk as its own async task with eight in flight by default. Each task reads one chunk, compresses it with zstd when the receiver advertised support, encrypts it with AES-GCM, and POSTs it to `/transfer/chunk`.
+5. `scheduler.rs` dispatches each chunk as its own async task with sixteen in flight by default. Each task reads one chunk, compresses it with zstd when the receiver advertised support, encrypts it with AES-GCM, and POSTs it to `/transfer/chunk`.
 6. Failed chunks retry up to four times with 1/2/4/8-second delays. Progress is emitted through Tauri events.
 
 ### Chunk compression and size negotiation
@@ -14,15 +14,15 @@
 Both are negotiated, never assumed, because the v1 wire and its installed receivers are frozen:
 
 - `GET /transfer/public-key` returns `vilsend-chunk-encoding: zstd` and `vilsend-max-chunk-bytes: <n>`. A receiver that predates these sends neither header.
-- **Chunk size.** The sender plans `min(configured size, advertised max, MAX_CHUNK_SIZE)`. With no header it falls back to the legacy 4 MiB, which is what an installed receiver's 10 MiB body limit accepts; a new receiver advertises 32 MiB and the sender uses its 16 MiB default.
-- **Compression.** The sender compresses a chunk only when the encoding header was present. A compressed chunk carries `chunk-encoding: zstd`; an uncompressed one carries no header, which is byte-for-byte the old request.
+- **Chunk size.** The sender plans `min(configured size, advertised max, MAX_CHUNK_SIZE)`, with the configured/default size itself capped at 512 KiB. With no header it falls back to the same 512 KiB maximum, which every installed receiver's 10 MiB body limit accepts comfortably. The receiver's own body limit stays at 32 MiB so installed senders keep working.
+- **Compression.** On by default. The sender compresses a chunk only when the encoding header was present. Per chunk the order is read → compress → encrypt → send, so what goes on the wire is the sealed compressed bytes. A compressed chunk carries `chunk-encoding: zstd`; an uncompressed one carries no header, which is byte-for-byte the old request.
 - Compression happens on the plaintext, before encryption. Manifest hashes, resume digests, the sender's `ExpectedTransfer`, and progress all describe plaintext bytes, so none of them change.
-- A chunk that does not shrink is sent uncompressed even on a negotiated session, so already-compressed media pays no overhead.
+- A chunk that does not shrink is sent uncompressed even on a negotiated session, so genuinely incompressible data pays no wire overhead. The decision is made per chunk on the bytes, never from the file extension: a screen recording compresses several-fold despite being `.mp4`, and an archive that does not shrink falls back to identity after one attempt.
 - The receiver bounds decompression by the chunk length the sender described and refuses a chunk that expands past it (a small body must not become an unbounded allocation).
 
 ### Sending
 
-`scheduler.rs` dispatches each chunk as its own async task, bounded by a semaphore at the transfer's concurrency (8 by default). A failed chunk stops new dispatches and lets in-flight chunks finish; a paused transfer parks tasks before they read their chunk.
+`scheduler.rs` dispatches each chunk as its own async task, bounded by a semaphore at the transfer's concurrency (16 by default). A failed chunk stops new dispatches and lets in-flight chunks finish; a paused transfer parks tasks before they read their chunk.
 
 ## Receiver path
 

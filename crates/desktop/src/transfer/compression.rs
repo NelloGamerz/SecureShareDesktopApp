@@ -135,49 +135,17 @@ impl CompressionStrategy for ZstdCompressor {
     }
 }
 
-/// A strategy that leaves the chunk as it is.
-pub struct NoCompression;
-
-impl CompressionStrategy for NoCompression {
-    fn encoding(&self) -> ChunkEncoding {
-        ChunkEncoding::Identity
-    }
-
-    fn compress(&self, _plaintext: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-}
-
 static ZSTD: ZstdCompressor = ZstdCompressor;
-static NONE: NoCompression = NoCompression;
 
-/// Pick the strategy for one file by its path.
+/// The algorithm this build compresses every chunk with.
 ///
-/// zstd is the default. Formats that are already compressed skip the attempt
-/// entirely; for everything else `ZstdCompressor` still gives up per chunk when
-/// the result is not smaller, so incompressible data never grows.
-pub fn select(relative_path: &str) -> &'static dyn CompressionStrategy {
-    if is_already_compressed(relative_path) {
-        &NONE
-    } else {
-        &ZSTD
-    }
-}
-
-fn is_already_compressed(path: &str) -> bool {
-    const EXTENSIONS: &[&str] = &[
-        "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "mp4", "m4v", "mkv", "mov", "webm",
-        "avi", "mp3", "aac", "ogg", "flac", "zip", "gz", "bz2", "xz", "zst", "7z", "rar",
-    ];
-
-    std::path::Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            EXTENSIONS
-                .iter()
-                .any(|known| extension.eq_ignore_ascii_case(known))
-        })
+/// The file name is deliberately **not** consulted: a screen recording
+/// compresses five-fold even though its extension says `.mp4`, and a file that
+/// genuinely does not shrink is caught per chunk by `compress` returning
+/// `None`. The cost of trying is a few milliseconds of CPU on the blocking
+/// pool; the cost of guessing wrong is several times the wire bytes.
+pub fn strategy() -> &'static dyn CompressionStrategy {
+    &ZSTD
 }
 
 /// Compress one chunk, or say that the result is not worth sending.
@@ -256,40 +224,11 @@ mod tests {
         );
     }
 
+    /// The strategy must not depend on the extension. A screen recording can
+    /// compress several-fold while an archive may not; only the bytes decide.
     #[test]
-    fn selection_follows_the_file_extension() {
-        assert_eq!(
-            select("notes.txt").encoding(),
-            ChunkEncoding::Zstd,
-            "compressible files use zstd"
-        );
-        assert_eq!(
-            select("clip.MP4").encoding(),
-            ChunkEncoding::Identity,
-            "media skips compression"
-        );
-        assert_eq!(
-            select("archive.zip").encoding(),
-            ChunkEncoding::Identity,
-            "archives skip compression"
-        );
-        assert_eq!(
-            select("README").encoding(),
-            ChunkEncoding::Zstd,
-            "no extension means the default"
-        );
-    }
-
-    #[test]
-    fn the_identity_strategy_never_compresses() {
-        let plaintext = vec![b'a'; 4096];
-
-        assert_eq!(
-            select("photo.png")
-                .compress(&plaintext)
-                .expect("the identity strategy cannot fail"),
-            None
-        );
+    fn compression_is_chosen_by_content_not_extension() {
+        assert_eq!(strategy().encoding(), ChunkEncoding::Zstd);
     }
 
     #[test]

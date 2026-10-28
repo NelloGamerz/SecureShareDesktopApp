@@ -516,10 +516,16 @@ async fn plan_file(
             let length = (file.size - offset).min(chunk_size) as usize;
 
             reads.push(tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+
+                /*
+                 * Declared after the slot so it is dropped before it: a probe
+                 * that outlived its slot would be counted while the next read
+                 * already holds the slot it freed.
+                 */
                 #[cfg(test)]
                 let _probe = read_probe::Probe::enter();
 
-                let _slot = slot;
                 read_chunk(&path, offset, length)
             }));
         }

@@ -57,6 +57,31 @@ use crate::transfer::{
     integrity::ExpectedTransfer,
 };
 
+/// Whether chunks are compressed before they are sealed.
+///
+/// On by default. Compression is still negotiated: a receiver that does not
+/// advertise a decoder gets identity chunks, and a per-file strategy sends
+/// already-compressed formats unchanged. Reports record this setting.
+pub const COMPRESSION_ENABLED: bool = true;
+
+/// What sending one chunk cost, as the session measured it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChunkSendTimings {
+    /// Compressing the plaintext, including the hop to the blocking pool.
+    pub compress: std::time::Duration,
+    /// Plaintext bytes this attempt carried.
+    pub plaintext_bytes: u64,
+    /// Body bytes actually sent: compressed when it shrank, plaintext otherwise.
+    pub body_bytes: u64,
+    /// Sealing the plaintext, including the hop to the blocking pool.
+    pub encrypt: std::time::Duration,
+    /// The part of `encrypt` spent inside the cipher itself. The difference is
+    /// how long the work waited for a blocking thread.
+    pub encrypt_cpu: std::time::Duration,
+    /// The request and the wait for the receiver's acknowledgement.
+    pub http: std::time::Duration,
+}
+
 /// Everything the engine must tell a session before it can be opened.
 #[derive(Debug)]
 pub struct OpenRequest<'a> {
@@ -163,7 +188,10 @@ pub trait ProtocolSession: Send + Sync {
     /// disk and recorded — not once the bytes have left this process. The retry
     /// loop that calls this re-encrypts on each attempt, because it calls this
     /// again, which is what makes a retry draw a fresh nonce.
-    async fn send_chunk(&self, job: &ChunkJob, plaintext: Vec<u8>) -> Result<()>;
+    ///
+    /// The timings are what the report uses to say where a chunk's life went:
+    /// sealing, or the round trip that waits for the receiver's acknowledgement.
+    async fn send_chunk(&self, job: &ChunkJob, plaintext: Vec<u8>) -> Result<ChunkSendTimings>;
 
     /// Ask the receiver to drop a transfer and everything it holds for it.
     ///
@@ -320,8 +348,15 @@ impl ProtocolSession for LegacyV1Session {
          * a device capability carried by the handshake; a receiver that does not
          * advertise it keeps receiving identity chunks, which is what makes the
          * frozen v1 wire unchanged for installed peers.
+         *
+         * Compression follows the receiver's advertised capability. A receiver
+         * that predates it sends no header and keeps getting identity chunks.
          */
-        self.set_chunk_encoding(receiver_key.chunk_encoding);
+        self.set_chunk_encoding(match COMPRESSION_ENABLED {
+            true => receiver_key.chunk_encoding,
+
+            false => ChunkEncoding::Identity,
+        });
 
         let receiver_public =
             crypto::decode_public_key(&receiver_key.public_key).map_err(TransferError::Crypto)?;
@@ -374,7 +409,7 @@ impl ProtocolSession for LegacyV1Session {
         })
     }
 
-    async fn send_chunk(&self, job: &ChunkJob, plaintext: Vec<u8>) -> Result<()> {
+    async fn send_chunk(&self, job: &ChunkJob, plaintext: Vec<u8>) -> Result<ChunkSendTimings> {
         /*
          * Compress first, if the receiver said it can decode it. This runs on
          * the blocking pool because zstd is CPU-bound and several workers share
@@ -384,12 +419,18 @@ impl ProtocolSession for LegacyV1Session {
          * The original bytes come back from the closure so an incompressible
          * chunk — or a compressor failure — costs nothing but the attempt.
          */
+        let plaintext_bytes = plaintext.len() as u64;
+
+        let mut compress = std::time::Duration::ZERO;
+
         let (body, encoding) = match self.chunk_encoding() {
             ChunkEncoding::Identity => (plaintext, ChunkEncoding::Identity),
 
             ChunkEncoding::Zstd => {
-                // The strategy is chosen per file; today zstd or identity.
-                let strategy = compression::select(&job.relative_path);
+                // Content decides: zstd, or identity if this chunk did not shrink.
+                let strategy = compression::strategy();
+
+                let compress_started = std::time::Instant::now();
 
                 let (original, compressed) = tokio::task::spawn_blocking(move || {
                     let compressed = strategy.compress(&plaintext);
@@ -400,6 +441,8 @@ impl ProtocolSession for LegacyV1Session {
                 .map_err(|error| {
                     TransferError::Compression(format!("the compression task failed: {error}"))
                 })?;
+
+                compress = compress_started.elapsed();
 
                 match compressed {
                     Ok(Some(compressed)) => (compressed, strategy.encoding()),
@@ -434,13 +477,62 @@ impl ProtocolSession for LegacyV1Session {
             }
         };
 
+        let body_bytes = body.len() as u64;
+
         /*
          * Encrypted here, per attempt, which is how a retry draws a fresh nonce:
          * `upload::upload_chunk`'s loop calls this again, and this seals again.
          * Sealing outside the loop would send the same ciphertext and nonce on
          * every attempt, which on v1 is undetectable and on v2 is a nonce reuse.
          */
-        let encrypted = crypto::encrypt_chunk(&self.key(), &body).map_err(TransferError::Crypto)?;
+        /*
+         * Sealed on the blocking pool, in place.
+         *
+         * AES-GCM over a 16 MiB chunk is milliseconds of pure CPU, and several
+         * workers share this runtime — doing it inline stalls every other task
+         * for that long. The in-place form turns the plaintext buffer into
+         * ciphertext, so the chunk is not copied a second time.
+         */
+        let key = self.key();
+
+        let encrypt_started = std::time::Instant::now();
+
+        /*
+         * The CPU time is measured inside the blocking task, so the difference
+         * between the two numbers is how long the work waited for a thread in
+         * the pool. A large queue and a small CPU time means the runtime was
+         * saturated; the other way round means the cipher itself was slow.
+         */
+        let (encrypted, encrypt_cpu) = tokio::task::spawn_blocking(move || {
+            let cpu_started = std::time::Instant::now();
+
+            let result = crypto::encrypt_chunk_in_place(&key, body);
+
+            (result, cpu_started.elapsed())
+        })
+        .await
+        .map_err(|error| TransferError::Crypto(format!("the encryption task failed: {error}")))?;
+
+        let encrypted = encrypted.map_err(TransferError::Crypto)?;
+
+        let encrypt = encrypt_started.elapsed();
+
+        tracing::debug!(
+            transfer_id = %job.transfer_id,
+            chunk = job.index,
+            encrypt_ms = encrypt.as_secs_f64() * 1000.0,
+            encrypt_cpu_ms = encrypt_cpu.as_secs_f64() * 1000.0,
+            encrypt_queue_ms = (encrypt - encrypt_cpu).as_secs_f64() * 1000.0,
+            "chunk sealed; chunk request initiated"
+        );
+
+        /*
+         * The round trip — headers, body, and the wait for the receiver to
+         * fsync and acknowledge — measured on its own. This is the half the
+         * network and the receiver own, and the one a report can point at when
+         * a chunk is slow for reasons this process did not cause.
+         */
+        let http_started = std::time::Instant::now();
 
         self.client
             .send(
@@ -451,7 +543,25 @@ impl ProtocolSession for LegacyV1Session {
                 encrypted.nonce,
                 encoding,
             )
-            .await
+            .await?;
+
+        let http = http_started.elapsed();
+
+        tracing::debug!(
+            transfer_id = %job.transfer_id,
+            chunk = job.index,
+            http_ms = http.as_secs_f64() * 1000.0,
+            "chunk acknowledged by receiver"
+        );
+
+        Ok(ChunkSendTimings {
+            compress,
+            plaintext_bytes,
+            body_bytes,
+            encrypt,
+            encrypt_cpu,
+            http,
+        })
     }
 
     async fn cancel(&self, transfer_id: &str) -> Result<()> {

@@ -7,6 +7,7 @@ use crate::{
         crypto,
         errors::{Result as TransferResult, TransferError},
         http_client::StartTransferRequest,
+        integrity::ExpectedTransfer,
         manifest, merger,
         state::DownloadState,
     },
@@ -169,11 +170,17 @@ pub struct ReceiverState {
     pub downloads: Arc<tokio::sync::RwLock<HashMap<String, Arc<DownloadState>>>>,
     /// Which chunks each transfer has actually completed, keyed by transfer id.
     ///
-    /// Backed by `manifest.json` in the transfer's directory. The map is a
-    /// cache in front of that file — the file is what survives a restart, and
-    /// is loaded the first time a transfer is touched after one. See
-    /// [`crate::transfer::manifest`].
-    pub manifests: Arc<tokio::sync::Mutex<HashMap<String, manifest::Manifest>>>,
+    /// Backed by `manifest.json` and `chunks.journal` in the transfer's
+    /// directory. The map is a cache in front of those files — they are what
+    /// survives a restart, and are loaded the first time a transfer is touched
+    /// after one. See [`crate::transfer::manifest`].
+    ///
+    /// The outer map is held only long enough to clone the inner `Arc`. A
+    /// transfer's own record is locked separately, so disk work — fsyncs, the
+    /// journal append, the merge — never holds up another transfer. Same shape
+    /// as [`ReceiverState::writers`], for the same reason.
+    pub manifests:
+        Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<manifest::Manifest>>>>>,
     /// Transfers whose assembly has been refused since the session began.
     ///
     /// Set when an assembly attempt drops a chunk — the file is not the one the
@@ -215,6 +222,44 @@ impl ReceiverState {
             .entry(transfer_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// This transfer's chunk record, loaded from disk the first time it is
+    /// touched after a restart.
+    ///
+    /// The map lock is taken only to get or insert the handle; the record's own
+    /// lock is what a caller holds across a read-modify-write. The disk read is
+    /// inside the map lock deliberately: two chunks arriving together on a
+    /// fresh transfer must not both load and then race to insert.
+    pub(crate) async fn manifest_handle(
+        &self,
+        transfer_id: &str,
+    ) -> Arc<tokio::sync::Mutex<manifest::Manifest>> {
+        let mut manifests = self.manifests.lock().await;
+
+        if let Some(handle) = manifests.get(transfer_id) {
+            return Arc::clone(handle);
+        }
+
+        let recovered =
+            manifest::load_or_default(&self.transfer_dir(transfer_id), transfer_id).await;
+
+        tracing::info!(
+            transfer_id,
+            completed_chunks = recovered.chunks.len(),
+            "loaded transfer manifest"
+        );
+
+        let handle = Arc::new(tokio::sync::Mutex::new(recovered));
+
+        manifests.insert(transfer_id.to_owned(), Arc::clone(&handle));
+
+        handle
+    }
+
+    /// Drop the cached record for a transfer whose directory is gone.
+    pub(crate) async fn forget_manifest(&self, transfer_id: &str) {
+        self.manifests.lock().await.remove(transfer_id);
     }
 
     /// Drop a finished or cancelled transfer's lock.
@@ -306,11 +351,52 @@ fn check_receiver_storage(path: &Path) -> Result<u64, String> {
     Err("unable to determine receiver storage availability".into())
 }
 
+/// Take in a description the sender worked out after its session was opened.
+///
+/// Returns whether it described something this receiver did not already hold —
+/// which is what a streaming sender's second handshake looks like, as opposed to
+/// a duplicate start from a sender that crashed and came back.
+async fn absorb_expected(
+    state: &ReceiverState,
+    transfer_id: &str,
+    described: Option<ExpectedTransfer>,
+) -> bool {
+    let Some(described) = described.filter(|described| described.transfer_id == transfer_id) else {
+        return false;
+    };
+
+    let handle = state.manifest_handle(transfer_id).await;
+    let mut known = handle.lock().await;
+
+    if known.expected.as_ref() == Some(&described) {
+        return false;
+    }
+
+    known.expected = Some(described);
+
+    /*
+     * Stored under the record's own lock: `store` empties the journal, so it
+     * must not interleave with an append from an arriving chunk.
+     */
+    if let Err(error) = manifest::store(&state.transfer_dir(transfer_id), &known).await {
+        tracing::warn!(
+            transfer_id,
+            %error,
+            "could not record the sender's digests; this transfer cannot be checked if this \
+             process ends"
+        );
+    }
+
+    true
+}
+
 pub async fn start_transfer(
     State(state): State<ReceiverState>,
     headers: HeaderMap,
     Json(request): Json<StartTransferRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let initialization_started = std::time::Instant::now();
+
     tracing::info!(
         transfer_id = %request.transfer_id,
         sender_public_key_len = request.sender_ephemeral_public_key.len(),
@@ -366,6 +452,25 @@ pub async fn start_transfer(
         .await
         .contains_key(&request.transfer_id)
     {
+        /*
+         * A streaming sender opens its session with nothing described and
+         * describes the files later, once it has hashed them — so this second
+         * handshake is how the digests reach a transfer that is already running.
+         * Nothing is re-established; the session and its key are the ones
+         * already in force, and the conflict is still the answer.
+         */
+        if absorb_expected(&state, &request.transfer_id, request.expected).await {
+            tracing::info!(
+                transfer_id = %request.transfer_id,
+                "recorded the sender's digests on a live transfer"
+            );
+
+            return Err((
+                StatusCode::CONFLICT,
+                format!("transfer {} is already active", request.transfer_id),
+            ));
+        }
+
         tracing::warn!(
             transfer_id = %request.transfer_id,
             "duplicate transfer request rejected"
@@ -380,6 +485,10 @@ pub async fn start_transfer(
             cancelled: AtomicBool::new(false),
             started_at: std::time::Instant::now(),
             status: Mutex::new(TransferStatus::Failed),
+            report: crate::transfer::report::Telemetry::new(
+                crate::transfer::report::Role::Receiver,
+            ),
+            phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
         });
 
         state.events.emit(DomainEvent::TransferFailed {
@@ -429,6 +538,10 @@ pub async fn start_transfer(
             cancelled: AtomicBool::new(false),
             started_at: std::time::Instant::now(),
             status: Mutex::new(TransferStatus::Failed),
+            report: crate::transfer::report::Telemetry::new(
+                crate::transfer::report::Role::Receiver,
+            ),
+            phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
         });
 
         state.events.emit(DomainEvent::TransferFailed {
@@ -556,27 +669,9 @@ pub async fn start_transfer(
         None => None,
     };
 
-    let (recovered, expected_changed) = {
-        let mut manifests = state.manifests.lock().await;
-
-        let mut known = match manifests.get(&request.transfer_id).cloned() {
-            Some(known) => known,
-
-            None => {
-                let transfer_dir = state.transfer_dir(&request.transfer_id);
-
-                let recovered =
-                    manifest::load_or_default(&transfer_dir, &request.transfer_id).await;
-
-                tracing::info!(
-                    transfer_id = %request.transfer_id,
-                    completed_chunks = recovered.chunks.len(),
-                    "recovered transfer manifest"
-                );
-
-                recovered
-            }
-        };
+    let recovered = {
+        let handle = state.manifest_handle(&request.transfer_id).await;
+        let mut known = handle.lock().await;
 
         /*
          * The sender is the authority on its own transfer, so what it describes
@@ -587,30 +682,28 @@ pub async fn start_transfer(
 
         if changed {
             known.expected = described.clone();
+
+            /*
+             * Written down as well as remembered, so that the digests outlive
+             * this process: a receiver that restarts mid-transfer has to be
+             * able to check the file it goes on to assemble, and by then the
+             * sender may be gone. Stored under the record's lock because
+             * `store` empties the journal.
+             */
+            let transfer_dir = state.transfer_dir(&request.transfer_id);
+
+            if let Err(error) = manifest::store(&transfer_dir, &known).await {
+                tracing::warn!(
+                    transfer_id = %request.transfer_id,
+                    %error,
+                    "could not record the sender's digests; this transfer cannot be checked \
+                     if this process ends"
+                );
+            }
         }
 
-        manifests.insert(request.transfer_id.clone(), known.clone());
-
-        (known, changed)
+        known.clone()
     };
-
-    /*
-     * Written down as well as remembered, so that the digests outlive this
-     * process: a receiver that restarts mid-transfer has to be able to check the
-     * file it goes on to assemble, and by then the sender may be gone.
-     */
-    if expected_changed {
-        let transfer_dir = state.transfer_dir(&request.transfer_id);
-
-        if let Err(error) = manifest::store(&transfer_dir, &recovered).await {
-            tracing::warn!(
-                transfer_id = %request.transfer_id,
-                %error,
-                "could not record the sender's digests; this transfer cannot be checked \
-                 if this process ends"
-            );
-        }
-    }
 
     /*
      * What the recovered manifest is worth as progress, checked against the
@@ -636,6 +729,11 @@ pub async fn start_transfer(
         started_at: std::time::Instant::now(),
 
         status: Mutex::new(TransferStatus::Pending),
+        report: crate::transfer::report::Telemetry::new(crate::transfer::report::Role::Receiver),
+        phases: Mutex::new(crate::transfer::report::PhaseTimings {
+            initialization_seconds: Some(initialization_started.elapsed().as_secs_f64()),
+            ..crate::transfer::report::PhaseTimings::default()
+        }),
     });
 
     /*
@@ -647,6 +745,12 @@ pub async fn start_transfer(
         .await
         .insert(request.transfer_id.clone(), download.clone());
 
+    tracing::info!(
+        transfer_id = %request.transfer_id,
+        elapsed_ms = initialization_started.elapsed().as_millis() as u64,
+        "receiver: session created"
+    );
+
     /*
      * Notify frontend so it can immediately show the transfer.
      */
@@ -656,12 +760,8 @@ pub async fn start_transfer(
 
     tracing::info!(
         transfer_id = %request.transfer_id,
-        "transfer session established"
-    );
-
-    tracing::info!(
-        transfer_id = %request.transfer_id,
-        "transfer session established"
+        elapsed_ms = initialization_started.elapsed().as_millis() as u64,
+        "receiver: transfer session established"
     );
 
     Ok(StatusCode::OK)
@@ -696,11 +796,12 @@ async fn expected_chunk_length(
     file_id: &str,
     chunk_index: u64,
 ) -> Option<u64> {
-    let manifests = state.manifests.lock().await;
+    let handle = state.manifest_handle(transfer_id).await;
+    let known = handle.lock().await;
 
-    manifests
-        .get(transfer_id)
-        .and_then(|record| record.expected.as_ref())
+    known
+        .expected
+        .as_ref()
         .and_then(|expected| expected.file(file_id))
         .and_then(|file| file.chunk(chunk_index))
         .map(|chunk| chunk.length)
@@ -710,7 +811,7 @@ pub async fn receive(
     State(state): State<ReceiverState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<(StatusCode, HeaderMap), (StatusCode, String)> {
     tracing::info!(body_size = body.len(), "chunk upload request received");
 
     let transfer = header(&headers, "Transfer-Id").map_err(|e| {
@@ -878,11 +979,30 @@ pub async fn receive(
     let download = {
         let downloads = state.downloads.read().await;
 
-        downloads.get(&transfer).cloned().ok_or((
-            StatusCode::NOT_FOUND,
-            "download state not found".to_string(),
-        ))?
+        match downloads.get(&transfer).cloned() {
+            Some(download) => download,
+
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "download state not found".to_string(),
+                ));
+            }
+        }
     };
+
+    /*
+     * A chunk that arrives after the file was published is not needed: the
+     * receiver answered the last chunk only once the file was delivered. It is
+     * acknowledged and dropped rather than written into a directory that no
+     * longer exists.
+     */
+    if matches!(
+        *download.status.lock().expect("download status poisoned"),
+        TransferStatus::Completed
+    ) {
+        return Ok((StatusCode::OK, HeaderMap::new()));
+    }
 
     let hash = Sha256::digest(transfer_key);
 
@@ -932,22 +1052,48 @@ pub async fn receive(
         "attempting chunk decrypt"
     );
 
-    let decrypted = match crypto::decrypt_chunk(&transfer_key, &nonce, &body) {
-        Ok(data) => data,
+    /*
+     * Decryption is CPU work on the whole chunk, so it goes to the blocking
+     * pool rather than stalling every other transfer sharing this runtime. The
+     * body is a `Bytes` — handed over by reference count, not copied.
+     */
+    let ciphertext_size = body.len();
+    let body_for_decrypt = body.clone();
 
-        Err(e) => {
+    let decrypted = match tokio::task::spawn_blocking(move || {
+        crypto::decrypt_chunk(&transfer_key, &nonce, &body_for_decrypt)
+    })
+    .await
+    {
+        Ok(Ok(data)) => data,
+
+        Ok(Err(e)) => {
             tracing::error!(
                 transfer_id=%transfer,
                 chunk=index,
                 error=%e,
                 nonce=%nonce_b64,
-                ciphertext_size=body.len(),
+                ciphertext_size,
                 "chunk decryption failed"
             );
 
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("chunk decrypt failed: {e}"),
+            ));
+        }
+
+        Err(error) => {
+            tracing::error!(
+                transfer_id=%transfer,
+                chunk=index,
+                %error,
+                "the chunk decryption task failed"
+            );
+
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the decryption task failed: {error}"),
             ));
         }
     };
@@ -1029,7 +1175,7 @@ pub async fn receive(
      * only once its bytes are fsynced, and its manifest entry is written only
      * after them.
      */
-    match chunk_sink::accept(&state, &download, &transfer, &file, index, &plaintext).await {
+    match chunk_sink::accept(&state, &download, &transfer, &file, index, plaintext).await {
         Ok(chunk_sink::Accepted::Stored | chunk_sink::Accepted::AlreadyPresent) => {}
 
         Err(chunk_sink::SinkError::Cancelled(_)) => {
@@ -1037,6 +1183,16 @@ pub async fn receive(
         }
 
         Err(error) => {
+            chunk_sink::finalize_download(
+                &state,
+                &download,
+                TransferStatus::Failed,
+                Some("persistence"),
+                Some(error.to_string()),
+                None,
+            )
+            .await;
+
             return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
         }
     }
@@ -1054,16 +1210,58 @@ pub async fn receive(
          * The two refusals keep their own status codes, because `409` and `422`
          * are frozen v1 and an installed client distinguishes them.
          */
-        Ok(chunk_sink::Completion::Refused { kind, message, .. }) => {
-            let status = match kind {
-                chunk_sink::Refusal::Pruned => StatusCode::CONFLICT,
-                chunk_sink::Refusal::IntegrityMismatch => StatusCode::UNPROCESSABLE_ENTITY,
-            };
+        Ok(chunk_sink::Completion::Refused {
+            kind,
+            lost,
+            message,
+        }) => {
+            match kind {
+                /*
+                 * The bytes that are still valid are kept; the ones named here
+                 * were dropped and have to come again. Naming them lets the
+                 * sender resend exactly those instead of failing the transfer
+                 * or starting over.
+                 */
+                chunk_sink::Refusal::Pruned => {
+                    let mut response_headers = HeaderMap::new();
 
-            return Err((status, message));
+                    let indices = lost
+                        .iter()
+                        .map(|index| index.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    if let Ok(value) = HeaderValue::from_str(&indices) {
+                        response_headers
+                            .insert(crate::transfer::http_client::MISSING_CHUNKS_HEADER, value);
+                    }
+
+                    return Ok((StatusCode::CONFLICT, response_headers));
+                }
+
+                chunk_sink::Refusal::IntegrityMismatch => {
+                    return Err((StatusCode::UNPROCESSABLE_ENTITY, message));
+                }
+            }
         }
 
         Err(error) => {
+            /*
+             * The file could not be assembled — a missing part, a disk error, a
+             * publish that failed. That is the receiver's own state, so it goes
+             * in the receiver's report with the stage that produced it, rather
+             * than only into a status code the sender reads as "retry".
+             */
+            chunk_sink::finalize_download(
+                &state,
+                &download,
+                TransferStatus::Failed,
+                Some("assembly"),
+                Some(error.to_string()),
+                None,
+            )
+            .await;
+
             return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
         }
     }
@@ -1074,7 +1272,7 @@ pub async fn receive(
         "chunk processing complete"
     );
 
-    Ok(StatusCode::OK)
+    Ok((StatusCode::OK, HeaderMap::new()))
 }
 
 pub async fn get_public_key(
@@ -1237,7 +1435,10 @@ async fn resume_state(
 ) -> Result<TransferResumeResponse, (StatusCode, String)> {
     let manifest_exists = fs::metadata(manifest::manifest_path(transfer_dir))
         .await
-        .is_ok();
+        .is_ok()
+        || fs::metadata(manifest::journal_path(transfer_dir))
+            .await
+            .is_ok();
 
     if !is_live && !manifest_exists {
         return Err((
@@ -1342,9 +1543,9 @@ pub async fn cancel_transfer(
     let transfer = header(&headers, "Transfer-Id")?;
 
     let was_known = {
-        let manifests = state.manifests.lock().await;
+        let cached = state.manifests.lock().await.contains_key(&transfer);
 
-        manifests.contains_key(&transfer) || state.downloads.read().await.contains_key(&transfer)
+        cached || state.downloads.read().await.contains_key(&transfer)
     };
 
     /*
@@ -1362,6 +1563,16 @@ pub async fn cancel_transfer(
         state.events.emit(DomainEvent::TransferCancelled {
             progress: progress::make_download(&download),
         });
+
+        chunk_sink::finalize_download(
+            &state,
+            &download,
+            TransferStatus::Cancelled,
+            None,
+            None,
+            Some("cancelled by the sender".into()),
+        )
+        .await;
     }
 
     state.keys.write().await.remove(&transfer);
@@ -1370,7 +1581,7 @@ pub async fn cancel_transfer(
     // removed from under a holder: an in-flight chunk owns an `Arc` to it and
     // finishes on the lock it already has.
     state.forget_transfer(&transfer).await;
-    state.manifests.lock().await.remove(&transfer);
+    state.forget_manifest(&transfer).await;
 
     match cleanup::remove_transfer(&state.root, &transfer).await {
         Ok(removed) => {
@@ -1421,7 +1632,7 @@ async fn sweep_abandoned(
     active: &HashSet<String>,
     ttl: Duration,
     now: SystemTime,
-    manifests: &tokio::sync::Mutex<HashMap<String, manifest::Manifest>>,
+    manifests: &tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<manifest::Manifest>>>>,
     keys: &tokio::sync::RwLock<HashMap<String, [u8; 32]>>,
 ) -> Vec<String> {
     let removed = cleanup::sweep(root, ttl, active, now).await;
@@ -1447,6 +1658,40 @@ async fn sweep_abandoned(
 /// could not delete.
 pub async fn run_cleanup(state: ReceiverState, ttl: Duration, interval: Duration) {
     loop {
+        /*
+         * A completed transfer keeps its download state until the next pass, so
+         * that a chunk still in flight when the file published is acknowledged
+         * rather than answered with "no such transfer". Once the transfer's
+         * directory is gone there is nothing left to answer for, so the state
+         * goes with it — bounded by one sweep interval.
+         */
+        {
+            let finished: Vec<String> = {
+                let downloads = state.downloads.read().await;
+
+                downloads
+                    .iter()
+                    .filter(|(_, download)| {
+                        matches!(
+                            *download.status.lock().expect("download status poisoned"),
+                            TransferStatus::Completed
+                                | TransferStatus::Failed
+                                | TransferStatus::Cancelled
+                        )
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+
+            if !finished.is_empty() {
+                let mut downloads = state.downloads.write().await;
+
+                for id in finished {
+                    downloads.remove(&id);
+                }
+            }
+        }
+
         let active: HashSet<String> = state.downloads.read().await.keys().cloned().collect();
 
         let removed = sweep_abandoned(
@@ -1541,6 +1786,7 @@ mod tests {
                 chunk_index: *index,
                 chunk_length: bytes.len() as u64,
                 chunk_hash: manifest::sha256_hex(bytes),
+                written_nanos: None,
             });
         }
 
@@ -1654,6 +1900,7 @@ mod tests {
                 chunk_index: *index,
                 chunk_length: bytes.len() as u64,
                 chunk_hash: manifest::sha256_hex(bytes),
+                written_nanos: None,
             });
         }
 
@@ -1679,6 +1926,7 @@ mod tests {
             chunk_index: index,
             chunk_length: bytes.len() as u64,
             chunk_hash: manifest::sha256_hex(bytes),
+            written_nanos: None,
         });
     }
 
@@ -1767,6 +2015,7 @@ mod tests {
             chunk_index: 1,
             chunk_length: 4,
             chunk_hash: manifest::sha256_hex(b"efgh"),
+            written_nanos: None,
         });
 
         let outcome = assemble_and_publish(&mut record, &transfer_dir, "f-1", 3, &destination)
@@ -1856,7 +2105,9 @@ mod tests {
 
         let manifests = tokio::sync::Mutex::new(HashMap::from([(
             "t-manifest".to_string(),
-            manifest::load_or_default(&dir, "t-manifest").await,
+            Arc::new(tokio::sync::Mutex::new(
+                manifest::load_or_default(&dir, "t-manifest").await,
+            )),
         )]));
         let keys = tokio::sync::RwLock::new(HashMap::from([("t-manifest".to_string(), [7u8; 32])]));
 
@@ -1894,7 +2145,9 @@ mod tests {
 
         let manifests = tokio::sync::Mutex::new(HashMap::from([(
             "t-manifest".to_string(),
-            manifest::load_or_default(&dir, "t-manifest").await,
+            Arc::new(tokio::sync::Mutex::new(
+                manifest::load_or_default(&dir, "t-manifest").await,
+            )),
         )]));
         let keys = tokio::sync::RwLock::new(HashMap::from([("t-manifest".to_string(), [7u8; 32])]));
 

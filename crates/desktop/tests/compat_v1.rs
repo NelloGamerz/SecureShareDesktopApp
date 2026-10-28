@@ -146,7 +146,7 @@ impl Sender {
 
     /// Upload one chunk through the real sender path.
     async fn send(&self, job: &ChunkJob) {
-        upload::upload_chunk(&self.session, job, 0)
+        upload::upload_chunk(&self.session, job, 0, &upload::FileHandles::default(), None)
             .await
             .expect("the v1 receiver must accept this chunk");
     }

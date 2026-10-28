@@ -141,6 +141,33 @@ pub fn encrypt_chunk(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedChunk,
     })
 }
 
+/// [`encrypt_chunk`], sealing the buffer in place.
+///
+/// The same bytes and the same nonce on the wire, without the copy the
+/// allocating form makes: a chunk is moved in, gains its 16-byte tag, and comes
+/// back as ciphertext. Used by the sender, where that copy is a full chunk of
+/// memory traffic per chunk.
+pub fn encrypt_chunk_in_place(
+    key: &[u8; 32],
+    mut plaintext: Vec<u8>,
+) -> Result<EncryptedChunk, String> {
+    use aes_gcm::aead::AeadInPlace;
+
+    let cipher = Aes256Gcm::new(key.into());
+
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    cipher
+        .encrypt_in_place(Nonce::from_slice(&nonce), b"", &mut plaintext)
+        .map_err(|e| e.to_string())?;
+
+    Ok(EncryptedChunk {
+        nonce: nonce.to_vec(),
+        data: plaintext,
+    })
+}
+
 pub fn decrypt_chunk(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new(key.into());
 

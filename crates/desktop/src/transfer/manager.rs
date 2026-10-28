@@ -3,6 +3,7 @@ use crate::services::local_transfer_file_service::LocalTransferFileService;
 use crate::transfer::http_client::SessionStart;
 use crate::transfer::integrity::{self, ExpectedTransfer};
 use crate::transfer::persist::{PersistedTransfer, TransferSecrets, TransferStore};
+use crate::transfer::report;
 use crate::transfer::resume;
 use crate::transfer::session::{LegacyV1Session, OpenRequest, ProtocolSession};
 use crate::{
@@ -33,12 +34,26 @@ use vilsend_core::{DomainEvent, EventSink};
 /// much, and the chunks it misses are simply sent again.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Milliseconds since `origin`, for the startup timeline every log line shares.
+fn since_ms(origin: Instant) -> u64 {
+    origin.elapsed().as_millis() as u64
+}
+
 /// How long a cancellation waits for the receiver to acknowledge it.
 ///
 /// Telling the receiver is best-effort: it is worth a moment, because it is what
 /// frees the receiver's disk now rather than at the next sweep, and it is not
 /// worth waiting on a peer that is gone.
 const RECEIVER_NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether the sender hashes its files and describes them to the receiver.
+///
+/// With this off, no digest pass runs and the receiver checks nothing about the
+/// assembled file. The per-chunk records the receiver writes for a resume are
+/// untouched — those are how a transfer knows what not to send again.
+///
+/// shortcut: integrity disabled, re-enable by setting this to `true`.
+pub(crate) const DESCRIBE_DIGESTS: bool = false;
 
 #[derive(Debug)]
 pub enum TransferEvent {
@@ -114,31 +129,61 @@ impl UploadManager {
              */
             let expected = self.store.load_plan(&record.transfer_id).await;
 
-            let mut transfers = self.transfers.lock().expect("transfer lock poisoned");
-
-            if transfers.contains_key(&record.transfer_id) {
-                continue;
-            }
-
             let status = record.resumable_status();
 
-            tracing::info!(
-                transfer_id = %record.transfer_id,
-                completed_chunks = record.completed_chunks.len(),
-                total_chunks = record.total_chunks,
-                ?status,
-                "restored a persisted transfer"
-            );
+            let state = Arc::new(restored_state(&record, expected));
 
-            transfers.insert(
-                record.transfer_id.clone(),
-                Arc::new(restored_state(&record, expected)),
-            );
+            {
+                let mut transfers = self.transfers.lock().expect("transfer lock poisoned");
+
+                if transfers.contains_key(&record.transfer_id) {
+                    continue;
+                }
+
+                tracing::info!(
+                    transfer_id = %record.transfer_id,
+                    completed_chunks = record.completed_chunks.len(),
+                    total_chunks = record.total_chunks,
+                    ?status,
+                    "restored a persisted transfer"
+                );
+
+                transfers.insert(record.transfer_id.clone(), Arc::clone(&state));
+            }
+
+            /*
+             * A transfer that reached a terminal state before the process ended
+             * may have died between that transition and writing its report. If
+             * the report is missing, write what the record still knows and say
+             * plainly that the timings were lost — a wrong report is worse than
+             * an incomplete one.
+             */
+            if matches!(
+                status,
+                TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Cancelled
+            ) {
+                self.recover_report(&state).await;
+            }
 
             restored += 1;
         }
 
         restored
+    }
+
+    /// Write a terminal transfer's report from what a restart restored, when
+    /// the live one never reached the disk.
+    async fn recover_report(&self, state: &Arc<UploadState>) {
+        let path = report::report_path(&self.store.reports_dir(), &state.transfer_id);
+
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return;
+        }
+
+        let status = state.status.lock().expect("status lock poisoned").clone();
+
+        self.finalize_report(state, status, None, None, None, true)
+            .await;
     }
 
     pub async fn start(&self, metadata: TransferMetadata) -> Result<TransferStatusResponse> {
@@ -164,6 +209,12 @@ impl UploadManager {
          * what makes "why has it not started yet?" answerable from the log.
          */
         let startup_started = Instant::now();
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            startup_ms = 0u64,
+            "startup: transfer start requested"
+        );
 
         // let files = scanner::scan(&metadata.file_paths).await?;
         let local_files = self
@@ -192,6 +243,7 @@ impl UploadManager {
             transfer_id = %metadata.transfer_id,
             files = files.len(),
             elapsed_ms = scan_started.elapsed().as_millis() as u64,
+            startup_ms = since_ms(startup_started),
             "startup phase: files scanned"
         );
 
@@ -213,19 +265,34 @@ impl UploadManager {
          * body limit accepts, instead of 16 MiB chunks it would refuse with 413.
          */
         let capabilities_started = Instant::now();
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            startup_ms = since_ms(startup_started),
+            "startup: capabilities request initiated"
+        );
+
         let capabilities = session.capabilities().await?;
 
         tracing::info!(
             transfer_id = %metadata.transfer_id,
             max_chunk_bytes = capabilities.max_chunk_bytes,
             elapsed_ms = capabilities_started.elapsed().as_millis() as u64,
-            "startup phase: receiver capabilities read"
+            startup_ms = since_ms(startup_started),
+            "startup: capabilities response received"
         );
 
+        let total_bytes = files.iter().map(|f| f.size).sum();
+
+        /*
+         * A backend may name a size, but never one above this build's cap: the
+         * cap is what keeps a stalled chunk cheap to retry. Otherwise the size
+         * follows the transfer's own size, within the same 256 KiB–1 MiB band.
+         */
         let requested_chunk_size = metadata
             .chunk_size
-            .unwrap_or(constants::DEFAULT_CHUNK_SIZE)
-            .max(1);
+            .unwrap_or_else(|| chunker::chunk_size_for(total_bytes))
+            .clamp(1, constants::MAX_PLANNED_CHUNK_SIZE);
 
         /*
          * Clamp to what the receiver accepts, and to what this build's body
@@ -248,63 +315,45 @@ impl UploadManager {
 
         let jobs = chunker::jobs(&metadata.transfer_id, &files, chunk_size);
 
-        let total_bytes = files.iter().map(|f| f.size).sum();
-
-        /*
-         * What each file hashes to, read from the files themselves before the
-         * first chunk moves. The receiver is handed these with the session so
-         * that it can tell the file it assembles from one that merely looks
-         * assembled — it has no other expectation it did not write itself.
-         *
-         * The report is the only thing the UI hears between "start" and the
-         * first acknowledged chunk, and for a large file that gap is the whole
-         * complaint: it looks frozen. The bytes reported are bytes *hashed*,
-         * not sent, so the first upload event starts the bar again from zero.
-         */
-        let plan_started = Instant::now();
-        let progress_id = metadata.transfer_id.clone();
-        let progress_events = Arc::clone(&self.events);
-        let progress: integrity::PlanProgress = Arc::new(move |hashed, total| {
-            progress_events.emit(DomainEvent::TransferProgress {
-                progress: vilsend_core::upload_progress(
-                    progress_id.clone(),
-                    hashed,
-                    total,
-                    plan_started.elapsed().as_secs_f64(),
-                    TransferStatus::Queued,
-                ),
-            });
-        });
-
-        let expected = integrity::plan_with_progress(
-            &metadata.transfer_id,
-            &files,
-            chunk_size,
-            Some(progress),
-        )
-        .await?;
-
         tracing::info!(
             transfer_id = %metadata.transfer_id,
-            chunks = expected.files.iter().map(|file| file.chunks.len()).sum::<usize>(),
-            elapsed_ms = plan_started.elapsed().as_millis() as u64,
-            "startup phase: digests planned"
+            chunks = jobs.len(),
+            startup_ms = since_ms(startup_started),
+            "startup: chunk jobs generated"
         );
 
         /*
-         * The handshake, and the key it settles on.
+         * The handshake comes before the digests, not after them.
          *
-         * The session derives this, not the engine. The two versions derive it
-         * differently — v1's KDF has no salt, v2's is salted with nonces that
-         * only exist once the handshake has run — so an engine that derived it
-         * itself could only ever speak v1. See `transfer::session`.
+         * It used to wait for a pass that read every byte of the transfer, which
+         * for a large file is the whole of "nothing is happening yet". The
+         * digests are not needed to open a session; they are needed before a
+         * file can be assembled and checked, which is why only each file's final
+         * chunk waits for them (see `scheduler::PlanGate`).
+         *
+         * The description is optional on the wire: a receiver that never hears
+         * it checks nothing, exactly as it did before this build.
          */
+        /*
+         * Everything up to here is initialization: loading the file list,
+         * scanning it, and asking the receiver what it accepts. The handshake
+         * is timed on its own, below.
+         */
+        let initialization_seconds = startup_started.elapsed().as_secs_f64();
+
         let handshake_started = Instant::now();
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            startup_ms = since_ms(startup_started),
+            "startup: handshake request initiated"
+        );
+
         let opened = session
             .open(OpenRequest {
                 transfer_id: &metadata.transfer_id,
                 file_size: total_bytes,
-                expected: Some(&expected),
+                expected: None,
                 existing_key: None,
             })
             .await?;
@@ -313,8 +362,11 @@ impl UploadManager {
             transfer_id = %metadata.transfer_id,
             start = ?opened.start,
             elapsed_ms = handshake_started.elapsed().as_millis() as u64,
-            "startup phase: handshake complete"
+            startup_ms = since_ms(startup_started),
+            "startup: handshake response received"
         );
+
+        let handshake_seconds = handshake_started.elapsed().as_secs_f64();
 
         let transfer_key = opened.transfer_key;
 
@@ -352,14 +404,19 @@ impl UploadManager {
                 .unwrap_or(constants::DEFAULT_MAX_RETRIES),
             status: Mutex::new(TransferStatus::Queued),
             started_at: std::time::Instant::now(),
+            startup_started,
             completed: Mutex::new(std::collections::HashSet::new()),
             running: false.into(),
             resume_lock: tokio::sync::Mutex::new(()),
-            // Cloned so the plan can also be written beside the transfer's state
-            // without borrowing across the state it now lives in.
-            expected: Mutex::new(Some(expected.clone())),
-            // The scan's own stamps are the ones this plan was made against.
+            // Worked out in the background, while the transfer runs.
+            expected: Mutex::new(None),
             plan_stamps: Mutex::new(std::collections::HashMap::new()),
+            report: report::Telemetry::new(report::Role::Sender),
+            phases: Mutex::new(report::PhaseTimings {
+                initialization_seconds: Some(initialization_seconds),
+                handshake_seconds: Some(handshake_seconds),
+                ..report::PhaseTimings::default()
+            }),
         });
         let response = state.snapshot();
         self.transfers
@@ -368,16 +425,42 @@ impl UploadManager {
             .insert(metadata.transfer_id.clone(), state.clone());
 
         /*
-         * Persist before any chunk moves. The plan and the secrets are written
-         * now so that a crash during the first chunk still leaves a transfer
-         * that can be described and continued, rather than one nobody knows the
-         * shape of.
+         * Persist before any chunk moves. The secrets are written now so that a
+         * crash during the first chunk still leaves a transfer that can be
+         * described and continued; the plan is written once it exists.
          */
+        let persistence_started = Instant::now();
+
         self.store_secrets(&state);
         self.persist(&state).await;
-        self.persist_plan(&metadata.transfer_id, &expected).await;
 
-        self.spawn_scheduler(state, jobs, Arc::new(session));
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            elapsed_ms = persistence_started.elapsed().as_millis() as u64,
+            startup_ms = since_ms(startup_started),
+            "startup: transfer state persisted"
+        );
+
+        let gate = Arc::new(scheduler::PlanGate::default());
+        let session: Arc<dyn ProtocolSession> = Arc::new(session);
+
+        if DESCRIBE_DIGESTS {
+            self.spawn_scheduler(
+                state.clone(),
+                jobs,
+                Arc::clone(&session),
+                Some(gate.clone()),
+            );
+            self.plan_in_background(state, session, gate);
+        } else {
+            self.spawn_scheduler(state, jobs, session, None);
+        }
+
+        tracing::info!(
+            transfer_id = %metadata.transfer_id,
+            startup_ms = since_ms(startup_started),
+            "startup: scheduler spawned"
+        );
 
         tracing::info!(
             transfer_id = %metadata.transfer_id,
@@ -387,6 +470,112 @@ impl UploadManager {
         );
 
         Ok(response)
+    }
+
+    /// Work out the digests while the transfer is already sending, then describe
+    /// them to the receiver and release the chunks that were waiting for them.
+    ///
+    /// The hashing is the expensive part of starting a large transfer, and it
+    /// does not have to happen before the bytes move: the chunks stream, and
+    /// only each file's last one is held back. A plan that cannot be worked out
+    /// fails the gate, so no file is ever completed unchecked.
+    fn plan_in_background(
+        &self,
+        state: Arc<UploadState>,
+        session: Arc<dyn ProtocolSession>,
+        gate: Arc<scheduler::PlanGate>,
+    ) {
+        let manager = self.clone();
+
+        tokio::spawn(async move {
+            let files = state.files.clone();
+            let chunk_size = state.chunk_size;
+
+            let expected =
+                match integrity::plan_with_progress(&state.transfer_id, &files, chunk_size, None)
+                    .await
+                {
+                    Ok(expected) => expected,
+
+                    Err(error) => {
+                        tracing::error!(
+                            transfer_id = %state.transfer_id,
+                            %error,
+                            "could not plan the transfer's digests; no file may complete"
+                        );
+
+                        gate.fail();
+
+                        return;
+                    }
+                };
+
+            tracing::info!(
+                transfer_id = %state.transfer_id,
+                "digest plan complete"
+            );
+
+            /*
+             * Kept even if the receiver cannot be told, so a resume does not
+             * have to read every file again. Written before the delivery so a
+             * crash between the two leaves a plan, not nothing.
+             */
+            state.set_expected(expected.clone());
+
+            if state.cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            manager.persist_plan(&state.transfer_id, &expected).await;
+
+            /*
+             * The handshake again, this time carrying the digests. A receiver
+             * that still has the transfer live answers `CONFLICT` and keeps its
+             * key — nothing is re-established, only the description is updated.
+             */
+            match session
+                .open(OpenRequest {
+                    transfer_id: &state.transfer_id,
+                    file_size: state.total_bytes,
+                    expected: Some(&expected),
+                    existing_key: Some(state.transfer_key()),
+                })
+                .await
+            {
+                Ok(opened) => {
+                    /*
+                     * `Established` means the receiver restarted while the plan
+                     * was being worked out and built a fresh session and key
+                     * from this handshake. Adopt its key; chunks already in
+                     * flight under the old one are refused and retried.
+                     */
+                    if opened.start == SessionStart::Established
+                        && opened.transfer_key != state.transfer_key()
+                    {
+                        let auth_token = state.auth_token();
+
+                        state.set_credentials(TransferCredentials {
+                            transfer_key: opened.transfer_key,
+                            auth_token,
+                        });
+
+                        manager.store_secrets(&state);
+                    }
+
+                    gate.release();
+                }
+
+                Err(error) => {
+                    tracing::error!(
+                        transfer_id = %state.transfer_id,
+                        %error,
+                        "could not describe the transfer's digests to the receiver"
+                    );
+
+                    gate.fail();
+                }
+            }
+        });
     }
 
     /// Start the workers that send `jobs` for a transfer.
@@ -405,6 +594,7 @@ impl UploadManager {
         state: Arc<UploadState>,
         jobs: Vec<ChunkJob>,
         session: Arc<dyn ProtocolSession>,
+        gate: Option<Arc<scheduler::PlanGate>>,
     ) {
         let manager = self.clone();
         let concurrency = state.concurrency;
@@ -435,7 +625,7 @@ impl UploadManager {
                 checkpointing.checkpoint(&s);
             });
             let result =
-                scheduler::run(jobs, concurrency, state.clone(), session, on_success).await;
+                scheduler::run(jobs, concurrency, state.clone(), session, on_success, gate).await;
 
             if state.cancelled.load(Ordering::Relaxed) {
                 state.set_running(false);
@@ -458,19 +648,28 @@ impl UploadManager {
                         progress: progress::make(&state),
                     });
 
+                    manager
+                        .finalize_report(&state, TransferStatus::Completed, None, None, None, false)
+                        .await;
+
                     manager.forget_plan(&state.transfer_id).await;
 
                     TransferEvent::Completed(state.transfer_id.clone())
                 }
-                Ok(()) => manager.fail_transfer(
-                    &state,
-                    format!(
-                        "the send queue drained with only {} of {} chunks acknowledged",
-                        state.uploaded_chunks.load(Ordering::Relaxed),
-                        state.planned_chunks()
-                    ),
-                ),
-                Err(error) => manager.fail_transfer(&state, error),
+                Ok(()) => {
+                    manager
+                        .fail_transfer(
+                            &state,
+                            "completion",
+                            format!(
+                                "the send queue drained with only {} of {} chunks acknowledged",
+                                state.uploaded_chunks.load(Ordering::Relaxed),
+                                state.planned_chunks()
+                            ),
+                        )
+                        .await
+                }
+                Err(error) => manager.fail_transfer(&state, "upload", error).await,
             };
 
             /*
@@ -491,14 +690,93 @@ impl UploadManager {
     ///
     /// The last progress sample carries the failed status, so a frontend that
     /// only follows progress events sees the transfer stop where it stopped.
-    fn fail_transfer(&self, state: &Arc<UploadState>, error: String) -> TransferEvent {
+    async fn fail_transfer(
+        &self,
+        state: &Arc<UploadState>,
+        stage: &str,
+        error: String,
+    ) -> TransferEvent {
         *state.status.lock().expect("status lock poisoned") = TransferStatus::Failed;
         tracing::error!(transfer_id=%state.transfer_id,error=%error,"transfer failed");
         self.events.emit(DomainEvent::TransferFailed {
             progress: progress::make(state),
         });
 
+        self.finalize_report(
+            state,
+            TransferStatus::Failed,
+            None,
+            Some(stage.to_owned()),
+            Some(error.clone()),
+            false,
+        )
+        .await;
+
         TransferEvent::Failed(state.transfer_id.clone(), error)
+    }
+
+    /// Write this transfer's performance report, once.
+    ///
+    /// The telemetry is what makes it exactly once: whichever terminal path
+    /// arrives first wins, and the rest are no-ops. A report that cannot be
+    /// written is logged and dropped — it is history, not state, and a transfer
+    /// must not fail over it.
+    async fn finalize_report(
+        &self,
+        state: &Arc<UploadState>,
+        status: TransferStatus,
+        cancellation_reason: Option<String>,
+        failure_stage: Option<String>,
+        failure_reason: Option<String>,
+        recovered: bool,
+    ) {
+        let chunk_size = state.chunk_size.max(1) as u64;
+
+        let files = state
+            .files
+            .iter()
+            .map(|file| report::FileDescriptor {
+                file_id: file.id.clone(),
+                relative_path: Some(file.relative_path.clone()),
+                size: file.size,
+                expected_chunks: file.size.div_ceil(chunk_size).max(1),
+            })
+            .collect();
+
+        let phases = state.phases.lock().expect("phases lock poisoned").clone();
+
+        let finish = report::Finish {
+            transfer_id: state.transfer_id.clone(),
+            status,
+            total_bytes: state.total_bytes,
+            completed_bytes: state.uploaded_bytes.load(Ordering::Relaxed),
+            total_chunks: state.total_chunks,
+            completed_chunks: state.uploaded_chunks.load(Ordering::Relaxed),
+            files,
+            retries: state.retry_count.load(Ordering::Relaxed) as u64,
+            failure_stage,
+            failure_reason,
+            cancellation_reason,
+            phases,
+            unavailable: vec![
+                "phases.final_assembly_seconds (the sender does not assemble)".into(),
+                "phases.verification_seconds (the sender does not verify the receiver's file)"
+                    .into(),
+                "phases.publication_seconds (the receiver publishes the file)".into(),
+                "resources are process-wide; concurrent transfers share them".into(),
+            ],
+            recovered,
+        };
+
+        state
+            .report
+            .finalize(
+                &self.store.reports_dir(),
+                finish,
+                crate::transfer::session::COMPRESSION_ENABLED,
+                DESCRIBE_DIGESTS,
+            )
+            .await;
     }
 
     /// Send the chunks a receiver is missing.
@@ -607,57 +885,61 @@ impl UploadManager {
         // The files with whichever stamps the current plan was made against.
         let files = state.files_with_stamps();
 
-        let expected = match state.expected() {
-            Some(expected)
-                if integrity::plan_is_current(
-                    &transfer_id,
-                    &expected,
-                    &files,
-                    state.chunk_size,
-                )
-                .await =>
-            {
-                tracing::info!(
-                    transfer_id = %transfer_id,
-                    elapsed_ms = plan_started.elapsed().as_millis() as u64,
-                    "resume phase: reused the persisted digest plan; no source file was re-read"
-                );
+        let expected = if !DESCRIBE_DIGESTS {
+            None
+        } else {
+            Some(match state.expected() {
+                Some(expected)
+                    if integrity::plan_is_current(
+                        &transfer_id,
+                        &expected,
+                        &files,
+                        state.chunk_size,
+                    )
+                    .await =>
+                {
+                    tracing::info!(
+                        transfer_id = %transfer_id,
+                        elapsed_ms = plan_started.elapsed().as_millis() as u64,
+                        "resume phase: reused the persisted digest plan; no source file was re-read"
+                    );
 
-                expected
-            }
+                    expected
+                }
 
-            previous => {
-                /*
-                 * Stamp before hashing, not after: a stamp older than the bytes
-                 * a plan describes only ever costs a re-hash on the next resume,
-                 * whereas one newer than them would let a stale plan be reused.
-                 */
-                let stamps = integrity::current_stamps(&files).await;
+                previous => {
+                    /*
+                     * Stamp before hashing, not after: a stamp older than the bytes
+                     * a plan describes only ever costs a re-hash on the next resume,
+                     * whereas one newer than them would let a stale plan be reused.
+                     */
+                    let stamps = integrity::current_stamps(&files).await;
 
-                let expected = integrity::plan_reusing(
-                    &transfer_id,
-                    &files,
-                    state.chunk_size,
-                    previous.as_ref(),
-                    // No progress report here: a resume's real progress is the
-                    // receiver's acknowledged chunks, and reporting bytes read
-                    // would overwrite that count with something smaller.
-                    None,
-                )
-                .await?;
+                    let expected = integrity::plan_reusing(
+                        &transfer_id,
+                        &files,
+                        state.chunk_size,
+                        previous.as_ref(),
+                        // No progress report here: a resume's real progress is the
+                        // receiver's acknowledged chunks, and reporting bytes read
+                        // would overwrite that count with something smaller.
+                        None,
+                    )
+                    .await?;
 
-                state.set_plan_stamps(stamps);
-                state.set_expected(expected.clone());
-                self.persist_plan(&transfer_id, &expected).await;
+                    state.set_plan_stamps(stamps);
+                    state.set_expected(expected.clone());
+                    self.persist_plan(&transfer_id, &expected).await;
 
-                tracing::info!(
-                    transfer_id = %transfer_id,
-                    elapsed_ms = plan_started.elapsed().as_millis() as u64,
-                    "resume phase: digest plan recomputed"
-                );
+                    tracing::info!(
+                        transfer_id = %transfer_id,
+                        elapsed_ms = plan_started.elapsed().as_millis() as u64,
+                        "resume phase: digest plan recomputed"
+                    );
 
-                expected
-            }
+                    expected
+                }
+            })
         };
 
         /*
@@ -667,15 +949,32 @@ impl UploadManager {
          * keeping the key it had — which is why the key this transfer was using
          * is handed in.
          */
+        /*
+         * A resume's own phases: everything before the handshake — loading the
+         * credentials, asking what the receiver holds, validating the plan — is
+         * initialization. The handshake is timed on its own, below.
+         */
+        {
+            let mut phases = state.phases.lock().expect("phases lock poisoned");
+
+            phases.initialization_seconds = Some(resume_started.elapsed().as_secs_f64());
+        }
+
         let handshake_started = Instant::now();
         let opened = session
             .open(OpenRequest {
                 transfer_id: &transfer_id,
                 file_size: state.total_bytes,
-                expected: Some(&expected),
+                expected: expected.as_ref(),
                 existing_key: Some(key),
             })
             .await?;
+
+        {
+            let mut phases = state.phases.lock().expect("phases lock poisoned");
+
+            phases.handshake_seconds = Some(handshake_started.elapsed().as_secs_f64());
+        }
 
         tracing::info!(
             transfer_id = %transfer_id,
@@ -718,7 +1017,8 @@ impl UploadManager {
          * transfer back off the disk.
          */
         let confirmation =
-            resume::confirmed_chunks_with_plan(report, &transfer_id, &jobs, Some(&expected)).await;
+            resume::confirmed_chunks_with_plan(report, &transfer_id, &jobs, expected.as_ref())
+                .await;
 
         if !confirmation.is_trusted() {
             tracing::warn!(
@@ -797,7 +1097,7 @@ impl UploadManager {
          */
         state.paused.store(false, Ordering::Relaxed);
 
-        self.spawn_scheduler(Arc::clone(state), missing, Arc::new(session));
+        self.spawn_scheduler(Arc::clone(state), missing, Arc::new(session), None);
 
         tracing::info!(
             transfer_id = %transfer_id,
@@ -851,7 +1151,13 @@ impl UploadManager {
 
         let record = state.to_persisted();
 
-        if let Err(error) = self.store.save(&record).await {
+        let started = Instant::now();
+
+        let saved = self.store.save(&record).await;
+
+        state.report.add_persistence(started.elapsed());
+
+        if let Err(error) = saved {
             tracing::warn!(
                 transfer_id = %state.transfer_id,
                 %error,
@@ -983,6 +1289,16 @@ impl UploadManager {
         self.events.emit(DomainEvent::TransferCancelled {
             progress: progress::make(&s),
         });
+
+        self.finalize_report(
+            &s,
+            TransferStatus::Cancelled,
+            Some("cancelled by the user".into()),
+            None,
+            None,
+            false,
+        )
+        .await;
         self.transfers
             .lock()
             .expect("transfer lock poisoned")
@@ -1035,7 +1351,7 @@ impl UploadManager {
     pub fn status(&self, id: &str) -> Result<TransferStatusResponse> {
         Ok(self.get(id)?.snapshot())
     }
-    fn get(&self, id: &str) -> Result<Arc<UploadState>> {
+    pub(crate) fn get(&self, id: &str) -> Result<Arc<UploadState>> {
         self.transfers
             .lock()
             .expect("transfer lock poisoned")
@@ -1078,6 +1394,7 @@ fn restored_state(
         max_retries: record.max_retries,
         status: Mutex::new(record.resumable_status()),
         started_at: Instant::now(),
+        startup_started: Instant::now(),
         completed: Mutex::new(std::collections::HashSet::new()),
         // Nothing is running after a restart.
         running: false.into(),
@@ -1092,6 +1409,22 @@ fn restored_state(
         // No refresh yet: the record's stamps are the plan's basis until a
         // resume finds something changed.
         plan_stamps: Mutex::new(std::collections::HashMap::new()),
+        /*
+         * The telemetry a checkpoint left, continued rather than replaced: a
+         * report recovered after a restart then knows how long the run took and
+         * how much of it moved, instead of reporting zeros.
+         */
+        report: crate::transfer::report::Telemetry::restore(
+            crate::transfer::report::Role::Sender,
+            record.report.as_ref(),
+        ),
+        phases: Mutex::new(
+            record
+                .report
+                .as_ref()
+                .map(|report| report.phases.clone())
+                .unwrap_or_default(),
+        ),
     };
 
     /*
@@ -1172,6 +1505,7 @@ mod tests {
             }],
             total_bytes: 4096,
             total_chunks: 4,
+            report: None,
             completed_chunks: (0..completed as u64)
                 .map(|chunk_index| PersistedChunk {
                     file_id: "f-1".into(),
@@ -1187,6 +1521,127 @@ mod tests {
      * A restart rebuilds what the previous run had
      * ----------------------------------------------------------------------
      */
+
+    #[tokio::test]
+    async fn a_terminal_transfer_that_died_before_its_report_is_reported_on_restart() {
+        let scratch = TempDir::new();
+        let store = Arc::new(TransferStore::in_memory(scratch.path().join("state")));
+
+        // A run that reached its terminal state and died before writing the
+        // report: the record is all that survived.
+        store
+            .save(&record("t-1", TransferStatus::Completed, 4))
+            .await
+            .expect("saving");
+
+        let manager = build_manager(Arc::clone(&store)).await;
+
+        assert_eq!(manager.restore_persisted().await, 1);
+
+        let path = store.reports_dir().join("t-1.json");
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the recovered report"))
+                .expect("json");
+
+        assert_eq!(json["transfer_id"], "t-1");
+        assert_eq!(json["status"], "COMPLETED");
+
+        assert_eq!(json["recovered"], true);
+
+        /*
+         * This record carries no telemetry — it was written before the transfer
+         * kept any — so there is no duration to report and the report must say
+         * so rather than claim the transfer took the microseconds since it was
+         * restored.
+         */
+        assert!(json["duration_seconds"].is_null());
+
+        let unavailable = json["unavailable"].as_array().expect("unavailable");
+
+        assert!(unavailable
+            .iter()
+            .any(|item| item.as_str().unwrap_or_default().starts_with("duration")));
+    }
+
+    #[tokio::test]
+    async fn a_recovered_report_keeps_the_measurements_the_checkpoint_saved() {
+        let scratch = TempDir::new();
+        let store = Arc::new(TransferStore::in_memory(scratch.path().join("state")));
+
+        let mut record = record("t-1", TransferStatus::Completed, 4);
+        record.report = Some(crate::transfer::report::PersistedTelemetry {
+            started_unix_ms: Some(1_700_000_000_000),
+            elapsed_ms: 20_000,
+            first_chunk_start_ms: Some(500),
+            first_chunk_ack_ms: Some(900),
+            upload_start_ms: Some(500),
+            upload_end_ms: Some(19_000),
+            files: vec![crate::transfer::report::PersistedFileTelemetry {
+                file_id: "f-1".into(),
+                first_ms: Some(500),
+                last_ms: Some(19_000),
+                chunks: 4,
+                bytes: 4096,
+                retries: 2,
+                failed: 0,
+                completed: false,
+            }],
+            ..crate::transfer::report::PersistedTelemetry::default()
+        });
+
+        store.save(&record).await.expect("saving");
+
+        let manager = build_manager(Arc::clone(&store)).await;
+        assert_eq!(manager.restore_persisted().await, 1);
+
+        let path = store.reports_dir().join("t-1.json");
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the recovered report"))
+                .expect("json");
+
+        assert_eq!(json["recovered"], true);
+        assert_eq!(json["status"], "COMPLETED");
+
+        assert!(
+            json["duration_seconds"].as_f64().unwrap() >= 20.0,
+            "the duration is the run's, not the instant of recovery"
+        );
+        assert!(json["throughput"]["mib_s"].is_number());
+        assert_eq!(json["files"][0]["chunks_done"], 4);
+        assert_eq!(json["files"][0]["retries"], 2);
+        assert_eq!(
+            json["files"][0]["outcome"], "unknown",
+            "acknowledged, but this side never saw the publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_does_not_overwrite_a_report_that_was_written() {
+        let scratch = TempDir::new();
+        let store = Arc::new(TransferStore::in_memory(scratch.path().join("state")));
+
+        store
+            .save(&record("t-1", TransferStatus::Completed, 4))
+            .await
+            .expect("saving");
+
+        let reports = store.reports_dir();
+        std::fs::create_dir_all(&reports).expect("reports dir");
+        std::fs::write(reports.join("t-1.json"), b"{\"written\":true}")
+            .expect("an existing report");
+
+        let manager = build_manager(Arc::clone(&store)).await;
+        manager.restore_persisted().await;
+
+        let bytes = std::fs::read(reports.join("t-1.json")).expect("reading");
+
+        assert_eq!(
+            bytes, b"{\"written\":true}",
+            "recovery must not replace a report the run itself wrote"
+        );
+    }
 
     #[tokio::test]
     async fn a_restart_restores_an_interrupted_transfer() {
@@ -1551,6 +2006,9 @@ mod resume_tests {
         /// The digests the sender described in its last `POST /transfer/start`,
         /// if it described any. `None` means the request carried none.
         described: StdMutex<Option<Value>>,
+        /// Every `POST /transfer/start` the sender made, in order, with the
+        /// digests it carried — `None` for a start that described nothing.
+        starts: StdMutex<Vec<Option<Value>>>,
         /// How many times the sender asked the receiver to cancel.
         cancelled: StdMutex<usize>,
     }
@@ -1576,11 +2034,17 @@ mod resume_tests {
         AxumState(receiver): AxumState<Arc<StubReceiver>>,
         body: Bytes,
     ) -> StatusCode {
+        let mut described = None;
+
         if let Ok(request) = serde_json::from_slice::<Value>(&body) {
-            if let Some(described) = request.get("expected") {
-                *receiver.described.lock().expect("described lock") = Some(described.clone());
+            if let Some(expected) = request.get("expected") {
+                described = Some(expected.clone());
+
+                *receiver.described.lock().expect("described lock") = Some(expected.clone());
             }
         }
+
+        receiver.starts.lock().expect("starts lock").push(described);
 
         if *receiver.session_already_active.lock().expect("active lock") {
             StatusCode::CONFLICT
@@ -1715,6 +2179,7 @@ mod resume_tests {
             }],
             total_bytes: size,
             total_chunks,
+            report: None,
             completed_chunks: completed
                 .iter()
                 .map(|chunk_index| PersistedChunk {
@@ -2216,8 +2681,62 @@ mod resume_tests {
      * ----------------------------------------------------------------------
      */
 
+    /*
+     * ----------------------------------------------------------------------
+     * Streaming: the session does not wait for the digests
+     * ----------------------------------------------------------------------
+     */
+
+    /// Opening the session must not wait for the hashing pass. The handshake is
+    /// made with nothing described, the transfer starts sending, and the
+    /// description follows on a second start once it exists.
+    ///
+    /// That the chunks behind it are really sent before the description is
+    /// proved by `scheduler::tests::every_chunk_but_the_last_streams_before_the_digests_are_ready`;
+    /// this asserts the sender actually makes that two-start handshake.
+    #[tokio::test]
+    async fn the_session_opens_before_the_files_are_hashed() {
+        if !super::DESCRIBE_DIGESTS {
+            return;
+        }
+        let scratch = TempDir::new();
+        let (receiver, endpoint) = serve_stub().await;
+
+        let (manager, _path) = registered(&scratch).await;
+
+        manager.start(metadata(&endpoint)).await.expect("starting");
+        let status = settle(&manager).await;
+
+        assert_eq!(status.status, TransferStatus::Completed);
+
+        let starts = receiver.starts.lock().expect("starts lock").clone();
+
+        assert!(
+            starts.len() >= 2,
+            "the transfer has to open a session and then describe its files, saw {} start(s)",
+            starts.len()
+        );
+        assert!(
+            starts[0].is_none(),
+            "the session must open before the hashing pass, not after it"
+        );
+        assert_eq!(
+            starts[1]
+                .as_ref()
+                .map(|expected| &expected["files"][0]["sha256"]),
+            Some(&serde_json::Value::String(described_sha256())),
+            "and the digests follow on the next start"
+        );
+
+        assert_eq!(receiver.received_indices(), vec![0, 1, 2]);
+    }
+
     #[tokio::test]
     async fn a_new_transfer_describes_what_its_files_should_hash_to() {
+        if !super::DESCRIBE_DIGESTS {
+            return;
+        }
+
         let scratch = TempDir::new();
         let (receiver, endpoint) = serve_stub().await;
 
@@ -2259,6 +2778,10 @@ mod resume_tests {
 
     #[tokio::test]
     async fn a_resume_describes_what_its_files_should_hash_to() {
+        if !super::DESCRIBE_DIGESTS {
+            return;
+        }
+
         let scratch = TempDir::new();
         let (receiver, endpoint) = serve_stub().await;
 
@@ -2629,6 +3152,10 @@ mod resume_tests {
 
     #[tokio::test]
     async fn a_resume_re_hashes_a_source_file_that_changed_after_it_was_planned() {
+        if !super::DESCRIBE_DIGESTS {
+            return;
+        }
+
         let scratch = TempDir::new();
         let (receiver, endpoint) = serve_stub().await;
         let path = scratch.path().join("a.bin");

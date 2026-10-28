@@ -51,6 +51,12 @@ pub struct UploadState {
     pub max_retries: u32,
     pub status: std::sync::Mutex<TransferStatus>,
     pub started_at: Instant,
+    /// When the request that started this transfer arrived.
+    ///
+    /// The origin every startup timing log is measured from, so the sender's
+    /// scan, handshake, scheduling and first chunk can be put on one timeline
+    /// instead of four.
+    pub startup_started: Instant,
     /// Which chunks the receiver has acknowledged.
     ///
     /// The counters above say how much has gone; this says *which*, which is
@@ -87,6 +93,10 @@ pub struct UploadState {
     /// scan's when the state is next written or validated. Empty until a
     /// re-plan happens.
     pub plan_stamps: std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
+    /// The performance report this transfer accumulates, written when it ends.
+    pub report: std::sync::Arc<crate::transfer::report::Telemetry>,
+    /// Phase timings the manager measured for the report.
+    pub phases: std::sync::Mutex<crate::transfer::report::PhaseTimings>,
 }
 impl UploadState {
     /// How many bytes one chunk of this transfer holds, or `None` when the plan
@@ -350,6 +360,15 @@ impl UploadState {
             total_chunks: self.total_chunks,
             completed_chunks: self.completed_chunks(),
             status: self.status.lock().expect("status lock poisoned").clone(),
+            /*
+             * The live telemetry, so a report written after a restart carries
+             * the measurements of the run rather than starting from zero. It is
+             * a snapshot, not the source of truth: only the report reads it.
+             */
+            report: Some(
+                self.report
+                    .snapshot(&self.phases.lock().expect("phases lock poisoned")),
+            ),
         }
     }
 
@@ -382,4 +401,10 @@ pub struct DownloadState {
     pub started_at: Instant,
 
     pub status: Mutex<TransferStatus>,
+
+    /// The performance report this transfer accumulates, written when it ends.
+    pub report: std::sync::Arc<crate::transfer::report::Telemetry>,
+
+    /// Phase timings the receiver measured for the report.
+    pub phases: Mutex<crate::transfer::report::PhaseTimings>,
 }

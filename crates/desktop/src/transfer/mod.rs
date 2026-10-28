@@ -29,6 +29,9 @@ pub mod manifest;
 pub mod merger;
 pub mod persist;
 pub mod progress;
+/// The per-transfer performance report: what the transfer did, written down
+/// once when it ends.
+pub mod report;
 /// The end-to-end suite: the real sender against the real receiver, interrupted
 /// every way it can be.
 #[cfg(test)]

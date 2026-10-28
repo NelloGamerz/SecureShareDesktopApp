@@ -31,7 +31,7 @@ use crate::{
         local_transfer_file_service::LocalTransferFileService,
     },
     transfer::{
-        manager::UploadManager,
+        manager::{UploadManager, DESCRIBE_DIGESTS},
         manifest,
         manifest::test_support::TempDir,
         persist::{InMemorySecretStore, SecretStore, TransferStore},
@@ -302,6 +302,8 @@ impl Drop for Receiver {
 struct Sender {
     manager: UploadManager,
     endpoint: String,
+    chunk_size: usize,
+    concurrency: usize,
 }
 
 impl Sender {
@@ -319,8 +321,8 @@ impl Sender {
             network_type: ConnectionType::Lan,
             endpoint: self.endpoint.clone(),
             auth_token: TOKEN.into(),
-            chunk_size: Some(CHUNK),
-            concurrency: Some(1),
+            chunk_size: Some(self.chunk_size),
+            concurrency: Some(self.concurrency),
             max_retries: Some(RETRIES),
         }
     }
@@ -329,6 +331,29 @@ impl Sender {
         self.manager
             .status(TRANSFER)
             .expect("the transfer is known")
+    }
+
+    /// Wait until the sender has worked out what its files should hash to.
+    ///
+    /// The digests are computed while the transfer runs, so a test that needs
+    /// them to describe the file *as it was when the transfer started* has to
+    /// wait for them before changing the file.
+    async fn wait_for_plan(&self) {
+        for _ in 0..2_000 {
+            if self
+                .manager
+                .get(TRANSFER)
+                .ok()
+                .and_then(|state| state.expected())
+                .is_some()
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        panic!("the sender never worked out its digests");
     }
 
     /// Stop the sender once `chunks` of it have landed, the way a user quitting
@@ -428,7 +453,11 @@ struct Harness {
 
 impl Harness {
     async fn new(chunks: u64) -> Self {
-        let size = chunks * CHUNK as u64;
+        Self::sized(chunks * CHUNK as u64).await
+    }
+
+    /// A harness whose source file is `size` bytes, for the throughput matrix.
+    async fn sized(size: u64) -> Self {
         let scratch = TempDir::new();
 
         let payload = scratch.path().join("payload");
@@ -529,6 +558,16 @@ impl Harness {
     /// Calling this twice is a sender restarting: the second one sees the first
     /// one's state file and keychain, and nothing of its memory.
     async fn sender(&self, receiver: &Receiver) -> Sender {
+        self.sender_with(receiver, CHUNK, 1).await
+    }
+
+    /// A sender with an explicit chunk size and concurrency, for the matrix.
+    async fn sender_with(
+        &self,
+        receiver: &Receiver,
+        chunk_size: usize,
+        concurrency: usize,
+    ) -> Sender {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -561,15 +600,14 @@ impl Harness {
                 )),
             ),
             endpoint: receiver.endpoint.clone(),
+            chunk_size,
+            concurrency,
         }
     }
 
     /// The chunks the receiver is holding, by index.
     async fn held(&self) -> Vec<u64> {
-        let manifest = manifest::load(&self.transfer_dir())
-            .await
-            .expect("reading the manifest")
-            .unwrap_or_else(|| manifest::Manifest::new(TRANSFER));
+        let manifest = manifest::load_or_default(&self.transfer_dir(), TRANSFER).await;
 
         let mut held: Vec<u64> = manifest
             .chunks
@@ -867,7 +905,7 @@ async fn a_chunk_altered_on_disk_is_sent_again_rather_than_merged() {
 /// The same-length version of this is covered by the restart test; this is the
 /// one that has to be caught without anything restarting.
 #[tokio::test]
-async fn a_chunk_that_goes_bad_mid_transfer_is_not_swallowed() {
+async fn a_chunk_that_goes_bad_mid_transfer_is_resent_rather_than_published() {
     let harness = Harness::new(6).await;
     harness.pace_chunks(Duration::from_millis(15));
 
@@ -912,26 +950,21 @@ async fn a_chunk_that_goes_bad_mid_transfer_is_not_swallowed() {
 
     drop(held);
 
-    let failed = sender.settle().await;
-
-    assert_eq!(
-        failed.status,
-        TransferStatus::Failed,
-        "a chunk the receiver can no longer verify must be refused, not counted as delivered"
-    );
-    assert!(
-        !harness.destination().exists(),
-        "and no file may be published from it"
-    );
-
-    sender.resume().await;
-
     let status = sender.settle().await;
 
-    assert_eq!(status.status, TransferStatus::Completed);
+    assert_eq!(
+        status.status,
+        TransferStatus::Completed,
+        "a chunk the receiver can no longer verify is refused, resent, and the transfer still completes"
+    );
     assert!(
         receiver_attempts(&harness, 0) >= 2,
-        "the damaged chunk has to be sent again"
+        "the damaged chunk is the one that has to be sent again"
+    );
+    assert_eq!(
+        receiver_attempts(&harness, 1),
+        1,
+        "the chunks that were still valid are kept, not sent again"
     );
 
     harness.assert_delivered();
@@ -1047,6 +1080,10 @@ async fn cancelling_a_transfer_clears_both_sides_and_stays_cleared() {
 
 #[tokio::test]
 async fn a_file_that_does_not_match_the_senders_digests_is_not_delivered() {
+    if !DESCRIBE_DIGESTS {
+        return;
+    }
+
     let harness = Harness::new(8).await;
     let receiver = harness.receiver().await;
 
@@ -1058,17 +1095,24 @@ async fn a_file_that_does_not_match_the_senders_digests_is_not_delivered() {
      *
      * That makes the window between "the sender worked out what it is sending"
      * and "the sender reads the fourth chunk" something a test can stand in.
-     * The digests were taken at the start, from the file as it was; the bytes
-     * for chunk four are read afterwards, from the file as it now is. Every
-     * chunk is individually fine — each one is exactly what the receiver was
-     * told to expect by way of its own record — and the file they assemble into
-     * is not the one the sender described.
+     * The digests describe the file as it was when they were worked out; the
+     * bytes for chunk four are read afterwards, from the file as it now is.
+     * Every chunk is individually fine — each one is exactly what the receiver
+     * was told to expect by way of its own record — and the file they assemble
+     * into is not the one the sender described.
      */
     let guard = receiver.state.transfer_lock(TRANSFER).await;
     let held = guard.lock().await;
 
     let sender = harness.sender(&receiver).await;
     sender.start().await;
+
+    /*
+     * The digests are worked out while the transfer runs now, so the test waits
+     * for them before changing the file. They then describe the original bytes,
+     * and the fourth chunk is read from the changed ones.
+     */
+    sender.wait_for_plan().await;
 
     assert!(
         harness.held().await.is_empty(),
@@ -1183,4 +1227,215 @@ async fn one_transfers_write_lock_does_not_block_another() {
         first.try_lock().is_err(),
         "one transfer's own chunks must serialise against each other"
     );
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Every transfer leaves a performance report
+ * ----------------------------------------------------------------------
+ */
+
+/// Wait for a report file to appear.
+///
+/// The sender's status turns `Completed` before its report is written — the
+/// report is history, written after the terminal event — so a test that reads
+/// it has to wait for it rather than assume it is already there.
+async fn wait_for_report(path: &std::path::Path) -> std::fs::File {
+    for _ in 0..2_000 {
+        if let Ok(file) = std::fs::File::open(path) {
+            return file;
+        }
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    panic!("no report at {}", path.display());
+}
+
+fn sender_report(harness: &Harness) -> std::path::PathBuf {
+    harness
+        .state_dir
+        .join("reports")
+        .join(format!("{TRANSFER}.json"))
+}
+
+fn receiver_report(receiver: &Receiver) -> std::path::PathBuf {
+    receiver
+        .state
+        .root
+        .join("reports")
+        .join(format!("{TRANSFER}.json"))
+}
+
+#[tokio::test]
+async fn a_completed_transfer_writes_a_sender_and_a_receiver_report() {
+    let harness = Harness::new(chunks()).await;
+    let receiver = harness.receiver().await;
+
+    let sender = harness.sender(&receiver).await;
+    sender.start().await;
+
+    assert_eq!(sender.settle().await.status, TransferStatus::Completed);
+
+    let sender_json: serde_json::Value =
+        serde_json::from_reader(wait_for_report(&sender_report(&harness)).await).expect("json");
+
+    assert_eq!(sender_json["role"], "sender");
+    assert_eq!(sender_json["status"], "COMPLETED");
+    assert_eq!(sender_json["transfer_id"], TRANSFER);
+    assert_eq!(sender_json["completed_chunks"], chunks());
+    assert!(sender_json["throughput"]["mib_s"].is_number());
+    assert!(sender_json["chunk_latency"]["p95_ms"].is_number());
+    assert_eq!(
+        sender_json["files"][0]["chunks_done"],
+        chunks(),
+        "every chunk was acknowledged"
+    );
+    assert_eq!(
+        sender_json["files"][0]["outcome"], "completed",
+        "the receiver acknowledges a file's last chunk only after publishing it"
+    );
+    assert_eq!(sender_json["completed_files"], 1);
+    assert_eq!(sender_json["unknown_files"], 0);
+
+    let receiver_json: serde_json::Value =
+        serde_json::from_reader(wait_for_report(&receiver_report(&receiver)).await).expect("json");
+
+    assert_eq!(receiver_json["role"], "receiver");
+    assert_eq!(receiver_json["transfer_id"], TRANSFER);
+    assert_eq!(receiver_json["status"], "COMPLETED");
+    assert_eq!(
+        receiver_json["files"][0]["outcome"], "completed",
+        "the receiver published it, so it can say so"
+    );
+    assert_eq!(receiver_json["completed_files"], 1);
+    assert!(receiver_json["phases"]["final_assembly_seconds"].is_number());
+    assert!(receiver_json["phases"]["verification_seconds"].is_number());
+}
+
+#[tokio::test]
+async fn a_cancelled_transfer_still_writes_a_report() {
+    let harness = Harness::new(chunks()).await;
+    let receiver = harness.receiver().await;
+
+    let sender = harness.sender(&receiver).await;
+    sender.start().await;
+    sender.stop_after(&harness, 2).await;
+
+    sender.manager.cancel(TRANSFER).await.expect("cancelling");
+
+    let json: serde_json::Value =
+        serde_json::from_reader(wait_for_report(&sender_report(&harness)).await).expect("json");
+
+    assert_eq!(json["status"], "CANCELLED");
+    assert_eq!(json["cancellation_reason"], "cancelled by the user");
+    assert!(json["completed_bytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn a_transfer_is_reported_once_even_when_failure_and_cancel_race() {
+    let harness = Harness::new(chunks()).await;
+    let receiver = harness.receiver().await;
+
+    let sender = harness.sender(&receiver).await;
+    sender.start().await;
+    sender.stop_after(&harness, 2).await;
+
+    // Cancel twice: the second is a no-op, and neither may write a second report.
+    let _ = sender.manager.cancel(TRANSFER).await;
+    let _ = sender.manager.cancel(TRANSFER).await;
+
+    let path = sender_report(&harness);
+
+    wait_for_report(&path).await;
+
+    assert!(path.is_file());
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Throughput matrix (run explicitly: --ignored --nocapture)
+ * ----------------------------------------------------------------------
+ *
+ * Real sender and real receiver over a loopback socket, one large file, the
+ * same settings the product ships with (compression and digests disabled).
+ * Every number printed comes from the transfer reports, not from arithmetic.
+ */
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "throughput matrix: run explicitly with --ignored --nocapture"]
+async fn bench_upload_matrix() {
+    const SIZE: u64 = 64 * 1024 * 1024;
+
+    println!(
+        "chunk_mib,concurrency,mib_s,wall_s,ack_p50_ms,ack_p95_ms,ack_p99_ms,\
+         cpu_avg_pct,cpu_peak_pct,mem_peak_mib,recv_accept_p50_ms,recv_persist_s,\
+         recv_assembly_s,read_pct,encrypt_pct,encrypt_cpu_pct,http_pct,status,failed"
+    );
+
+    for chunk_size in [4usize << 20, 8 << 20, 16 << 20] {
+        for concurrency in [4usize, 8, 12, 16] {
+            /*
+             * A fresh harness per run: the transfer id is fixed by the fixture,
+             * and a receiver directory left from the previous configuration
+             * would describe a different chunking of the same id.
+             */
+            let harness = Harness::sized(SIZE).await;
+
+            let _ = std::fs::remove_file(sender_report(&harness));
+
+            let receiver = harness.receiver().await;
+            let _ = std::fs::remove_file(receiver_report(&receiver));
+
+            let sender = harness
+                .sender_with(&receiver, chunk_size, concurrency)
+                .await;
+
+            let started = std::time::Instant::now();
+
+            sender.start().await;
+            let status = sender.settle().await;
+
+            let wall = started.elapsed().as_secs_f64();
+
+            let sender_json: serde_json::Value =
+                serde_json::from_reader(wait_for_report(&sender_report(&harness)).await)
+                    .expect("sender report");
+
+            let receiver_json: serde_json::Value =
+                serde_json::from_reader(wait_for_report(&receiver_report(&receiver)).await)
+                    .expect("receiver report");
+
+            println!(
+                "{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.1},{:.2},{:.2},{:.2},{:.1},{:.1},{:.1},{:.1},{:?},{}",
+                chunk_size >> 20,
+                concurrency,
+                sender_json["throughput"]["mib_s"].as_f64().unwrap_or_default(),
+                wall,
+                sender_json["chunk_latency"]["p50_ms"].as_f64().unwrap_or_default(),
+                sender_json["chunk_latency"]["p95_ms"].as_f64().unwrap_or_default(),
+                sender_json["chunk_latency"]["p99_ms"].as_f64().unwrap_or_default(),
+                sender_json["resources"]["cpu_average_percent"].as_f64().unwrap_or_default(),
+                sender_json["resources"]["cpu_peak_percent"].as_f64().unwrap_or_default(),
+                sender_json["resources"]["memory_peak_bytes"].as_u64().unwrap_or_default() as f64
+                    / (1024.0 * 1024.0),
+                receiver_json["chunk_latency"]["p50_ms"].as_f64().unwrap_or_default(),
+                receiver_json["phases"]["chunk_persistence_seconds"].as_f64().unwrap_or_default(),
+                receiver_json["phases"]["final_assembly_seconds"].as_f64().unwrap_or_default(),
+                sender_json["chunk_breakdown"]["read"]["share_percent"].as_f64().unwrap_or_default(),
+                sender_json["chunk_breakdown"]["encrypt"]["share_percent"].as_f64().unwrap_or_default(),
+                sender_json["chunk_breakdown"]["encrypt_cpu"]["share_percent"].as_f64().unwrap_or_default(),
+                sender_json["chunk_breakdown"]["http"]["share_percent"].as_f64().unwrap_or_default(),
+                status.status,
+                sender_json["failed_chunks"].as_u64().unwrap_or_default(),
+            );
+
+            if sender_json["status"] != "COMPLETED" {
+                println!(
+                    "#   reason: {} / {}",
+                    sender_json["failure_stage"].as_str().unwrap_or("-"),
+                    sender_json["failure_reason"].as_str().unwrap_or("-")
+                );
+            }
+        }
+    }
 }

@@ -1,11 +1,13 @@
-/// The size of one chunk, in bytes.
+/// The smallest chunk a sender plans.
+pub const MIN_CHUNK_SIZE: usize = 256 * 1024;
+
+/// The largest chunk a sender plans, whatever it is configured with.
 ///
-/// 16 MiB is the default because the per-request cost — a round trip, a header
-/// set, an AEAD tag, a manifest read-modify-write on the receiver — is paid once
-/// per chunk. Larger chunks amortise that better over a fast link; past this
-/// point the win is small and a chunk that fails has to be re-read and re-sent
-/// whole, so retry latency grows with it.
-pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+/// This is **not** [`MAX_CHUNK_SIZE`]: the receiver still accepts bodies up to
+/// that limit so installed senders keep working. The cap is a sender policy —
+/// a chunk this size fails and is retried in well under a second on a slow
+/// link, whereas a 16 MiB chunk made one stall cost twenty.
+pub const MAX_PLANNED_CHUNK_SIZE: usize = 512 * 1024;
 
 /// The largest chunk any sender may configure.
 ///
@@ -17,11 +19,10 @@ pub const MAX_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 /// The chunk size a sender falls back to when the receiver does not say what it
 /// can accept.
 ///
-/// This is what installed receivers have always been sent: their request-body
-/// limit is 10 MiB, so it is the largest value that is safe without negotiation.
-/// A sender that assumed the new 16 MiB default would get `413` from every
-/// installed peer.
-pub const LEGACY_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// This is a *maximum*, so an installed receiver — whose request-body limit is
+/// 10 MiB — accepts it comfortably. The sender never plans above
+/// [`MAX_PLANNED_CHUNK_SIZE`] anyway.
+pub const LEGACY_CHUNK_SIZE: usize = MAX_PLANNED_CHUNK_SIZE;
 
 /// The response header a receiver uses to state the largest chunk body it will
 /// accept.
@@ -29,10 +30,10 @@ pub const MAX_CHUNK_BYTES_HEADER: &str = "vilsend-max-chunk-bytes";
 
 /// How many chunks may be in flight at once.
 ///
-/// Each one holds a full chunk buffer on both sides, so this is a memory bound
-/// as much as a throughput setting: 8 × 16 MiB is 128 MiB of chunk buffers per
-/// process at the default chunk size.
-pub const DEFAULT_CONCURRENCY: usize = 8;
+/// This is the width of the scheduler's sliding window and the pool size the
+/// HTTP client keeps warm. With chunks capped at 512 KiB, 16 in flight is at
+/// most 8 MiB of chunk buffers per process.
+pub const DEFAULT_CONCURRENCY: usize = 16;
 
 pub const DEFAULT_MAX_RETRIES: u32 = 4;
 

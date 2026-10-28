@@ -50,6 +50,10 @@ mod tests {
             cancelled: AtomicBool::new(false),
             started_at: std::time::Instant::now(),
             status: Mutex::new(TransferStatus::Downloading),
+            report: crate::transfer::report::Telemetry::new(
+                crate::transfer::report::Role::Receiver,
+            ),
+            phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
         }
     }
 

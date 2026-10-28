@@ -14,6 +14,13 @@
 //! recorded. A `.part` with no entry is not complete, however plausible it
 //! looks — see [`chunk_complete`].
 //!
+//! An accepted chunk does not rewrite the manifest. It appends one line to
+//! `{transfer_dir}/chunks.journal`, which is replayed over the manifest when the
+//! transfer is loaded and folded back into it once it grows past
+//! [`JOURNAL_COMPACT_BYTES`]. Rewriting the whole document per chunk made a
+//! transfer quadratic in its own chunk count; an append is O(1) whatever the
+//! transfer's size.
+//!
 //! Everything here is storage, not wire: nothing in this module changes what
 //! the sender sends or what the receiver accepts. The manifest only decides
 //! what the receiver may skip re-writing.
@@ -37,6 +44,7 @@
 //!   which is extra work; trusting a manifest we cannot read would be
 //!   corruption.
 
+use crate::models::file_info::modified_nanos;
 use crate::transfer::atomic_file;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,6 +56,20 @@ use tokio::fs;
 
 /// The manifest's file name inside a transfer's directory.
 pub const MANIFEST_FILE: &str = "manifest.json";
+
+/// The chunk journal's file name inside a transfer's directory.
+///
+/// One JSON [`ChunkEntry`] per line, appended and synced once its `.part` is
+/// durable. It is replayed over the manifest by [`load_or_default`], and folded
+/// back into the manifest — and emptied — by [`store`].
+pub const CHUNK_JOURNAL_FILE: &str = "chunks.journal";
+
+/// How large the journal may grow before it is folded into the manifest.
+///
+/// A megabyte is a few thousand entries: replaying one at startup costs one
+/// read, and a transfer that reaches it rewrites its manifest once per megabyte
+/// of journal instead of once per chunk.
+const JOURNAL_COMPACT_BYTES: u64 = 1024 * 1024;
 
 /// The on-disk shape this build writes and understands.
 ///
@@ -67,6 +89,14 @@ pub struct ChunkEntry {
     pub chunk_length: u64,
     /// Hex SHA-256 of the plaintext chunk as written.
     pub chunk_hash: String,
+    /// When the `.part` file was written, in nanoseconds since the epoch.
+    ///
+    /// Recorded so that a chunk offered again can be recognised as already held
+    /// without reading it back: if the length and this modification time still
+    /// match, nothing has touched the file since this receiver wrote it.
+    /// Absent on entries written by older builds, which are hashed as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_nanos: Option<u64>,
 }
 
 /// A transfer's completed chunks.
@@ -208,9 +238,9 @@ pub async fn load(transfer_dir: &Path) -> io::Result<Option<Manifest>> {
 /// worst case is work already done — whereas failing the chunk or trusting the
 /// broken record is not.
 pub async fn load_or_default(transfer_dir: &Path, transfer_id: &str) -> Manifest {
-    match load(transfer_dir).await {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => Manifest::new(transfer_id),
+    let (mut manifest, replay) = match load(transfer_dir).await {
+        Ok(Some(manifest)) => (manifest, true),
+        Ok(None) => (Manifest::new(transfer_id), true),
         Err(error) => {
             tracing::warn!(
                 transfer_id,
@@ -219,8 +249,105 @@ pub async fn load_or_default(transfer_dir: &Path, transfer_id: &str) -> Manifest
                 "ignoring unreadable transfer manifest; completed chunks will be re-written"
             );
 
-            Manifest::new(transfer_id)
+            /*
+             * The journal is not replayed over a record this build could not
+             * read: a manifest that is unparseable may be from a format that
+             * means something else, and the journal was written to match it.
+             */
+            (Manifest::new(transfer_id), false)
         }
+    };
+
+    if replay {
+        replay_journal(transfer_dir, &mut manifest).await;
+    }
+
+    manifest
+}
+
+/// Fold the chunks journaled since the last compaction into `manifest`.
+///
+/// A line that does not parse is a crash mid-append — the bytes are a partial
+/// chunk's record and never a whole one, because a line is only durable once
+/// written in full. It is skipped rather than failing the load: the chunk it
+/// described is simply not counted, and is sent again.
+async fn replay_journal(transfer_dir: &Path, manifest: &mut Manifest) {
+    let bytes = match fs::read(journal_path(transfer_dir)).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                transfer_id = %manifest.transfer_id,
+                %error,
+                "could not read a transfer's chunk journal; its last chunks will be sent again"
+            );
+
+            return;
+        }
+    };
+
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_slice::<ChunkEntry>(line) {
+            Ok(entry) => manifest.record(entry),
+
+            Err(error) => tracing::warn!(
+                transfer_id = %manifest.transfer_id,
+                %error,
+                "skipping a partial line in the chunk journal"
+            ),
+        }
+    }
+}
+
+/// Append one accepted chunk to the journal, and make it durable.
+///
+/// Returns the journal's length afterwards, so the caller can decide whether it
+/// is time to compact. The append is not atomic on its own — a crash can leave
+/// half a line — but `replay_journal` skips exactly that, and a chunk that is
+/// not journaled is simply not counted.
+pub async fn journal(transfer_dir: &Path, entry: &ChunkEntry) -> io::Result<u64> {
+    use tokio::io::AsyncWriteExt;
+
+    fs::create_dir_all(transfer_dir).await?;
+
+    let path = journal_path(transfer_dir);
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+
+    let mut line = serde_json::to_vec(entry).map_err(io::Error::other)?;
+
+    line.push(b'\n');
+
+    file.write_all(&line).await?;
+    file.sync_all().await?;
+
+    Ok(file.metadata().await?.len())
+}
+
+/// Whether the journal has grown enough to be worth folding into the manifest.
+pub fn journal_is_full(length: u64) -> bool {
+    length >= JOURNAL_COMPACT_BYTES
+}
+
+/// Where a transfer's chunk journal lives.
+pub fn journal_path(transfer_dir: &Path) -> PathBuf {
+    transfer_dir.join(CHUNK_JOURNAL_FILE)
+}
+
+/// Empty the journal, if there is one.
+async fn clear_journal(transfer_dir: &Path) -> io::Result<()> {
+    match fs::remove_file(journal_path(transfer_dir)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -236,10 +363,22 @@ pub async fn load_or_default(transfer_dir: &Path, transfer_id: &str) -> Manifest
 /// The temporary is created next to the target rather than in the system temp
 /// directory precisely so that the rename cannot cross a filesystem boundary,
 /// which would make it a copy and lose the atomicity this function exists for.
+///
+/// The journal is emptied **before** the manifest is written. A manifest is
+/// written to state the whole truth — including a discarded chunk — so a crash
+/// between the two must leave the older, shorter truth and a journal that
+/// cannot resurrect what this call dropped. Losing recent journal lines costs a
+/// resend; resurrecting a chunk that was pruned would hand the sender a
+/// completion that can never assemble.
+///
+/// Callers must hold the transfer's manifest lock: emptying the journal is what
+/// makes this call safe against a concurrent [`journal`] append.
 pub async fn store(transfer_dir: &Path, manifest: &Manifest) -> io::Result<()> {
     fs::create_dir_all(transfer_dir).await?;
 
-    let bytes = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
+    clear_journal(transfer_dir).await?;
+
+    let bytes = serde_json::to_vec(manifest).map_err(io::Error::other)?;
 
     atomic_file::write_atomic(&manifest_path(transfer_dir), &bytes).await
 }
@@ -295,10 +434,34 @@ pub async fn part_matches(part: &Path, entry: &ChunkEntry) -> bool {
         return false;
     }
 
+    /*
+     * A `.part` whose length and modification time are exactly what this
+     * receiver recorded when it wrote it has not been touched since, so it
+     * still holds the bytes that were recorded and does not have to be read
+     * back. An entry with no recorded time — written by an older build — or a
+     * file whose stamp has moved is hashed as before.
+     */
+    if entry.written_nanos.is_some() && modified_nanos(&metadata) == entry.written_nanos {
+        return true;
+    }
+
     match fs::read(part).await {
-        Ok(bytes) => sha256_hex(&bytes) == entry.chunk_hash,
+        Ok(bytes) => sha256_off_thread(bytes)
+            .await
+            .map(|digest| digest == entry.chunk_hash)
+            .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// SHA-256 of `bytes`, on the blocking pool.
+///
+/// Hashing a chunk is a few milliseconds of pure CPU at the default chunk size.
+/// Doing it inline would stall every other task on the runtime for that long.
+pub async fn sha256_off_thread(bytes: Vec<u8>) -> io::Result<String> {
+    tokio::task::spawn_blocking(move || sha256_hex(&bytes))
+        .await
+        .map_err(io::Error::other)
 }
 
 /// The path of one chunk's `.part` file inside a file's parts directory.
@@ -314,8 +477,11 @@ pub fn part_path(parts_dir: &Path, chunk_index: u64) -> PathBuf {
 /// and the sender's are not describing the same bytes.
 pub async fn part_digest(part: &Path) -> Option<(u64, String)> {
     let bytes = fs::read(part).await.ok()?;
+    let length = bytes.len() as u64;
 
-    Some((bytes.len() as u64, sha256_hex(&bytes)))
+    let digest = sha256_off_thread(bytes).await.ok()?;
+
+    Some((length, digest))
 }
 
 /// Drop every chunk of `file_id` that the sender's digests do not vouch for.
@@ -672,6 +838,7 @@ mod tests {
             chunk_index: index,
             chunk_length: bytes.len() as u64,
             chunk_hash: sha256_hex(bytes),
+            written_nanos: None,
         }
     }
 
@@ -708,6 +875,7 @@ mod tests {
                 chunk_index: 3,
                 chunk_length: payload.len() as u64,
                 chunk_hash: sha256_hex(payload),
+                written_nanos: None,
             })
         );
         assert_eq!(reloaded.version, MANIFEST_VERSION);
@@ -1846,5 +2014,165 @@ mod tests {
 
         assert_eq!(discarded, vec![0, 1], "every chunk is asked for again");
         assert!(manifest.chunks.is_empty());
+    }
+
+    /*
+     * ----------------------------------------------------------------------
+     * The chunk journal
+     * ----------------------------------------------------------------------
+     */
+
+    #[tokio::test]
+    async fn a_journaled_chunk_survives_a_restart_without_a_manifest() {
+        let scratch = TempDir::new();
+        let dir = scratch.transfer_dir();
+
+        let bytes = b"one chunk".as_slice();
+        let length = journal(&dir, &entry("f-1", 2, bytes))
+            .await
+            .expect("journaling");
+
+        assert!(!journal_is_full(length));
+        assert!(!manifest_path(&dir).exists(), "nothing compacted yet");
+
+        let reloaded = load_or_default(&dir, "t-manifest").await;
+
+        assert_eq!(
+            reloaded
+                .entry("f-1", 2)
+                .map(|entry| entry.chunk_hash.as_str()),
+            Some(sha256_hex(bytes).as_str()),
+            "the journal is replayed over the (absent) manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_journal_line_is_skipped_rather_than_failing_the_load() {
+        let scratch = TempDir::new();
+        let dir = scratch.transfer_dir();
+
+        journal(&dir, &entry("f-1", 0, b"first"))
+            .await
+            .expect("journaling");
+
+        // What a crash mid-append leaves: half a line.
+        let mut torn = std::fs::read_to_string(journal_path(&dir)).expect("reading the journal");
+
+        torn.push_str("{\"file_id\":\"f-1\",\"chunk_index\":1,\"chunk_le");
+
+        std::fs::write(journal_path(&dir), torn).expect("tearing the journal");
+
+        let reloaded = load_or_default(&dir, "t-manifest").await;
+
+        assert_eq!(reloaded.chunks.len(), 1);
+        assert_eq!(reloaded.chunks[0].chunk_index, 0);
+    }
+
+    #[tokio::test]
+    async fn storing_folds_the_journal_into_the_manifest_and_empties_it() {
+        let scratch = TempDir::new();
+        let dir = scratch.transfer_dir();
+
+        let mut manifest = Manifest::new("t-manifest");
+        manifest.record(entry("f-1", 0, b"first"));
+        manifest.record(entry("f-1", 1, b"second"));
+
+        store(&dir, &manifest).await.expect("storing");
+
+        assert!(!journal_path(&dir).exists(), "the journal is spent");
+
+        let reloaded = load(&dir)
+            .await
+            .expect("reading")
+            .expect("the manifest is there");
+
+        assert_eq!(reloaded.chunks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn storing_a_discarded_chunk_does_not_resurrect_it() {
+        let scratch = TempDir::new();
+        let dir = scratch.transfer_dir();
+
+        journal(&dir, &entry("f-1", 0, b"first"))
+            .await
+            .expect("journaling");
+
+        journal(&dir, &entry("f-1", 1, b"second"))
+            .await
+            .expect("journaling");
+
+        // The second chunk was found to be wrong and dropped: the manifest
+        // written now is the whole truth, and the journal behind it must not
+        // bring back what it left out.
+        let mut manifest = Manifest::new("t-manifest");
+        manifest.record(entry("f-1", 0, b"first"));
+
+        store(&dir, &manifest).await.expect("storing");
+
+        let reloaded = load_or_default(&dir, "t-manifest").await;
+
+        assert_eq!(reloaded.chunks.len(), 1);
+        assert!(reloaded.entry("f-1", 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_its_own_stamp_is_not_read_back() {
+        let scratch = TempDir::new();
+        let dir = scratch.transfer_dir();
+        let parts = dir.join("f-1");
+
+        std::fs::create_dir_all(&parts).expect("creating the parts directory");
+
+        let bytes = b"one chunk".as_slice();
+        let part = part_path(&parts, 0);
+
+        write_part(&part, bytes).await.expect("writing the part");
+
+        let stamped = std::fs::metadata(&part).expect("the part is there");
+        let written_nanos = modified_nanos(&stamped);
+
+        let mut recorded = entry("f-1", 0, bytes);
+        recorded.written_nanos = written_nanos;
+
+        assert!(
+            part_matches(&part, &recorded).await,
+            "the bytes are what was written and the stamp says untouched"
+        );
+
+        /*
+         * An entry with no stamp — written by an older build — is still
+         * verified, and still by hashing.
+         */
+        let mut unstamped = entry("f-1", 0, bytes);
+        unstamped.written_nanos = None;
+
+        assert!(part_matches(&part, &unstamped).await);
+    }
+
+    #[tokio::test]
+    async fn a_stamped_chunk_whose_bytes_changed_does_not_match() {
+        let scratch = TempDir::new();
+        let dir = scratch.transfer_dir();
+        let parts = dir.join("f-1");
+
+        std::fs::create_dir_all(&parts).expect("creating the parts directory");
+
+        let bytes = b"one chunk".as_slice();
+        let part = part_path(&parts, 0);
+
+        write_part(&part, bytes).await.expect("writing the part");
+
+        let mut recorded = entry("f-1", 0, bytes);
+        recorded.written_nanos =
+            modified_nanos(&std::fs::metadata(&part).expect("the part is there"));
+
+        // Same length, different bytes, written after the stamp was taken.
+        write_part(&part, b"another!!").await.expect("altering");
+
+        assert!(
+            !part_matches(&part, &recorded).await,
+            "the bytes are not the ones the entry describes"
+        );
     }
 }

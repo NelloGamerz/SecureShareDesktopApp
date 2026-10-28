@@ -21,6 +21,13 @@ pub enum TransferError {
     /// peer's body is not the encoding it declared.
     #[error("compression error: {0}")]
     Compression(String),
+    /// The receiver refused a chunk and named the chunks it no longer holds.
+    ///
+    /// Distinct from a receiver error because it is actionable: the sender can
+    /// send exactly these again instead of failing the transfer or resending
+    /// everything.
+    #[error("receiver is missing chunks: {missing:?}")]
+    ChunksMissing { missing: Vec<u64> },
     /// A peer sent something that is not the protocol.
     ///
     /// Its own variant because only the v2 framed session can produce it, and
