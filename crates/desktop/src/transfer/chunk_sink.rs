@@ -548,7 +548,19 @@ pub(crate) async fn finish(
             // Whatever was refused before, the file is delivered now.
             state.refused.lock().await.remove(transfer_id);
 
-            *download.status.lock().expect("download status poisoned") = TransferStatus::Completed;
+            /*
+             * A published file is no longer progress the receiver still holds,
+             * so its chunk records go too. One `DownloadState` covers the whole
+             * transfer — several files arrive under one id — and the transfer is
+             * done only once no file has chunks left and every expected byte has
+             * arrived. Marking it `Completed` on the first file, as this did
+             * while a transfer was one file, made every later file's chunks be
+             * answered as already delivered and never written.
+             */
+            record.chunks.retain(|entry| entry.file_id != file_id);
+
+            let transfer_complete = record.chunks.is_empty()
+                && download.received_bytes.load(Ordering::Relaxed) >= download.total_bytes;
 
             {
                 let mut phases = download.phases.lock().expect("phases lock poisoned");
@@ -558,11 +570,17 @@ pub(crate) async fn finish(
 
             download.report.file_completed(file_id);
 
-            finalize_download(state, download, TransferStatus::Completed, None, None, None).await;
+            if transfer_complete {
+                *download.status.lock().expect("download status poisoned") =
+                    TransferStatus::Completed;
 
-            state.events.emit(DomainEvent::TransferCompleted {
-                progress: progress::make_download(download),
-            });
+                finalize_download(state, download, TransferStatus::Completed, None, None, None)
+                    .await;
+
+                state.events.emit(DomainEvent::TransferCompleted {
+                    progress: progress::make_download(download),
+                });
+            }
 
             /*
              * The completed state stays in the map until the next sweep, so a
@@ -577,7 +595,9 @@ pub(crate) async fn finish(
 
             // Likewise its write lock: the transfer is delivered and has no next
             // chunk.
-            state.forget_transfer(transfer_id).await;
+            if transfer_complete {
+                state.forget_transfer(transfer_id).await;
+            }
 
             tracing::info!(
                 transfer_id,
@@ -600,9 +620,12 @@ pub(crate) async fn finish(
              * The parts are gone, so the manifest that described them is no
              * longer worth caching. It stays on disk — a transfer that restarts
              * under the same id will load it, find no backing `.part` files, and
-             * re-write the chunks, which is the safe answer.
+             * re-write the chunks, which is the safe answer. A transfer with
+             * files still to publish keeps its manifest in memory.
              */
-            state.forget_manifest(transfer_id).await;
+            if transfer_complete {
+                state.forget_manifest(transfer_id).await;
+            }
 
             Ok(Completion::Published)
         }
@@ -862,6 +885,86 @@ mod tests {
 
         assert!(matches!(storage, SinkError::Storage(_)));
         assert!(!matches!(storage, SinkError::Cancelled(_)));
+    }
+
+    struct TestHostWithDownloads(std::path::PathBuf);
+
+    impl crate::transfer::writer::ReceiverHost for TestHostWithDownloads {
+        fn downloads_root(&self) -> std::result::Result<std::path::PathBuf, String> {
+            Ok(self.0.clone())
+        }
+
+        fn available_space(&self, _path: &std::path::Path) -> std::result::Result<u64, String> {
+            Ok(u64::MAX)
+        }
+
+        fn device_private_key(&self) -> std::result::Result<String, String> {
+            Ok(String::new())
+        }
+
+        fn device_public_key(&self) -> std::result::Result<String, String> {
+            Ok(String::new())
+        }
+    }
+
+    fn unique_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "vilsend-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_nanos()
+        ))
+    }
+
+    /// A folder arrives as several files under one transfer id. The transfer is
+    /// done when the last file publishes, not the first: marking it complete
+    /// early makes the receiver answer every remaining chunk as already
+    /// delivered, and only one file of the folder is ever written.
+    #[tokio::test]
+    async fn a_transfer_completes_after_its_last_file_not_its_first() {
+        let root = unique_root("sink-multi");
+        let downloads = root.join("downloads");
+
+        let state = ReceiverState::new(
+            std::sync::Arc::new(TestHostWithDownloads(downloads.clone())),
+            std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
+            root.clone(),
+        );
+
+        let download = DownloadState {
+            total_bytes: 10,
+            ..download("t-multi")
+        };
+
+        for (file_id, bytes) in [("f-1", b"first".as_slice()), ("f-2", b"secnd")] {
+            assert!(matches!(
+                accept(&state, &download, "t-multi", file_id, 0, bytes.to_vec()).await,
+                Ok(Accepted::Stored)
+            ));
+        }
+
+        let first = finish(&state, &download, "t-multi", "f-1", 1, "nested/first.bin").await;
+
+        assert!(matches!(first, Ok(Completion::Published)));
+        assert_ne!(
+            *download.status.lock().expect("status"),
+            TransferStatus::Completed,
+            "one file of two is not the whole transfer"
+        );
+
+        let second = finish(&state, &download, "t-multi", "f-2", 1, "nested/second.bin").await;
+
+        assert!(matches!(second, Ok(Completion::Published)));
+        assert_eq!(
+            *download.status.lock().expect("status"),
+            TransferStatus::Completed
+        );
+        assert!(downloads.join("nested/first.bin").exists());
+        assert!(downloads.join("nested/second.bin").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     struct TestHost;

@@ -287,6 +287,11 @@ export function TransfersPage() {
                     t.status === "DOWNLOADING" ||
                     t.status === "IN_PROGRESS";
 
+                  const elapsedSeconds =
+                    (new Date(t.updatedAt).getTime() -
+                      new Date(t.createdAt).getTime()) /
+                    1000;
+
                   return (
                     <motion.tr
                       key={t.id}
@@ -409,6 +414,12 @@ export function TransfersPage() {
                         <span className="text-sm text-muted-foreground">
                           {new Date(t.createdAt).toLocaleString()}
                         </span>
+
+                        {t.status === "COMPLETED" && elapsedSeconds > 0 && (
+                          <span className="block text-[11px] text-muted-foreground">
+                            Completed in {formatDuration(elapsedSeconds)}
+                          </span>
+                        )}
                       </TableCell>
 
                       <TableCell>

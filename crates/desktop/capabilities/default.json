@@ -12,6 +12,7 @@
     "dialog:default",
     "fs:allow-stat",
     "fs:allow-read",
+    "fs:allow-read-dir",
     "log:default"
   ]
 }

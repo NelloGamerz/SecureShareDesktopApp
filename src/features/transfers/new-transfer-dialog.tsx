@@ -1,6 +1,7 @@
 import * as React from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { stat } from "@tauri-apps/plugin-fs";
+import { readDir, stat } from "@tauri-apps/plugin-fs";
+import { join } from "@tauri-apps/api/path";
 import { saveLocalTransferFile } from "@/api/tauri";
 
 import { getDeviceInfo } from "@/services/getDeviceInfo";
@@ -59,6 +60,26 @@ async function selectPaths(options: PickerOptions): Promise<string[]> {
   }
 
   return Array.isArray(result) ? result : [result];
+}
+
+// `stat` reports a directory's own entry size (~0), not its contents, so a
+// picked folder must be walked to get the bytes the transfer will send.
+async function pathSize(path: string): Promise<number> {
+  const info = await stat(path);
+
+  if (!info.isDirectory) {
+    return info.size;
+  }
+
+  let total = 0;
+
+  for (const entry of await readDir(path)) {
+    if (entry.isDirectory || entry.isFile) {
+      total += await pathSize(await join(path, entry.name));
+    }
+  }
+
+  return total;
 }
 
 function displayPath(path: string) {
@@ -611,12 +632,10 @@ export function NewTransferDialog({
 
       const files = await Promise.all(
         paths.map(async (path) => {
-          const fileInfo = await stat(path);
-
           return {
             path,
             name: displayPath(path),
-            size: fileInfo.size,
+            size: await pathSize(path),
           };
         }),
       );
@@ -927,7 +946,7 @@ export function NewTransferDialog({
                         font-semibold
                       "
                   >
-                    {paths.length} file{paths.length === 1 ? "" : "s"}
+                    {paths.length} item{paths.length === 1 ? "" : "s"}
                   </p>
                 </div>
 

@@ -12,11 +12,12 @@ pub async fn scan(paths: &[String]) -> Result<Vec<FileInfo>> {
     let mut files = Vec::new();
     for source in paths {
         let p = PathBuf::from(source);
-        let base = if p.is_dir() {
-            p.clone()
-        } else {
-            p.parent().unwrap_or(Path::new("")).to_path_buf()
-        };
+        /*
+         * Relative to the *parent*, so a picked folder arrives as itself —
+         * `Photos/a.jpg`, not `a.jpg` — and the receiver writes the folder as
+         * it was on disk rather than its contents loose in the download root.
+         */
+        let base = p.parent().unwrap_or(Path::new("")).to_path_buf();
         visit(&p, &base, &mut files).await?;
     }
     Ok(files)
