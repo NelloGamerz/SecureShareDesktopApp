@@ -13,6 +13,11 @@ pub enum ServerCommand {
         chunk_size: Option<usize>,
         concurrency: Option<usize>,
         max_retries: Option<u32>,
+        /// Optional sibling of the tunnel fields. Kept untyped so a malformed
+        /// manifest cannot fail the whole command — the dispatcher parses it and
+        /// falls back to the tunnel on error.
+        #[serde(default)]
+        transport_manifest: Option<serde_json::Value>,
     },
 
     #[serde(rename = "CANCEL_TRANSFER")]

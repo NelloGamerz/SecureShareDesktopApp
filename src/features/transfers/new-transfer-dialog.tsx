@@ -640,19 +640,10 @@ export function NewTransferDialog({
         }),
       );
 
-      const response = await createTransfer.mutateAsync({
-        receiverId,
-
-        senderDeviceIdentifier: deviceInfo.deviceIdentifier,
-
-        files: files.map((file) => ({
-          name: file.name,
-          size: file.size,
-        })),
-      });
-
       /*
-      Save local file mapping after backend creates transfer.
+      One backend transfer per selected file, so each 5 files means 5 POSTs.
+
+      Save local file mapping after each backend transfer is created.
 
       Backend stores:
       - transfer id
@@ -665,14 +656,27 @@ export function NewTransferDialog({
       - size
     */
       await Promise.all(
-        files.map((file) =>
-          saveLocalTransferFile({
+        files.map(async (file) => {
+          const response = await createTransfer.mutateAsync({
+            receiverId,
+
+            senderDeviceIdentifier: deviceInfo.deviceIdentifier,
+
+            files: [
+              {
+                name: file.name,
+                size: file.size,
+              },
+            ],
+          });
+
+          await saveLocalTransferFile({
             transfer_id: response.transferId,
             file_path: file.path,
             file_name: file.name,
             file_size: file.size,
-          }),
-        ),
+          });
+        }),
       );
 
       changeOpen(false);

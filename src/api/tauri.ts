@@ -151,6 +151,21 @@ export function onTransferEvent(
   return listen<TransferProgress>(event, ({ payload }) => callback(payload));
 }
 
+/** The path the sender chose for a transfer, for the UI to show. */
+export type ChosenTransport = "LAN" | "P2P" | "Bluetooth" | "Relay" | "Tunnel";
+
+export function onTransportSelected(
+  callback: (selection: {
+    transferId: string;
+    transport: ChosenTransport;
+  }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ transferId: string; transport: ChosenTransport }>(
+    "transfer-transport",
+    ({ payload }) => callback(payload),
+  );
+}
+
 export function onTransferRequest(
   callback: (request: TransferRequestPayload) => void,
 ): Promise<UnlistenFn> {

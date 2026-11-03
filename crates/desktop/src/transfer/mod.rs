@@ -44,5 +44,9 @@ pub mod scheduler;
 /// transfer. `LegacyV1Session` is the frozen v1 wire behind that seam.
 pub mod session;
 pub mod state;
+/// The optional transport manifest on ACCEPT and the sender's choice of path
+/// from it. Absent entirely from an old receiver, in which case the sender is
+/// unchanged.
+pub mod transport_manifest;
 pub mod upload;
 pub mod writer;

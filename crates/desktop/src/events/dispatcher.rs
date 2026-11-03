@@ -5,6 +5,8 @@ use tauri::{AppHandle, Emitter};
 
 use crate::models::TransferMetadata;
 use crate::transfer::manager::UploadManager;
+use crate::transfer::transport_manifest::{self, TransportManifest};
+use vilsend_core::TransportKind;
 use crate::websocket::WebSocketManager;
 use crate::{error::AppError, transfer::manager::TransferEvent};
 // use crate::websocket::ServerCommand;
@@ -47,6 +49,24 @@ impl EventDispatcher {
         let payload = serde_json::to_value(payload).map_err(AppError::from)?;
 
         self.emit("transfer-request", payload).await
+    }
+
+    /// Tells the webview which path the sender chose.
+    ///
+    /// Emitted only for a `START_TRANSFER` that carried a manifest, so an old
+    /// receiver produces no event that did not exist before.
+    pub async fn emit_transport_selected(
+        &self,
+        transfer_id: &str,
+        transport: &str,
+    ) -> Result<(), AppError> {
+        let payload = serde_json::json!({
+            "type": "transfer-transport",
+            "transferId": transfer_id,
+            "transport": transport,
+        });
+
+        self.emit("transfer-transport", payload).await
     }
 
     async fn emit(&self, event_name: &str, payload: Value) -> Result<(), AppError> {
@@ -99,7 +119,55 @@ impl EventDispatcher {
                 chunk_size,
                 concurrency,
                 max_retries,
+                // Renamed so it does not shadow the module of the same name.
+                transport_manifest: raw_manifest,
             } => {
+                /*
+                 * The manifest is optional. Parsing is deliberately separate
+                 * from reading the command so a malformed one costs the
+                 * manifest and nothing else — the command still starts over the
+                 * tunnel with the fields it arrived with.
+                 */
+                let manifest_present = raw_manifest.is_some();
+                // Kept for the report: this is exactly what the backend sent.
+                let manifest_for_report = raw_manifest.clone();
+
+                let selected = match raw_manifest {
+                    Some(value) => match serde_json::from_value::<TransportManifest>(value) {
+                        Ok(manifest) => transport_manifest::select(&manifest).await,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "malformed transport manifest; using the tunnel path"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
+                // No manifest, or nothing in it this build can dial: keep the
+                // endpoint exactly as it arrived, which is what the sender did
+                // before manifests existed.
+                let endpoint = selected
+                    .as_ref()
+                    .and_then(|choice| choice.direct_endpoint.clone())
+                    .unwrap_or(endpoint);
+
+                if manifest_present {
+                    let kind = selected
+                        .as_ref()
+                        .map(|choice| choice.kind)
+                        .unwrap_or(TransportKind::Tunnel);
+
+                    self.emit_transport_selected(
+                        &transfer_id,
+                        transport_manifest::transport_label(kind),
+                    )
+                    .await
+                    .ok();
+                }
+
                 let metadata = TransferMetadata {
                     transfer_id,
                     // transfer_key,
@@ -111,6 +179,11 @@ impl EventDispatcher {
                     chunk_size,
                     concurrency,
                     max_retries,
+                    transport: selected
+                        .as_ref()
+                        .map(|choice| transport_manifest::transport_label(choice.kind).to_string())
+                        .or_else(|| manifest_present.then(|| "Tunnel".to_string())),
+                    transport_manifest: manifest_for_report,
                 };
 
                 self.upload_manager

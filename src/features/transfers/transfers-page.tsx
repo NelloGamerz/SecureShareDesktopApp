@@ -156,6 +156,16 @@ export function TransfersPage() {
     );
   };
 
+  const handleAcceptAll = () => {
+    uniqueRequests.forEach((request) => {
+      handleTransferAction(
+        request.transfer_id,
+        "ACCEPT",
+        request.transfer_id,
+      );
+    });
+  };
+
   return (
     <PageContainer>
       <PageHeader
@@ -172,9 +182,22 @@ export function TransfersPage() {
       {uniqueRequests.length > 0 && (
         <Card className="mb-4">
           <CardContent className="space-y-3 p-4">
-            <h3 className="text-sm font-semibold">
-              Incoming transfer requests
-            </h3>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">
+                Incoming transfer requests
+              </h3>
+
+              {uniqueRequests.length > 1 && (
+                <Button
+                  size="sm"
+                  disabled={transferAction.isPending}
+                  onClick={handleAcceptAll}
+                >
+                  <Check className="mr-1 h-4 w-4" />
+                  Accept all
+                </Button>
+              )}
+            </div>
 
             {uniqueRequests.map((request) => (
               <div

@@ -324,6 +324,8 @@ impl Sender {
             chunk_size: Some(self.chunk_size),
             concurrency: Some(self.concurrency),
             max_retries: Some(RETRIES),
+            transport: None,
+            transport_manifest: None,
         }
     }
 

@@ -835,6 +835,10 @@ pub(crate) async fn finalize_download(
             "phases.handshake_seconds (the start request is the handshake)".into(),
             "phases.publication_seconds (the rename is inside assembly)".into(),
             "per-file relative paths (the receiver reports by file id)".into(),
+            "transport (the sender chooses the path; the receiver is not told which)"
+                .into(),
+            "transport_manifest (built for the accept call, not retained by the receiver)"
+                .into(),
             "resources are process-wide; concurrent transfers share them".into(),
         ],
         recovered: false,

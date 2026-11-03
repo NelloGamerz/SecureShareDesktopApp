@@ -42,7 +42,7 @@ use std::{
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 /// The report format this build writes.
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
 
 /// How often the resource sampler reads the process.
 const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -482,6 +482,14 @@ pub struct TransferReport {
     pub files: Vec<FileReport>,
     pub compression_enabled: bool,
     pub integrity_digests_enabled: bool,
+    /// The path this transfer took, as the UI names it: `LAN`, `P2P`,
+    /// `Bluetooth`, `Relay` or `Tunnel`. `null` when this side did not choose
+    /// (a receiver) or the sender had no manifest.
+    pub transport: Option<String>,
+    /// The manifest the control plane relayed with `START_TRANSFER`, verbatim —
+    /// every medium the receiver advertised. `null` when there was none or this
+    /// side never saw it.
+    pub transport_manifest: Option<serde_json::Value>,
     pub unavailable: Vec<String>,
     /// True when rebuilt from persisted telemetry after a restart.
     pub recovered: bool,
@@ -584,6 +592,10 @@ pub struct Telemetry {
     encrypt_cpu_latency: Mutex<LatencyHistogram>,
     http_latency: Mutex<LatencyHistogram>,
     files: Mutex<HashMap<String, FileTelemetry>>,
+    /// How the transfer reached the peer, and the manifest it was chosen from.
+    /// Set once at start; `null` when this side never knew.
+    transport: Mutex<Option<String>>,
+    transport_manifest: Mutex<Option<serde_json::Value>>,
     resources: Arc<ResourceSampler>,
     finalized: AtomicBool,
 }
@@ -731,6 +743,8 @@ impl Telemetry {
             encrypt_cpu_latency: Mutex::new(encrypt_cpu_latency),
             http_latency: Mutex::new(http_latency),
             files: Mutex::new(files),
+            transport: Mutex::new(None),
+            transport_manifest: Mutex::new(None),
             resources: ResourceSampler::start(),
             finalized: AtomicBool::new(false),
         });
@@ -1071,6 +1085,25 @@ impl Telemetry {
         files
     }
 
+    /// Records how this transfer reached the peer.
+    ///
+    /// Set once, at start, from what the sender chose and the manifest it chose
+    /// from. The receiver never learns either, so its report leaves them null.
+    pub fn set_transport(
+        &self,
+        transport: Option<String>,
+        manifest: Option<serde_json::Value>,
+    ) {
+        *self
+            .transport
+            .lock()
+            .expect("telemetry transport lock poisoned") = transport;
+        *self
+            .transport_manifest
+            .lock()
+            .expect("telemetry transport manifest lock poisoned") = manifest;
+    }
+
     /// Time spent writing the transfer's own record, e.g. a checkpoint.
     pub fn add_persistence(&self, elapsed: std::time::Duration) {
         self.persistence_ns.fetch_add(
@@ -1276,6 +1309,26 @@ impl Telemetry {
             unavailable.push("chunk_breakdown (no per-phase chunk timings)".into());
         }
 
+        let transport = self
+            .transport
+            .lock()
+            .expect("telemetry transport lock poisoned")
+            .clone();
+
+        let transport_manifest = self
+            .transport_manifest
+            .lock()
+            .expect("telemetry transport manifest lock poisoned")
+            .clone();
+
+        if transport.is_none() {
+            unavailable.push("transport (not chosen, or not observed on this side)".into());
+        }
+
+        if transport_manifest.is_none() {
+            unavailable.push("transport_manifest (no manifest was relayed)".into());
+        }
+
         TransferReport {
             schema_version: REPORT_SCHEMA_VERSION,
             role: self.role,
@@ -1316,6 +1369,8 @@ impl Telemetry {
             files,
             compression_enabled,
             integrity_digests_enabled,
+            transport,
+            transport_manifest,
             unavailable,
             recovered: finish.recovered,
             notes: {
@@ -1464,7 +1519,7 @@ pub fn render_markdown(report: &TransferReport) -> String {
     ));
 
     out.push_str(&format!(
-        "- role: {}\n- schema: {}\n- duration: {}\n- bytes: {} of {} acknowledged ({} remaining)\n- chunks: {} of {}\n- files: {} completed, {} unknown, {} total\n- compression: {}\n- integrity digests: {}\n- recovered after restart: {}\n\n",
+        "- role: {}\n- schema: {}\n- duration: {}\n- bytes: {} of {} acknowledged ({} remaining)\n- chunks: {} of {}\n- files: {} completed, {} unknown, {} total\n- compression: {}\n- integrity digests: {}\n- recovered after restart: {}\n",
         match report.role {
             Role::Sender => "sender",
             Role::Receiver => "receiver",
@@ -1482,6 +1537,16 @@ pub fn render_markdown(report: &TransferReport) -> String {
         report.compression_enabled,
         report.integrity_digests_enabled,
         report.recovered,
+    ));
+
+    out.push_str(&format!(
+        "- transport: {}\n- transport manifest: {}\n\n",
+        report.transport.as_deref().unwrap_or("n/a"),
+        report
+            .transport_manifest
+            .as_ref()
+            .map(|manifest| manifest.to_string())
+            .unwrap_or_else(|| "n/a".into()),
     ));
 
     out.push_str("## Throughput\n\n");
@@ -1677,6 +1742,81 @@ mod tests {
         let markdown = std::fs::read_to_string(&paths.markdown).expect("reading");
 
         assert!(markdown.contains("Throughput"));
+    }
+
+    #[tokio::test]
+    async fn a_sender_report_records_the_transport_and_the_manifest_it_chose_from() {
+        let scratch = TempDir::new();
+        let reports = scratch.path().join("reports");
+        let telemetry = Telemetry::new(Role::Sender);
+
+        telemetry.set_transport(
+            Some("LAN".into()),
+            Some(serde_json::json!({
+                "manifest_version": 1,
+                "capabilities": { "lan": true, "p2p": false, "ble": false },
+                "lan": { "endpoints": [{ "ip": "192.168.1.5", "port": 7878 }] }
+            })),
+        );
+
+        let paths = telemetry
+            .finalize(
+                &reports,
+                finish("t-1", TransferStatus::Completed),
+                false,
+                false,
+            )
+            .await
+            .expect("the report is written");
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.json).expect("reading")).expect("json");
+
+        assert_eq!(json["transport"], "LAN");
+        assert_eq!(json["transport_manifest"]["capabilities"]["lan"], true);
+        assert_eq!(
+            json["transport_manifest"]["lan"]["endpoints"][0]["ip"],
+            "192.168.1.5",
+            "the manifest is recorded verbatim, not summarised"
+        );
+
+        let markdown = std::fs::read_to_string(&paths.markdown).expect("reading");
+
+        assert!(markdown.contains("- transport: LAN"));
+        assert!(markdown.contains("192.168.1.5"));
+    }
+
+    #[tokio::test]
+    async fn a_side_that_never_saw_a_manifest_reports_them_null_and_unavailable() {
+        let scratch = TempDir::new();
+        let reports = scratch.path().join("reports");
+        let telemetry = Telemetry::new(Role::Receiver);
+
+        let paths = telemetry
+            .finalize(
+                &reports,
+                finish("t-1", TransferStatus::Completed),
+                false,
+                false,
+            )
+            .await
+            .expect("reported");
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.json).expect("reading")).expect("json");
+
+        assert!(json["transport"].is_null());
+        assert!(json["transport_manifest"].is_null());
+
+        let unavailable = json["unavailable"].as_array().expect("unavailable");
+
+        assert!(unavailable
+            .iter()
+            .any(|item| item.as_str().unwrap_or_default().starts_with("transport ")));
+        assert!(unavailable.iter().any(|item| item
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("transport_manifest")));
     }
 
     #[tokio::test]

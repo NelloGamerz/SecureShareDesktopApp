@@ -418,6 +418,11 @@ impl UploadManager {
                 ..report::PhaseTimings::default()
             }),
         });
+
+        state
+            .report
+            .set_transport(metadata.transport.clone(), metadata.transport_manifest.clone());
+
         let response = state.snapshot();
         self.transfers
             .lock()
@@ -1886,6 +1891,8 @@ mod tests {
             chunk_size: Some(1024),
             concurrency: Some(1),
             max_retries: Some(1),
+            transport: None,
+            transport_manifest: None,
         };
 
         // Nothing is registered for this transfer in the local files table, so
@@ -2347,6 +2354,8 @@ mod resume_tests {
             chunk_size: Some(CHUNK),
             concurrency: Some(1),
             max_retries: Some(1),
+            transport: None,
+            transport_manifest: None,
         }
     }
 

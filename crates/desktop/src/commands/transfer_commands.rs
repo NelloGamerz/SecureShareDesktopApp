@@ -38,6 +38,16 @@ pub async fn cancel_transfer(
         .await
         .map_err(|e| e.to_string())
 }
+/// Probes this machine's transports for the accept request.
+///
+/// Returns `None` when no manifest should be sent (nothing usable, or the
+/// encoded manifest would exceed the backend's limit). The probe is bounded, so
+/// accept cannot hang on it, and it never returns an error the UI must handle.
+#[tauri::command]
+pub async fn build_transport_manifest() -> Option<serde_json::Value> {
+    crate::transfer::transport_manifest::build_manifest().await
+}
+
 #[tauri::command]
 pub fn get_transfer_status(
     manager: State<'_, Arc<UploadManager>>,

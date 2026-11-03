@@ -60,7 +60,8 @@ use commands::auth::{
 };
 
 use commands::transfer_commands::{
-    cancel_transfer, get_transfer_status, pause_transfer, resume_transfer, start_transfer,
+    build_transport_manifest, cancel_transfer, get_transfer_status, pause_transfer,
+    resume_transfer, start_transfer,
 };
 
 #[cfg(feature = "enable-updater")]
@@ -435,6 +436,7 @@ pub fn run() {
             get_default_download_location,
             set_default_download_location,
             start_transfer,
+            build_transport_manifest,
             pause_transfer,
             resume_transfer,
             cancel_transfer,

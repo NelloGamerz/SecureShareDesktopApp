@@ -93,8 +93,12 @@ export async function getMyTransfers(): Promise<TransferResponse[]> {
 export async function updateTransferStatus(
   transferId: string,
   action: TransferAction,
+  transportManifest?: unknown,
 ): Promise<void> {
   await api.patch(`/transfers/${transferId}`, {
     action,
+    // Omitted entirely when there is no manifest, so an accept is byte-for-byte
+    // the request an older build sent.
+    ...(transportManifest == null ? {} : { transport_manifest: transportManifest }),
   });
 }

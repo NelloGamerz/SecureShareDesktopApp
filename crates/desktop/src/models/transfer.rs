@@ -36,6 +36,13 @@ pub struct TransferMetadata {
     pub chunk_size: Option<usize>,
     pub concurrency: Option<usize>,
     pub max_retries: Option<u32>,
+    /// The path chosen from the receiver's manifest (`LAN`, `Tunnel`, …).
+    /// Recorded in the transfer report; not part of the frozen wire.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// The manifest the control plane relayed, kept verbatim for the report.
+    #[serde(default)]
+    pub transport_manifest: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
