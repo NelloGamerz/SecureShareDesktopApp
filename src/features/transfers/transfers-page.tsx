@@ -120,6 +120,8 @@ export function TransfersPage() {
 
   const requests = useTransferRequestStore((state) => state.requests);
 
+  const removeRequest = useTransferRequestStore((state) => state.removeRequest);
+
   const uniqueRequests = React.useMemo(() => {
     return Array.from(
       new Map(requests.map((request) => [request.id, request])).values(),
@@ -137,11 +139,21 @@ export function TransfersPage() {
   const handleTransferAction = (
     transferId: string,
     action: "ACCEPT" | "REJECT" | "CANCEL",
+    requestId?: string,
   ) => {
-    transferAction.mutate({
-      transferId,
-      action,
-    });
+    transferAction.mutate(
+      {
+        transferId,
+        action,
+      },
+      {
+        // Answered requests leave the pending list; the invalidated transfers
+        // query picks up the new state in the main table.
+        onSuccess: () => {
+          if (requestId) removeRequest(requestId);
+        },
+      },
+    );
   };
 
   return (
@@ -167,15 +179,21 @@ export function TransfersPage() {
             {uniqueRequests.map((request) => (
               <div
                 key={request.id}
-                className="flex items-center justify-between rounded-lg border p-3"
+                className="flex items-center justify-between rounded-lg border border-primary/40 bg-primary/5 p-3"
               >
                 <div className="flex items-center gap-3">
-                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted">
-                    <ArrowDownToLine className="h-4 w-4" />
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10">
+                    <ArrowDownToLine className="h-4 w-4 text-primary" />
                   </div>
 
                   <div>
-                    <p className="text-sm font-medium">{request.file_name}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-medium">{request.file_name}</p>
+
+                      <Badge variant="default" className="text-[10px]">
+                        New
+                      </Badge>
+                    </div>
 
                     <p className="text-xs text-muted-foreground">
                       {formatFileSize(request.file_size)}
@@ -187,10 +205,11 @@ export function TransfersPage() {
                   <Button
                     size="sm"
                     onClick={() => {
-                      console.log("Accept:", request.id);
-                      handleTransferAction(request.id, "ACCEPT");
-
-                      // removeRequest(request.transfer_id);
+                      handleTransferAction(
+                        request.transfer_id,
+                        "ACCEPT",
+                        request.transfer_id,
+                      );
                     }}
                   >
                     <Check className="mr-1 h-4 w-4" />
@@ -201,13 +220,11 @@ export function TransfersPage() {
                     size="sm"
                     variant="destructive"
                     onClick={() => {
-                      console.log("Reject transfer", request.transfer_id);
-                      handleTransferAction(request.id, "REJECT");
-
-                      // TODO:
-                      // invoke reject_transfer
-
-                      // removeRequest(request.transfer_id);
+                      handleTransferAction(
+                        request.transfer_id,
+                        "REJECT",
+                        request.transfer_id,
+                      );
                     }}
                   >
                     <X className="mr-1 h-4 w-4" />

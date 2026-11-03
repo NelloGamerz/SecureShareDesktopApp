@@ -30,7 +30,8 @@ export const useTransferRequestStore = create<TransferRequestState>((set) => ({
       }
 
       return {
-        requests: [...state.requests, request],
+        // Newest first so a fresh request is always at the top.
+        requests: [request, ...state.requests],
       };
     }),
 
