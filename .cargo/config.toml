@@ -1,0 +1,13 @@
+# aarch64: `aes` 0.8 and `polyval` 0.6 only compile the ARMv8 crypto-extension
+# backends when these cfgs are set. Without them every AES-GCM call silently
+# runs the software implementation (~8x slower) on a CPU that supports it.
+# x86_64 needs nothing here: both crates dispatch at runtime.
+#
+# `utils::crypto_backend` logs which backend a started build actually got.
+# `aarch64-apple-darwin` is a release target (rust-toolchain.toml); the Linux
+# triple is here so an arm64 Linux build is not the slow one by accident.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

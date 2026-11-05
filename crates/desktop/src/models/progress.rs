@@ -54,6 +54,13 @@ mod tests {
                 crate::transfer::report::Role::Receiver,
             ),
             phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
+            network_report: Mutex::new(crate::transfer::network_report::NetworkReport::new(
+                crate::transfer::report::Role::Receiver,
+                "t-1",
+                Vec::new(),
+                None,
+            )),
+            network_written: Mutex::new(std::time::Instant::now()),
         }
     }
 

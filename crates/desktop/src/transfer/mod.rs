@@ -37,6 +37,9 @@ pub mod report;
 #[cfg(test)]
 mod resumability_tests;
 pub mod resume;
+/// The live network-path report written at start and kept current while a
+/// transfer runs.
+pub mod network_report;
 pub mod retry;
 pub mod scanner;
 pub mod scheduler;

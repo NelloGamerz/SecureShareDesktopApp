@@ -47,6 +47,26 @@
 //! refused, because the alternative is writing bytes the sender never meant.
 
 use crate::transfer::errors::{Result, TransferError};
+use std::path::Path;
+
+/// Extensions whose contents are already compressed: a zstd attempt costs CPU
+/// and cannot shrink them.
+const PRECOMPRESSED_EXTENSIONS: &[&str] = &[
+    "zip", "7z", "gz", "tgz", "bz2", "xz", "zst", "mp4", "mov", "m4v", "mkv", "webm", "avi", "jpg",
+    "jpeg", "png", "gif", "webp", "heic", "exe", "msi", "dll", "docx", "xlsx", "pptx", "odt",
+    "epub", "jar", "apk", "iso", "dmg", "pdf",
+];
+
+/// Whether a file's extension says its bytes are already compressed.
+pub fn is_precompressed(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map_or(false, |extension| {
+            PRECOMPRESSED_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
+}
 
 /// The response header a receiver uses to advertise the chunk encodings it can
 /// decode.
@@ -139,11 +159,11 @@ static ZSTD: ZstdCompressor = ZstdCompressor;
 
 /// The algorithm this build compresses every chunk with.
 ///
-/// The file name is deliberately **not** consulted: a screen recording
-/// compresses five-fold even though its extension says `.mp4`, and a file that
-/// genuinely does not shrink is caught per chunk by `compress` returning
-/// `None`. The cost of trying is a few milliseconds of CPU on the blocking
-/// pool; the cost of guessing wrong is several times the wire bytes.
+/// This strategy itself never looks at the file name. The sender skips it for
+/// [`is_precompressed`] extensions (see `session::send_chunk`), and a chunk that
+/// genuinely does not shrink is caught by `compress` returning `None`. The
+/// remaining risk is that the extension lies — a screen recording in `.mp4` can
+/// compress — but the list is narrow enough to accept that trade.
 pub fn strategy() -> &'static dyn CompressionStrategy {
     &ZSTD
 }
@@ -188,6 +208,14 @@ pub fn decompress(encoded: &[u8], limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precompressed_extensions_are_recognised_case_insensitively() {
+        assert!(is_precompressed(Path::new("holiday.ZIP")));
+        assert!(is_precompressed(Path::new("a/b/movie.mp4")));
+        assert!(!is_precompressed(Path::new("notes.txt")));
+        assert!(!is_precompressed(Path::new("no-extension")));
+    }
 
     #[test]
     fn compressible_chunks_shrink_and_round_trip() {

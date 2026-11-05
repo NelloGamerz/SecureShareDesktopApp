@@ -94,12 +94,57 @@ pub struct BleSection {
     pub mtu: Option<u16>,
 }
 
+/// The smallest valid manifest: every capability false, no sections.
+///
+/// The backend records this differently from no manifest at all, which is why
+/// an accept always carries one.
+pub fn empty_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "manifest_version": 1,
+        "capabilities": { "p2p": false, "lan": false, "ble": false, "preferred_order": [] }
+    })
+}
+
 /// Probes local capabilities for the accept request.
 ///
 /// Never fails and never blocks longer than [`PROBE_TIMEOUT`]: a probe that
-/// errors or runs long only costs that capability. Returns `None` when nothing
-/// usable was found or the encoded manifest would exceed the backend limit.
-pub async fn build_manifest() -> Option<serde_json::Value> {
+/// errors or runs long only costs that capability, and the manifest is still
+/// sent with that capability false. A manifest too large for the backend is
+/// replaced by [`empty_manifest`] rather than omitted.
+pub async fn build_manifest() -> serde_json::Value {
+    let manifest = probe().await;
+    let lan_available = manifest.capabilities.as_ref().is_some_and(|caps| caps.lan);
+    let endpoints = manifest.lan.as_ref().map(|lan| lan.endpoints.len()).unwrap_or(0);
+
+    tracing::info!(
+        "accept manifest: caps={lan},{p2p},{ble} lan_endpoints={endpoints}",
+        lan = lan_available,
+        p2p = false,
+        ble = false,
+        endpoints = endpoints
+    );
+
+    let value = match serde_json::to_value(&manifest) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "could not encode the transport manifest; sending an empty one");
+            return empty_manifest();
+        }
+    };
+
+    if serde_json::to_vec(&value).map(|bytes| bytes.len()).unwrap_or(0) > MANIFEST_LIMIT_BYTES {
+        tracing::warn!("transport manifest exceeds 16 KiB; sending an empty one");
+        return empty_manifest();
+    }
+
+    value
+}
+
+/// This machine's capabilities as a manifest, for the network report.
+///
+/// Same probe the accept path sends, without the size check: the report is a
+/// local file, and the receiver's own copy of what it advertised costs nothing.
+pub async fn probe() -> TransportManifest {
     let lan = match tokio::time::timeout(PROBE_TIMEOUT, probe_lan()).await {
         Ok(section) => section,
         Err(_) => {
@@ -108,35 +153,39 @@ pub async fn build_manifest() -> Option<serde_json::Value> {
         }
     };
 
-    let manifest = TransportManifest {
+    // P2P and BLE are not implemented in this build, so they are never
+    // available and never appear in the preferred order.
+    let lan_available = lan.is_some();
+    let mut preferred_order = Vec::new();
+
+    if lan_available {
+        preferred_order.push("lan".to_owned());
+    }
+
+    TransportManifest {
         manifest_version: Some(1),
         capabilities: Some(ManifestCapabilities {
             p2p: false,
-            lan: lan.is_some(),
+            lan: lan_available,
             ble: false,
-            preferred_order: vec!["lan".into(), "p2p".into(), "ble".into()],
+            preferred_order,
         }),
         lan,
         p2p: None,
         ble: None,
-    };
-
-    let value = serde_json::to_value(&manifest).ok()?;
-    let size = serde_json::to_vec(&value).ok()?.len();
-
-    if size > MANIFEST_LIMIT_BYTES {
-        tracing::warn!(
-            bytes = size,
-            "transport manifest exceeds 16 KiB; omitting it"
-        );
-        return None;
     }
-
-    Some(value)
 }
 
 async fn probe_lan() -> Option<LanSection> {
-    let ip = local_ip().await?;
+    let Some(std::net::IpAddr::V4(ip)) = local_ip().await else {
+        tracing::warn!("lan probe: no non-loopback ipv4 (default-route trick failed)");
+        return None;
+    };
+
+    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+        tracing::warn!("lan probe: no non-loopback ipv4 (default-route trick failed)");
+        return None;
+    }
 
     Some(LanSection {
         endpoints: vec![LanEndpoint {
@@ -265,6 +314,40 @@ mod tests {
             .unwrap()
             .block_on(select(&manifest))
             .is_none());
+    }
+
+    #[test]
+    fn an_empty_manifest_keeps_every_capability_false() {
+        let value = empty_manifest();
+
+        assert_eq!(value["manifest_version"], 1);
+        assert_eq!(value["capabilities"]["lan"], false);
+        assert_eq!(value["capabilities"]["p2p"], false);
+        assert_eq!(value["capabilities"]["ble"], false);
+        assert!(value["capabilities"]["preferred_order"]
+            .as_array()
+            .expect("preferred_order is a list")
+            .is_empty());
+        assert!(value.get("lan").is_none(), "no LAN section without LAN");
+    }
+
+    #[test]
+    fn a_probed_manifest_always_carries_capabilities() {
+        let manifest = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(probe());
+        let capabilities = manifest
+            .capabilities
+            .expect("capabilities are always present");
+
+        assert!(!capabilities.p2p);
+        assert!(!capabilities.ble);
+        assert_eq!(
+            capabilities.preferred_order.contains(&"lan".to_owned()),
+            capabilities.lan,
+            "LAN is preferred exactly when it is available"
+        );
+        assert_eq!(manifest.lan.is_some(), capabilities.lan);
     }
 
     #[test]

@@ -31,6 +31,29 @@ pub struct ChunkTimings {
     pub encrypt_cpu: std::time::Duration,
     /// The request and the wait for the receiver's acknowledgement.
     pub http: std::time::Duration,
+    /// The durability step the receiver reported for the accepted attempt.
+    /// Zero when it sent no timings headers.
+    pub recv_lock_wait: std::time::Duration,
+    pub recv_part_write: std::time::Duration,
+    pub recv_journal: std::time::Duration,
+    pub recv_accept: std::time::Duration,
+    /// Whether the receiver reported any timing for this chunk.
+    pub recv_timed: bool,
+    /// The receiver's live counters, for the timeseries. `None` on an old
+    /// receiver.
+    pub recv_inflight: Option<u32>,
+    pub recv_journal_pending: Option<u32>,
+    pub recv_part_files: Option<u32>,
+    pub recv_incoming_bytes: Option<u64>,
+    pub recv_compactions: Option<u64>,
+    pub recv_journal_flushes: Option<u64>,
+    pub recv_journal_entries: Option<u64>,
+    pub recv_compaction_ms: Option<u64>,
+    pub recv_compaction_under_lock_ms: Option<u64>,
+    pub recv_manifest_chunks: Option<u32>,
+    pub recv_manifest_lookup_p50_us: Option<u64>,
+    pub recv_manifest_lookup_p95_us: Option<u64>,
+    pub recv_manifest_memory_bytes: Option<u64>,
 }
 
 /// How many source files are kept open across one run.
@@ -223,6 +246,27 @@ pub async fn upload_chunk(
             timings.encrypt += sent.encrypt;
             timings.encrypt_cpu += sent.encrypt_cpu;
             timings.http += sent.http;
+
+            // Only the attempt that succeeded carries an acknowledgement, and
+            // it is not summed: it describes this chunk, not the retries.
+            timings.recv_lock_wait = sent.receiver.lock_wait;
+            timings.recv_part_write = sent.receiver.part_write;
+            timings.recv_journal = sent.receiver.journal;
+            timings.recv_accept = sent.receiver.accept;
+            timings.recv_timed = sent.receiver.present;
+            timings.recv_inflight = sent.receiver.inflight;
+            timings.recv_journal_pending = sent.receiver.journal_pending;
+            timings.recv_part_files = sent.receiver.part_files;
+            timings.recv_incoming_bytes = sent.receiver.incoming_bytes;
+            timings.recv_compactions = sent.receiver.compactions;
+            timings.recv_journal_flushes = sent.receiver.journal_flushes;
+            timings.recv_journal_entries = sent.receiver.journal_entries;
+            timings.recv_compaction_ms = sent.receiver.compaction_ms;
+            timings.recv_compaction_under_lock_ms = sent.receiver.compaction_under_lock_ms;
+            timings.recv_manifest_chunks = sent.receiver.manifest_chunks;
+            timings.recv_manifest_lookup_p50_us = sent.receiver.manifest_lookup_p50_us;
+            timings.recv_manifest_lookup_p95_us = sent.receiver.manifest_lookup_p95_us;
+            timings.recv_manifest_memory_bytes = sent.receiver.manifest_memory_bytes;
 
             if let Some(origin) = first {
                 tracing::info!(

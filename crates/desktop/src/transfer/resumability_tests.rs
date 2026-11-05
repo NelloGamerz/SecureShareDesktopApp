@@ -274,8 +274,11 @@ impl Receiver {
         self.state.manifests.lock().await.clear();
     }
 
-    /// Where chunk `index` of `file_id` is kept, as the receiver keeps it.
-    fn part_path(&self, file_id: &str, index: u64) -> PathBuf {
+    /// The file `file_id`'s chunks are written into, at their offsets.
+    ///
+    /// The sender here chunks every file at [`CHUNK`], so chunk `index` is the
+    /// [`CHUNK`]-byte range starting at `index * CHUNK`.
+    fn assembly_path(&self, file_id: &str) -> PathBuf {
         let parts = self
             .state
             .root
@@ -283,7 +286,35 @@ impl Receiver {
             .join(TRANSFER)
             .join(file_id);
 
-        manifest::part_path(&parts, index)
+        manifest::assembly_path(&parts)
+    }
+
+    /// Leave `index` unable to verify: the tail of its range cut off, or a byte
+    /// in it flipped. Only that chunk's range is touched, because the later
+    /// chunks' bytes have not been written yet.
+    fn damage_chunk(&self, file_id: &str, index: u64, damage: Damage) {
+        let assembly = self.assembly_path(file_id);
+
+        match damage {
+            Damage::Truncate => {
+                let end = index * CHUNK as u64 + CHUNK as u64 / 2;
+
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&assembly)
+                    .expect("opening the assembly")
+                    .set_len(end)
+                    .expect("truncating the assembly");
+            }
+
+            Damage::Alter => {
+                let mut bytes = std::fs::read(&assembly).expect("reading the assembly");
+
+                bytes[index as usize * CHUNK] ^= 0xff;
+
+                std::fs::write(&assembly, &bytes).expect("altering the assembly");
+            }
+        }
     }
 }
 
@@ -613,7 +644,7 @@ impl Harness {
 
         let mut held: Vec<u64> = manifest
             .chunks
-            .iter()
+            .values()
             .filter(|chunk| chunk.file_id == self.file_id)
             .map(|chunk| chunk.chunk_index)
             .collect();
@@ -819,21 +850,7 @@ async fn interrupted_with_damaged_chunk(index: u64, damage: Damage) -> (Harness,
     receiver.forget_everything().await;
     drop(first);
 
-    let part = receiver.part_path(&harness.file_id, index);
-
-    match damage {
-        Damage::Truncate => {
-            let bytes = std::fs::read(&part).expect("reading the part");
-            std::fs::write(&part, &bytes[..bytes.len() / 2]).expect("truncating the part");
-        }
-
-        // Same length, different bytes: the case only the hash can see.
-        Damage::Alter => {
-            let mut bytes = std::fs::read(&part).expect("reading the part");
-            bytes[0] ^= 0xff;
-            std::fs::write(&part, &bytes).expect("altering the part");
-        }
-    }
+    receiver.damage_chunk(&harness.file_id, index, damage);
 
     (harness, receiver)
 }
@@ -859,7 +876,12 @@ async fn a_truncated_chunk_is_sent_again_rather_than_merged() {
         "a chunk that is no longer the length it was recorded at has to be sent again"
     );
 
-    for index in [0, 1, 3] {
+    /*
+     * The chunks before the truncation are intact and are kept. The ones after
+     * it went with the file's tail in the same cut, so they are sent again too
+     * — a range cannot be shortened without the file ending there.
+     */
+    for index in [0, 1] {
         assert_eq!(
             receiver_attempts(&harness, index),
             1,
@@ -946,9 +968,7 @@ async fn a_chunk_that_goes_bad_mid_transfer_is_resent_rather_than_published() {
      * first question can be answered without concluding that a chunk the sender
      * has already been thanked for is a chunk that was never sent.
      */
-    let part = receiver.part_path(&harness.file_id, 0);
-    let bytes = std::fs::read(&part).expect("reading the part");
-    std::fs::write(&part, &bytes[..bytes.len() / 2]).expect("truncating the part");
+    receiver.damage_chunk(&harness.file_id, 0, Damage::Truncate);
 
     drop(held);
 

@@ -34,7 +34,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -43,6 +43,14 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 
 /// The report format this build writes.
 pub const REPORT_SCHEMA_VERSION: u32 = 3;
+
+/// How often the sender samples the transfer for the `timeseries`.
+pub const SAMPLE_INTERVAL_SECS: u64 = 5;
+
+/// The most samples a `timeseries` may hold. Past this the sampler keeps every
+/// second sample and doubles its interval, so a very long transfer is
+/// downsampled rather than unbounded.
+const MAX_TIMESERIES_SAMPLES: usize = 720;
 
 /// How often the resource sampler reads the process.
 const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -73,6 +81,104 @@ pub struct LatencySummary {
     pub max_ms: Option<f64>,
     /// The percentiles are bucket upper bounds exact to within a factor of two.
     pub resolution: &'static str,
+}
+
+/// Percentiles of a count rather than a duration, in whatever units the values
+/// were recorded with. Used for the journal batch size.
+#[derive(Debug, Clone, Serialize)]
+pub struct CountSummary {
+    pub count: u64,
+    pub mean: Option<f64>,
+    pub p50: Option<u64>,
+    pub p95: Option<u64>,
+    pub max: Option<u64>,
+    pub resolution: &'static str,
+}
+
+/// One interval of a transfer's life, sampled by the sender.
+///
+/// The receiver columns come from its per-chunk response headers: each chunk
+/// ack refreshes the latest values, and the sampler folds the newest into its
+/// window. `null` means the receiver is an older build that sent no headers.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeSample {
+    /// Seconds since the transfer started.
+    pub t_secs: f64,
+    pub bytes_acked: u64,
+    pub chunks_acked: u64,
+    /// Throughput in this interval only: `delta_bytes / interval`.
+    pub window_mib_s: f64,
+    /// Chunks dispatched and not yet acknowledged, at sample time.
+    pub inflight_now: u32,
+    /// This process, from the resource sampler's last 500 ms read.
+    pub sender_rss_bytes: u64,
+    pub sender_open_fds: Option<u32>,
+    /// Not measured on the receiver (a header would cost a sysinfo refresh per
+    /// chunk); always `null` today.
+    pub recv_rss_bytes: Option<u64>,
+    pub recv_inflight_map_len: Option<u32>,
+    pub recv_journal_pending: Option<u32>,
+    /// Journal flushes the receiver performed in this window.
+    pub recv_journal_flushes_this_window: Option<u32>,
+    /// Chunks in the receiver's in-memory manifest at sample time.
+    pub recv_manifest_chunk_count: Option<u32>,
+    pub recv_part_files: Option<u32>,
+    pub recv_incoming_dir_bytes: Option<u64>,
+    pub compactions_this_window: Option<u32>,
+    pub avg_chunk_latency_ms_this_window: f64,
+    /// Set when this one sample could not be collected; the transfer goes on.
+    pub error: Option<String>,
+}
+
+/// Is this decay real, and when did it start? Derived from the timeseries.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThroughputDecay {
+    pub first_quartile_mib_s: f64,
+    pub last_quartile_mib_s: f64,
+    /// `first / last`; above 1.3 means real decay. Floored at 1 MiB/s so a
+    /// complete stall stays a finite JSON number.
+    pub decay_ratio: f64,
+    /// First sample below 70% of the first quartile, or `null`.
+    pub slowdown_onset_secs: Option<f64>,
+}
+
+/// The newest receiver counters seen on an ack. Internal: the report carries
+/// them inside [`TimeSample`], not as a separate block.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiverSnapshot {
+    pub inflight: Option<u32>,
+    pub journal_pending: Option<u32>,
+    pub part_files: Option<u32>,
+    pub incoming_bytes: Option<u64>,
+    /// Cumulative; the sampler reports the window delta.
+    pub compactions: Option<u64>,
+    /// Cumulative; the sampler reports the window delta.
+    pub journal_flushes: Option<u64>,
+    /// Cumulative journal entries, for entries-per-flush on the final report.
+    pub journal_entries: Option<u64>,
+    /// Cumulative manifest-write milliseconds, total and under the lock.
+    pub compaction_ms: Option<u64>,
+    pub compaction_under_lock_ms: Option<u64>,
+    /// The receiver's in-memory manifest at the latest acknowledgement.
+    pub manifest_chunks: Option<u32>,
+    pub manifest_lookup_p50_us: Option<u64>,
+    pub manifest_lookup_p95_us: Option<u64>,
+    pub manifest_memory_bytes: Option<u64>,
+}
+
+/// The sampled series and the interval it is being taken at.
+struct TimeseriesState {
+    samples: Vec<TimeSample>,
+    interval_secs: u64,
+}
+
+/// Releases one in-flight slot when the chunk task ends, however it ends.
+pub struct InFlightGuard(Arc<Telemetry>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.inflight_now.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A fixed-size log-scale histogram of durations.
@@ -155,6 +261,36 @@ impl LatencyHistogram {
         }
     }
 
+    /// Mean and percentiles in the units the samples were recorded with.
+    ///
+    /// `summary` talks in milliseconds because durations are what it is for;
+    /// this is the same bucket walk without the unit conversion, used for the
+    /// journal batch size, which is a count of entries.
+    pub fn raw_summary(&self) -> CountSummary {
+        if self.count == 0 {
+            return CountSummary {
+                count: 0,
+                mean: None,
+                p50: None,
+                p95: None,
+                max: None,
+                resolution: "log2 buckets, clamped to the observed maximum",
+            };
+        }
+
+        let p50 = self.percentile(50.0).min(self.max_ns);
+        let p95 = self.percentile(95.0).min(self.max_ns).max(p50);
+
+        CountSummary {
+            count: self.count,
+            mean: Some(round(self.sum_ns as f64 / self.count as f64)),
+            p50: Some(p50),
+            p95: Some(p95),
+            max: Some(self.max_ns),
+            resolution: "log2 buckets, clamped to the observed maximum",
+        }
+    }
+
     /// The upper bound of the bucket `percent` of the samples fall at or below.
     ///
     /// Never above the largest recorded sample; the caller clamps anyway.
@@ -196,9 +332,24 @@ fn nanos_to_ms(nanos: f64) -> f64 {
     (nanos / 1_000_000.0 * 1000.0).round() / 1000.0
 }
 
+/// Average nanoseconds spent per acknowledged chunk since `last`, advanced in
+/// place. `0.0` for a window with no acknowledgements.
+fn window_average_ms(total_ns: u64, last: &mut u64, chunks: u64) -> f64 {
+    let delta = total_ns.saturating_sub(*last);
+    *last = total_ns;
+
+    if chunks == 0 {
+        return 0.0;
+    }
+
+    round(delta as f64 / chunks as f64 / 1e6)
+}
+
 /// Process CPU and memory, sampled while the transfer runs.
 #[derive(Default)]
 pub struct ResourceSampler {
+    /// The most recent 500 ms read, for the per-interval timeseries.
+    current_memory_bytes: AtomicU64,
     peak_memory_bytes: AtomicU64,
     cpu_sum_milli_percent: AtomicU64,
     cpu_peak_milli_percent: AtomicU64,
@@ -256,6 +407,9 @@ impl ResourceSampler {
                 let memory = process.memory();
                 let cpu = process.cpu_usage();
 
+                inner
+                    .current_memory_bytes
+                    .store(memory, Ordering::Relaxed);
                 inner.peak_memory_bytes.fetch_max(memory, Ordering::Relaxed);
 
                 let milli_percent = (cpu * 1000.0).max(0.0) as u64;
@@ -277,6 +431,11 @@ impl ResourceSampler {
 
     fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// The last sampled RSS of this process, in bytes.
+    fn current_rss(&self) -> u64 {
+        self.current_memory_bytes.load(Ordering::Relaxed)
     }
 
     fn summary(&self) -> ResourceSummary {
@@ -355,6 +514,11 @@ pub struct FileReport {
     pub duration_seconds: Option<f64>,
     pub throughput_mib_s: Option<f64>,
     pub outcome: &'static str,
+    /// Whether compression was attempted for this file.
+    pub compression_enabled: bool,
+    /// Why compression was skipped, when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_skipped_reason: Option<&'static str>,
 }
 
 /// One measured part of a chunk's life, as a share of the whole.
@@ -381,6 +545,14 @@ pub struct ChunkBreakdown {
     /// The part of `encrypt` that was the cipher itself.
     pub encrypt_cpu: PhaseShare,
     pub http: PhaseShare,
+    /// The parts of `http` a receiver reported: how long a chunk waited for
+    /// the per-transfer lock, how long its bytes took to be written and synced,
+    /// how long the journal append took, and the whole durability step. All
+    /// zero-count when the receiver sent no timing headers.
+    pub recv_lock_wait: PhaseShare,
+    pub recv_part_write: PhaseShare,
+    pub recv_journal: PhaseShare,
+    pub recv_accept: PhaseShare,
     pub dominant: Option<String>,
 }
 
@@ -472,6 +644,42 @@ pub struct TransferReport {
     pub chunk_latency: LatencySummary,
     /// Which measured part of a chunk held the most time, and the shares.
     pub chunk_breakdown: ChunkBreakdown,
+    /// The four receiver-reported parts of `recv_accept` as a fraction of the
+    /// sender's `http` time. `null` when fewer than 10% of acknowledged chunks
+    /// carried receiver timings — there is nothing to attribute.
+    pub recv_durability_share_percent: Option<f64>,
+    /// The share of acknowledged chunks whose `200` carried any receiver
+    /// timing header. `null` when no chunk was acknowledged.
+    pub recv_timings_coverage_percent: Option<f64>,
+    /// How many journal flushes the receiver performed. One flush covers up to
+    /// `JOURNAL_BATCH_ENTRIES` chunks.
+    pub recv_journal_flush_count: u64,
+    /// Entries per flush, `null` when there was no flush.
+    pub recv_journal_entries_per_flush: Option<CountSummary>,
+    /// How many times the receiver wrote its manifest.
+    pub recv_compaction_count: u64,
+    /// Total time the receiver spent writing its manifest, `null` when it
+    /// reported nothing (a sender whose receiver sent no headers).
+    pub recv_compaction_total_seconds: Option<f64>,
+    /// The part of that time spent holding the transfer lock. On the per-chunk
+    /// path this should be ~0; a regression shows up here.
+    pub recv_compaction_under_lock_ms: Option<f64>,
+    /// Chunks in the receiver's in-memory manifest at its last acknowledgement.
+    pub recv_manifest_chunk_count: Option<u32>,
+    /// Manifest lookup/insert percentiles, in microseconds.
+    pub recv_manifest_lookup_p50_us: Option<f64>,
+    pub recv_manifest_lookup_p95_us: Option<f64>,
+    /// Estimated resident size of the manifest map.
+    pub recv_manifest_memory_bytes: Option<u64>,
+    /// One record per sampling interval, from the sender. Empty on a receiver
+    /// report — receiver counters reach the sender on per-chunk headers.
+    pub timeseries: Vec<TimeSample>,
+    /// Whether throughput decayed, derived from `timeseries`. `null` when there
+    /// were fewer than two windows to compare.
+    pub throughput_decay: Option<ThroughputDecay>,
+    /// The interval the samples were taken at. Doubles when the timeseries is
+    /// downsampled, so a very long transfer stays bounded.
+    pub sampled_every_secs: u64,
     pub resources: ResourceSummary,
     pub phases: PhaseTimings,
     pub retries: u64,
@@ -592,12 +800,46 @@ pub struct Telemetry {
     encrypt_cpu_latency: Mutex<LatencyHistogram>,
     http_latency: Mutex<LatencyHistogram>,
     files: Mutex<HashMap<String, FileTelemetry>>,
+    /// The receiver-reported parts of `http`, and how many chunks reported any.
+    recv_lock_wait_ns: AtomicU64,
+    recv_part_write_ns: AtomicU64,
+    recv_journal_ns: AtomicU64,
+    recv_accept_ns: AtomicU64,
+    recv_timed_chunks: AtomicU64,
+    recv_lock_wait_latency: Mutex<LatencyHistogram>,
+    recv_part_write_latency: Mutex<LatencyHistogram>,
+    recv_journal_latency: Mutex<LatencyHistogram>,
+    recv_accept_latency: Mutex<LatencyHistogram>,
+    /// Receiver-side journal batching: one flush covers several chunks.
+    journal_flushes: AtomicU64,
+    journal_batch: Mutex<LatencyHistogram>,
+    /// Receiver-side manifest writes, set once before the report is finalized.
+    compaction_count: AtomicU64,
+    compaction_total_ns: AtomicU64,
+    compaction_under_lock_ns: AtomicU64,
+    /// Receiver-side manifest size/lookups, set once before finalization.
+    manifest_totals: Mutex<Option<ManifestTotals>>,
+    /// Chunks dispatched by the scheduler and not yet settled.
+    inflight_now: AtomicU32,
+    /// The newest receiver counters, refreshed on every chunk ack.
+    latest_recv: Mutex<ReceiverSnapshot>,
+    /// The sampled time series and the interval it is being taken at.
+    timeseries: Mutex<TimeseriesState>,
+    timeseries_started: AtomicBool,
     /// How the transfer reached the peer, and the manifest it was chosen from.
     /// Set once at start; `null` when this side never knew.
     transport: Mutex<Option<String>>,
     transport_manifest: Mutex<Option<serde_json::Value>>,
     resources: Arc<ResourceSampler>,
     finalized: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ManifestTotals {
+    chunks: u32,
+    memory_bytes: u64,
+    lookup_p50_us: Option<f64>,
+    lookup_p95_us: Option<f64>,
 }
 
 #[derive(Default, Clone)]
@@ -742,6 +984,28 @@ impl Telemetry {
             encrypt_latency: Mutex::new(encrypt_latency),
             encrypt_cpu_latency: Mutex::new(encrypt_cpu_latency),
             http_latency: Mutex::new(http_latency),
+            recv_lock_wait_ns: AtomicU64::new(0),
+            recv_part_write_ns: AtomicU64::new(0),
+            recv_journal_ns: AtomicU64::new(0),
+            recv_accept_ns: AtomicU64::new(0),
+            recv_timed_chunks: AtomicU64::new(0),
+            recv_lock_wait_latency: Mutex::new(LatencyHistogram::default()),
+            recv_part_write_latency: Mutex::new(LatencyHistogram::default()),
+            recv_journal_latency: Mutex::new(LatencyHistogram::default()),
+            recv_accept_latency: Mutex::new(LatencyHistogram::default()),
+            journal_flushes: AtomicU64::new(0),
+            journal_batch: Mutex::new(LatencyHistogram::default()),
+            compaction_count: AtomicU64::new(0),
+            compaction_total_ns: AtomicU64::new(0),
+            compaction_under_lock_ns: AtomicU64::new(0),
+            manifest_totals: Mutex::new(None),
+            inflight_now: AtomicU32::new(0),
+            latest_recv: Mutex::new(ReceiverSnapshot::default()),
+            timeseries: Mutex::new(TimeseriesState {
+                samples: Vec::new(),
+                interval_secs: SAMPLE_INTERVAL_SECS,
+            }),
+            timeseries_started: AtomicBool::new(false),
             files: Mutex::new(files),
             transport: Mutex::new(None),
             transport_manifest: Mutex::new(None),
@@ -793,6 +1057,366 @@ impl Telemetry {
         record_phase(&self.http_ns, &self.http_latency, http);
     }
 
+    /// What one chunk's receiver reported about its durability step.
+    ///
+    /// `present` is false for a receiver that predates the timing headers; the
+    /// chunk then counts towards the denominator of the coverage figure and
+    /// nothing else. Zero durations are skipped by `record_phase`, so a 0 ms
+    /// local contributes no sample rather than a fake one.
+    pub fn chunk_receiver_phases(
+        &self,
+        lock_wait: std::time::Duration,
+        part_write: std::time::Duration,
+        journal: std::time::Duration,
+        accept: std::time::Duration,
+        present: bool,
+    ) {
+        if !present {
+            return;
+        }
+
+        self.recv_timed_chunks.fetch_add(1, Ordering::Relaxed);
+
+        record_phase(&self.recv_lock_wait_ns, &self.recv_lock_wait_latency, lock_wait);
+        record_phase(&self.recv_part_write_ns, &self.recv_part_write_latency, part_write);
+        record_phase(&self.recv_journal_ns, &self.recv_journal_latency, journal);
+        record_phase(&self.recv_accept_ns, &self.recv_accept_latency, accept);
+    }
+
+    /// Count one dispatched chunk; the returned guard releases it.
+    pub fn begin_chunk(self: &Arc<Self>) -> InFlightGuard {
+        self.inflight_now.fetch_add(1, Ordering::Relaxed);
+
+        InFlightGuard(Arc::clone(self))
+    }
+
+    /// Refresh the receiver counters from one acknowledgement.
+    ///
+    /// A field the receiver did not send keeps its previous value: an old
+    /// receiver sends none, and the sample then carries `null`.
+    pub fn observe_receiver(&self, snapshot: ReceiverSnapshot) {
+        let mut latest = self.latest_recv.lock().expect("telemetry lock poisoned");
+
+        if snapshot.inflight.is_some() {
+            latest.inflight = snapshot.inflight;
+        }
+
+        if snapshot.journal_pending.is_some() {
+            latest.journal_pending = snapshot.journal_pending;
+        }
+
+        if snapshot.part_files.is_some() {
+            latest.part_files = snapshot.part_files;
+        }
+
+        if snapshot.incoming_bytes.is_some() {
+            latest.incoming_bytes = snapshot.incoming_bytes;
+        }
+
+        if snapshot.compactions.is_some() {
+            latest.compactions = snapshot.compactions;
+        }
+
+        if snapshot.journal_flushes.is_some() {
+            latest.journal_flushes = snapshot.journal_flushes;
+        }
+
+        if snapshot.journal_entries.is_some() {
+            latest.journal_entries = snapshot.journal_entries;
+        }
+
+        if snapshot.compaction_ms.is_some() {
+            latest.compaction_ms = snapshot.compaction_ms;
+        }
+
+        if snapshot.compaction_under_lock_ms.is_some() {
+            latest.compaction_under_lock_ms = snapshot.compaction_under_lock_ms;
+        }
+
+        if snapshot.manifest_chunks.is_some() {
+            latest.manifest_chunks = snapshot.manifest_chunks;
+        }
+
+        if snapshot.manifest_lookup_p50_us.is_some() {
+            latest.manifest_lookup_p50_us = snapshot.manifest_lookup_p50_us;
+        }
+
+        if snapshot.manifest_lookup_p95_us.is_some() {
+            latest.manifest_lookup_p95_us = snapshot.manifest_lookup_p95_us;
+        }
+
+        if snapshot.manifest_memory_bytes.is_some() {
+            latest.manifest_memory_bytes = snapshot.manifest_memory_bytes;
+        }
+    }
+
+    /// The receiver's own manifest size and lookup cost, for its report. The
+    /// sender gets the same numbers on the chunk headers instead.
+    pub fn set_manifest_totals(
+        &self,
+        chunks: u32,
+        memory_bytes: u64,
+        lookups: LatencySummary,
+    ) {
+        *self
+            .manifest_totals
+            .lock()
+            .expect("telemetry manifest lock poisoned") = Some(ManifestTotals {
+            chunks,
+            memory_bytes,
+            lookup_p50_us: lookups.p50_ms.map(|ms| round(ms * 1000.0)),
+            lookup_p95_us: lookups.p95_ms.map(|ms| round(ms * 1000.0)),
+        });
+    }
+
+    /// The receiver's own manifest-write totals. The sender gets the same
+    /// numbers on the chunk headers and this is never called for it.
+    pub fn set_compaction_totals(&self, count: u64, total_ns: u64, under_lock_ns: u64) {
+        self.compaction_count.store(count, Ordering::Relaxed);
+        self.compaction_total_ns.store(total_ns, Ordering::Relaxed);
+        self.compaction_under_lock_ns
+            .store(under_lock_ns, Ordering::Relaxed);
+    }
+
+    /// The receiver's cumulative journal flushes and journaled entries, for the
+    /// chunk acknowledgement headers.
+    pub fn journal_totals(&self) -> (u64, u64) {
+        let entries = self
+            .journal_batch
+            .lock()
+            .expect("telemetry latency lock poisoned")
+            .sum_ns;
+
+        (self.journal_flushes.load(Ordering::Relaxed), entries)
+    }
+
+    /// Start the per-interval sampler. Once per transfer.
+    ///
+    /// Only the sender samples: the receiver is a different process, and its
+    /// counters reach the sender on the per-chunk acknowledgement headers.
+    pub fn start_timeseries(self: &Arc<Self>) {
+        if !matches!(self.role, Role::Sender) {
+            return;
+        }
+
+        if self.timeseries_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let telemetry = Arc::clone(self);
+
+        handle.spawn(async move {
+            let mut last_bytes = 0u64;
+            let mut last_latency_count = 0u64;
+            let mut last_latency_ns = 0u64;
+            let mut last_compactions: Option<u64> = None;
+            let mut last_journal_flushes: Option<u64> = None;
+            let mut last_recv_lock_wait_ns = 0u64;
+            let mut last_recv_journal_ns = 0u64;
+
+            loop {
+                let interval_secs = {
+                    telemetry
+                        .timeseries
+                        .lock()
+                        .expect("telemetry lock poisoned")
+                        .interval_secs
+                };
+
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+
+                if telemetry.finalized.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let t_secs = telemetry.now_ns() as f64 / 1e9;
+
+                // One bad sample is reported in its own record and never fails
+                // the transfer.
+                let collected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    telemetry.collect_sample(
+                        t_secs,
+                        interval_secs,
+                        &mut last_bytes,
+                        &mut last_latency_count,
+                        &mut last_latency_ns,
+                        &mut last_compactions,
+                        &mut last_journal_flushes,
+                        &mut last_recv_lock_wait_ns,
+                        &mut last_recv_journal_ns,
+                    )
+                }));
+
+                match collected {
+                    Ok(sample) => telemetry.push_sample(sample),
+
+                    Err(_) => telemetry.push_sample(TimeSample {
+                        t_secs,
+                        bytes_acked: 0,
+                        chunks_acked: 0,
+                        window_mib_s: 0.0,
+                        inflight_now: 0,
+                        sender_rss_bytes: 0,
+                        sender_open_fds: None,
+                        recv_rss_bytes: None,
+                        recv_inflight_map_len: None,
+                        recv_journal_pending: None,
+                        recv_journal_flushes_this_window: None,
+                        recv_manifest_chunk_count: None,
+                        recv_part_files: None,
+                        recv_incoming_dir_bytes: None,
+                        compactions_this_window: None,
+                        avg_chunk_latency_ms_this_window: 0.0,
+                        error: Some("sample collection panicked".into()),
+                    }),
+                }
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_sample(
+        &self,
+        t_secs: f64,
+        interval_secs: u64,
+        last_bytes: &mut u64,
+        last_latency_count: &mut u64,
+        last_latency_ns: &mut u64,
+        last_compactions: &mut Option<u64>,
+        last_journal_flushes: &mut Option<u64>,
+        last_recv_lock_wait_ns: &mut u64,
+        last_recv_journal_ns: &mut u64,
+    ) -> TimeSample {
+        let bytes = self.plaintext_bytes.load(Ordering::Relaxed);
+
+        let (latency_count, latency_sum) = {
+            let histogram = self.latency.lock().expect("telemetry latency lock poisoned");
+
+            (histogram.count, histogram.sum_ns)
+        };
+
+        let delta_bytes = bytes.saturating_sub(*last_bytes);
+        let delta_count = latency_count.saturating_sub(*last_latency_count);
+        let delta_ns = latency_sum.saturating_sub(*last_latency_ns);
+
+        let avg_chunk_latency_ms = if delta_count > 0 {
+            delta_ns as f64 / delta_count as f64 / 1e6
+        } else {
+            0.0
+        };
+
+        let snapshot = self
+            .latest_recv
+            .lock()
+            .expect("telemetry lock poisoned")
+            .clone();
+
+        let compactions_this_window = snapshot.compactions.map(|total| {
+            let delta = last_compactions
+                .map(|previous| total.saturating_sub(previous))
+                .unwrap_or(total);
+
+            *last_compactions = Some(total);
+
+            u32::try_from(delta).unwrap_or(u32::MAX)
+        });
+
+        let journal_flushes_this_window = snapshot.journal_flushes.map(|total| {
+            let delta = last_journal_flushes
+                .map(|previous| total.saturating_sub(previous))
+                .unwrap_or(total);
+
+            *last_journal_flushes = Some(total);
+
+            u32::try_from(delta).unwrap_or(u32::MAX)
+        });
+
+        /*
+         * The receiver's per-chunk durability totals are cumulative; the log
+         * carries the average over this window so a killed transfer still
+         * leaves the decay curve behind.
+         */
+        let recv_lock_wait_ms_this_window = window_average_ms(
+            self.recv_lock_wait_ns.load(Ordering::Relaxed),
+            last_recv_lock_wait_ns,
+            delta_count,
+        );
+
+        let recv_journal_ms_this_window = window_average_ms(
+            self.recv_journal_ns.load(Ordering::Relaxed),
+            last_recv_journal_ns,
+            delta_count,
+        );
+
+        *last_bytes = bytes;
+        *last_latency_count = latency_count;
+        *last_latency_ns = latency_sum;
+
+        tracing::info!(
+            target: "transfer::series",
+            t_secs,
+            window_mib_s = delta_bytes as f64 / interval_secs as f64 / (1024.0 * 1024.0),
+            recv_lock_wait_ms = recv_lock_wait_ms_this_window,
+            recv_journal_ms = recv_journal_ms_this_window,
+            recv_part_files = ?snapshot.part_files,
+            sender_open_fds = ?open_fd_count(),
+            "sample"
+        );
+
+        TimeSample {
+            t_secs,
+            bytes_acked: bytes,
+            chunks_acked: latency_count,
+            window_mib_s: delta_bytes as f64 / interval_secs as f64 / (1024.0 * 1024.0),
+            inflight_now: self.inflight_now.load(Ordering::Relaxed),
+            sender_rss_bytes: self.resources.current_rss(),
+            sender_open_fds: open_fd_count(),
+            recv_rss_bytes: None,
+            recv_inflight_map_len: snapshot.inflight,
+            recv_journal_pending: snapshot.journal_pending,
+            recv_journal_flushes_this_window: journal_flushes_this_window,
+            recv_manifest_chunk_count: snapshot.manifest_chunks,
+            recv_part_files: snapshot.part_files,
+            recv_incoming_dir_bytes: snapshot.incoming_bytes,
+            compactions_this_window,
+            avg_chunk_latency_ms_this_window: avg_chunk_latency_ms,
+            error: None,
+        }
+    }
+
+    fn push_sample(&self, sample: TimeSample) {
+        let mut series = self.timeseries.lock().expect("telemetry lock poisoned");
+
+        series.samples.push(sample);
+
+        if series.samples.len() > MAX_TIMESERIES_SAMPLES {
+            let mut kept = Vec::with_capacity(MAX_TIMESERIES_SAMPLES / 2 + 1);
+
+            for (index, sample) in series.samples.drain(..).enumerate() {
+                if index % 2 == 0 {
+                    kept.push(sample);
+                }
+            }
+
+            series.samples = kept;
+            series.interval_secs = series.interval_secs.saturating_mul(2);
+        }
+    }
+
+    /// One journal flush, covering `entries` chunks.
+    pub fn record_journal_flush(&self, entries: u64) {
+        self.journal_flushes.fetch_add(1, Ordering::Relaxed);
+
+        self.journal_batch
+            .lock()
+            .expect("telemetry latency lock poisoned")
+            .record(entries);
+    }
+
     /// The bytes one acknowledged chunk carried, plaintext and on the wire.
     ///
     /// Recorded only after the receiver acknowledged the chunk, so the ratio
@@ -810,6 +1434,11 @@ impl Telemetry {
         let encrypt = self.encrypt_ns.load(Ordering::Relaxed);
         let encrypt_cpu = self.encrypt_cpu_ns.load(Ordering::Relaxed);
         let http = self.http_ns.load(Ordering::Relaxed);
+
+        let recv_lock_wait = self.recv_lock_wait_ns.load(Ordering::Relaxed);
+        let recv_part_write = self.recv_part_write_ns.load(Ordering::Relaxed);
+        let recv_journal = self.recv_journal_ns.load(Ordering::Relaxed);
+        let recv_accept = self.recv_accept_ns.load(Ordering::Relaxed);
 
         let total = read
             .saturating_add(compress)
@@ -885,6 +1514,42 @@ impl Telemetry {
                 share_percent: share(http),
                 latency: self
                     .http_latency
+                    .lock()
+                    .expect("telemetry latency lock poisoned")
+                    .summary(),
+            },
+            recv_lock_wait: PhaseShare {
+                total_seconds: seconds(recv_lock_wait),
+                share_percent: share(recv_lock_wait),
+                latency: self
+                    .recv_lock_wait_latency
+                    .lock()
+                    .expect("telemetry latency lock poisoned")
+                    .summary(),
+            },
+            recv_part_write: PhaseShare {
+                total_seconds: seconds(recv_part_write),
+                share_percent: share(recv_part_write),
+                latency: self
+                    .recv_part_write_latency
+                    .lock()
+                    .expect("telemetry latency lock poisoned")
+                    .summary(),
+            },
+            recv_journal: PhaseShare {
+                total_seconds: seconds(recv_journal),
+                share_percent: share(recv_journal),
+                latency: self
+                    .recv_journal_latency
+                    .lock()
+                    .expect("telemetry latency lock poisoned")
+                    .summary(),
+            },
+            recv_accept: PhaseShare {
+                total_seconds: seconds(recv_accept),
+                share_percent: share(recv_accept),
+                latency: self
+                    .recv_accept_latency
                     .lock()
                     .expect("telemetry latency lock poisoned")
                     .summary(),
@@ -1243,6 +1908,13 @@ impl Telemetry {
                 "incomplete"
             };
 
+            let precompressed = descriptor
+                .relative_path
+                .as_deref()
+                .map_or(false, |path| {
+                    crate::transfer::compression::is_precompressed(Path::new(path))
+                });
+
             files.push(FileReport {
                 file_id: descriptor.file_id.clone(),
                 relative_path: descriptor.relative_path.clone(),
@@ -1256,6 +1928,8 @@ impl Telemetry {
                 throughput_mib_s: duration_seconds
                     .map(|seconds| mib_per_second(bytes_done, seconds)),
                 outcome,
+                compression_enabled: !precompressed,
+                compression_skipped_reason: precompressed.then_some("precompressed_ext"),
             });
         }
 
@@ -1277,6 +1951,86 @@ impl Telemetry {
         };
 
         let chunk_breakdown = self.chunk_breakdown();
+
+        /*
+         * How much of the sender's own `http` time the receiver accounted for.
+         * The denominator is the acknowledged-chunk count, so a receiver that
+         * sends no timing headers reads 0% coverage rather than being silently
+         * assumed to have sent zeros.
+         */
+        let acknowledged = self
+            .latency
+            .lock()
+            .expect("telemetry latency lock poisoned")
+            .count;
+
+        let recv_timed = self.recv_timed_chunks.load(Ordering::Relaxed);
+
+        let recv_timings_coverage_percent =
+            (acknowledged > 0).then(|| round(recv_timed as f64 / acknowledged as f64 * 100.0));
+
+        let http_nanos = self.http_ns.load(Ordering::Relaxed);
+
+        let recv_nanos = self
+            .recv_lock_wait_ns
+            .load(Ordering::Relaxed)
+            .saturating_add(self.recv_part_write_ns.load(Ordering::Relaxed))
+            .saturating_add(self.recv_journal_ns.load(Ordering::Relaxed))
+            .saturating_add(self.recv_accept_ns.load(Ordering::Relaxed));
+
+        let recv_durability_share_percent = match recv_timings_coverage_percent {
+            Some(coverage) if coverage >= 10.0 && http_nanos > 0 => {
+                Some(round(recv_nanos as f64 / http_nanos as f64 * 100.0))
+            }
+
+            _ => None,
+        };
+
+        let (timeseries, sampled_every_secs) = {
+            let series = self.timeseries.lock().expect("telemetry lock poisoned");
+
+            (series.samples.clone(), series.interval_secs)
+        };
+
+        /*
+         * A sender learns the receiver's journal batching from its per-chunk
+         * headers; a receiver reports its own. When no header ever arrived, the
+         * local counters answer — which is `0` on a sender.
+         */
+        let (recv_journal_flush_count, recv_journal_entries_per_flush) = {
+            let latest = self
+                .latest_recv
+                .lock()
+                .expect("telemetry lock poisoned")
+                .clone();
+
+            match (latest.journal_flushes, latest.journal_entries) {
+                (Some(flushes), Some(entries)) if flushes > 0 => (
+                    flushes,
+                    Some(CountSummary {
+                        count: flushes,
+                        mean: Some(round(entries as f64 / flushes as f64)),
+                        p50: None,
+                        p95: None,
+                        max: None,
+                        resolution: "receiver cumulative: journaled entries per flush",
+                    }),
+                ),
+
+                _ => {
+                    let summary = self
+                        .journal_batch
+                        .lock()
+                        .expect("telemetry latency lock poisoned")
+                        .raw_summary();
+
+                    (
+                        self.journal_flushes.load(Ordering::Relaxed),
+                        (summary.count > 0).then_some(summary),
+                    )
+                }
+            }
+        };
 
         let mut unavailable = finish.unavailable.clone();
 
@@ -1329,6 +2083,68 @@ impl Telemetry {
             unavailable.push("transport_manifest (no manifest was relayed)".into());
         }
 
+        let (recv_compaction_count, recv_compaction_total_seconds, recv_compaction_under_lock_ms) = {
+            let latest = self
+                .latest_recv
+                .lock()
+                .expect("telemetry lock poisoned")
+                .clone();
+
+            if let Some(count) = latest.compactions {
+                (
+                    count,
+                    latest.compaction_ms.map(|ms| round(ms as f64 / 1000.0)),
+                    latest.compaction_under_lock_ms.map(|ms| ms as f64),
+                )
+            } else if matches!(self.role, Role::Receiver) {
+                let total_ns = self.compaction_total_ns.load(Ordering::Relaxed);
+                let under_ns = self.compaction_under_lock_ns.load(Ordering::Relaxed);
+
+                (
+                    self.compaction_count.load(Ordering::Relaxed),
+                    (total_ns > 0).then_some(round(total_ns as f64 / 1e9)),
+                    Some(round(under_ns as f64 / 1e6)),
+                )
+            } else {
+                (0, None, None)
+            }
+        };
+
+        let (
+            recv_manifest_chunk_count,
+            recv_manifest_lookup_p50_us,
+            recv_manifest_lookup_p95_us,
+            recv_manifest_memory_bytes,
+        ) = {
+            let latest = self
+                .latest_recv
+                .lock()
+                .expect("telemetry lock poisoned")
+                .clone();
+
+            if let Some(chunks) = latest.manifest_chunks {
+                (
+                    Some(chunks),
+                    latest.manifest_lookup_p50_us.map(|value| value as f64),
+                    latest.manifest_lookup_p95_us.map(|value| value as f64),
+                    latest.manifest_memory_bytes,
+                )
+            } else if let Some(own) = *self
+                .manifest_totals
+                .lock()
+                .expect("telemetry manifest lock poisoned")
+            {
+                (
+                    Some(own.chunks),
+                    own.lookup_p50_us,
+                    own.lookup_p95_us,
+                    Some(own.memory_bytes),
+                )
+            } else {
+                (None, None, None, None)
+            }
+        };
+
         TransferReport {
             schema_version: REPORT_SCHEMA_VERSION,
             role: self.role,
@@ -1359,6 +2175,20 @@ impl Telemetry {
                 .expect("telemetry latency lock poisoned")
                 .summary(),
             chunk_breakdown,
+            recv_durability_share_percent,
+            recv_timings_coverage_percent,
+            recv_journal_flush_count,
+            recv_journal_entries_per_flush,
+            recv_compaction_count,
+            recv_compaction_total_seconds,
+            recv_compaction_under_lock_ms,
+            recv_manifest_chunk_count,
+            recv_manifest_lookup_p50_us,
+            recv_manifest_lookup_p95_us,
+            recv_manifest_memory_bytes,
+            timeseries: timeseries.clone(),
+            throughput_decay: throughput_decay(&timeseries),
+            sampled_every_secs,
             resources: self.resources.summary(),
             phases,
             retries: finish.retries,
@@ -1400,6 +2230,77 @@ fn ms_to_ns(millis: u64) -> u64 {
     millis.saturating_mul(1_000_000)
 }
 
+/// How many handles/fds this process has open, where the platform can say.
+///
+/// A syscall on Windows and a directory read on Linux; `None` elsewhere rather
+/// than a guess. Called once per sampling interval, not per chunk.
+fn open_fd_count() -> Option<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
+        }
+
+        let mut count = 0u32;
+
+        // SAFETY: both are plain Win32 calls; `count` is a valid out pointer
+        // and the returned handle is the current process pseudo-handle.
+        let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+
+        (ok != 0).then_some(count)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir("/proc/self/fd")
+            .ok()
+            .map(|entries| entries.filter_map(Result::ok).count() as u32)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// `first / last` throughput ratio, and the first sample below 70% of the
+/// first quartile.
+fn throughput_decay(samples: &[TimeSample]) -> Option<ThroughputDecay> {
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let quartile = (samples.len() / 4).max(1);
+
+    let mean = |slice: &[TimeSample]| -> f64 {
+        slice.iter().map(|sample| sample.window_mib_s).sum::<f64>() / slice.len() as f64
+    };
+
+    let first = mean(&samples[..quartile]);
+    let last = mean(&samples[samples.len() - quartile..]);
+
+    // Floored so a total stall is still a finite number in the JSON.
+    let decay_ratio = first / last.max(0.001);
+
+    let slowdown_onset_secs = (first > 0.0)
+        .then(|| {
+            samples
+                .iter()
+                .find(|sample| sample.window_mib_s < 0.7 * first)
+                .map(|sample| round(sample.t_secs))
+        })
+        .flatten();
+
+    Some(ThroughputDecay {
+        first_quartile_mib_s: round(first),
+        last_quartile_mib_s: round(last),
+        decay_ratio: round(decay_ratio),
+        slowdown_onset_secs,
+    })
+}
+
 fn record_phase(
     total: &AtomicU64,
     latency: &Mutex<LatencyHistogram>,
@@ -1435,7 +2336,7 @@ fn optional_ms(nanos: u64) -> Option<u64> {
     (nanos != UNSET).then_some(nanos / 1_000_000)
 }
 
-fn status_name(status: TransferStatus) -> &'static str {
+pub(crate) fn status_name(status: TransferStatus) -> &'static str {
     match status {
         TransferStatus::Completed => "COMPLETED",
         TransferStatus::Failed => "FAILED",
@@ -2224,6 +3125,162 @@ mod tests {
         assert!(unavailable
             .iter()
             .any(|item| item.as_str().unwrap_or_default().starts_with("duration")));
+    }
+
+    #[test]
+    fn receiver_durability_share_is_null_when_no_chunk_reported_timings() {
+        let telemetry = Telemetry::new(Role::Sender);
+
+        for _ in 0..10 {
+            telemetry.chunk_finished("f-1", std::time::Duration::from_millis(100), 0);
+            telemetry.chunk_phases(
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(100),
+            );
+        }
+
+        let report = telemetry.build(finish("t-1", TransferStatus::Completed), false, false);
+
+        assert_eq!(report.recv_timings_coverage_percent, Some(0.0));
+        assert_eq!(
+            report.recv_durability_share_percent, None,
+            "0% coverage must not be reported as a 0% share"
+        );
+    }
+
+    #[test]
+    fn receiver_durability_share_attributes_the_reported_part_of_http() {
+        let telemetry = Telemetry::new(Role::Sender);
+
+        for _ in 0..10 {
+            telemetry.chunk_finished("f-1", std::time::Duration::from_millis(100), 0);
+            telemetry.chunk_phases(
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(100),
+            );
+            telemetry.chunk_receiver_phases(
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(40),
+                true,
+            );
+        }
+
+        let report = telemetry.build(finish("t-1", TransferStatus::Completed), false, false);
+
+        assert_eq!(report.recv_timings_coverage_percent, Some(100.0));
+        // (10 + 20 + 5 + 40) ms per chunk over 100 ms of http: 75%.
+        assert_eq!(report.recv_durability_share_percent, Some(75.0));
+    }
+
+    fn sample(t_secs: u64, window_mib_s: f64) -> TimeSample {
+        TimeSample {
+            t_secs: t_secs as f64,
+            bytes_acked: 0,
+            chunks_acked: 0,
+            window_mib_s,
+            inflight_now: 0,
+            sender_rss_bytes: 0,
+            sender_open_fds: None,
+            recv_rss_bytes: None,
+            recv_inflight_map_len: None,
+            recv_journal_pending: None,
+            recv_journal_flushes_this_window: None,
+            recv_manifest_chunk_count: None,
+            recv_part_files: None,
+            recv_incoming_dir_bytes: None,
+            compactions_this_window: None,
+            avg_chunk_latency_ms_this_window: 0.0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn throughput_decay_finds_the_slowdown() {
+        let samples: Vec<TimeSample> = [100.0, 100.0, 100.0, 100.0, 90.0, 60.0, 20.0, 10.0]
+            .iter()
+            .enumerate()
+            .map(|(index, window)| sample(index as u64, *window))
+            .collect();
+
+        let decay = throughput_decay(&samples).expect("eight windows");
+
+        assert_eq!(decay.first_quartile_mib_s, 100.0);
+        assert_eq!(decay.last_quartile_mib_s, 15.0);
+        assert_eq!(decay.decay_ratio, 6.667);
+        assert_eq!(
+            decay.slowdown_onset_secs,
+            Some(5.0),
+            "the first window below 70% of the first quartile"
+        );
+    }
+
+    #[test]
+    fn a_flat_transfer_has_no_decay_and_no_onset() {
+        let samples: Vec<TimeSample> = (0..8).map(|index| sample(index, 100.0)).collect();
+
+        let decay = throughput_decay(&samples).expect("eight windows");
+
+        assert_eq!(decay.decay_ratio, 1.0);
+        assert_eq!(decay.slowdown_onset_secs, None);
+    }
+
+    #[test]
+    fn the_timeseries_is_capped_and_downsampled() {
+        let telemetry = Telemetry::new(Role::Sender);
+
+        for second in 0..800u64 {
+            telemetry.push_sample(sample(second, 1.0));
+        }
+
+        let series = telemetry.timeseries.lock().expect("series");
+
+        assert!(
+            series.samples.len() <= MAX_TIMESERIES_SAMPLES,
+            "the series must stay bounded"
+        );
+        assert_eq!(series.interval_secs, SAMPLE_INTERVAL_SECS * 2);
+    }
+
+    #[test]
+    fn receiver_compaction_totals_reach_the_report() {
+        let telemetry = Telemetry::new(Role::Receiver);
+
+        telemetry.set_compaction_totals(3, 1_500_000_000, 0);
+
+        let report = telemetry.build(finish("t-1", TransferStatus::Completed), false, false);
+
+        assert_eq!(report.recv_compaction_count, 3);
+        assert_eq!(report.recv_compaction_total_seconds, Some(1.5));
+        assert_eq!(report.recv_compaction_under_lock_ms, Some(0.0));
+    }
+
+    #[test]
+    fn journal_flushes_are_counted_and_sized() {
+        let telemetry = Telemetry::new(Role::Receiver);
+
+        telemetry.record_journal_flush(32);
+        telemetry.record_journal_flush(8);
+
+        let report = telemetry.build(finish("t-1", TransferStatus::Completed), false, false);
+
+        assert_eq!(report.recv_journal_flush_count, 2);
+
+        let stats = report
+            .recv_journal_entries_per_flush
+            .expect("two flushes were recorded");
+
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.mean, Some(20.0));
+        assert_eq!(stats.max, Some(32));
+        assert!(stats.p50.unwrap() <= 32);
     }
 
     #[test]

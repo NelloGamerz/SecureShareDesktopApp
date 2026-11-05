@@ -97,6 +97,9 @@ pub struct UploadState {
     pub report: std::sync::Arc<crate::transfer::report::Telemetry>,
     /// Phase timings the manager measured for the report.
     pub phases: std::sync::Mutex<crate::transfer::report::PhaseTimings>,
+    /// The paths `START_TRANSFER` advertised, kept current while the transfer
+    /// runs and written to `<id>.network.json`.
+    pub network_report: std::sync::Mutex<crate::transfer::network_report::NetworkReport>,
 }
 impl UploadState {
     /// How many bytes one chunk of this transfer holds, or `None` when the plan
@@ -407,4 +410,10 @@ pub struct DownloadState {
 
     /// Phase timings the receiver measured for the report.
     pub phases: Mutex<crate::transfer::report::PhaseTimings>,
+
+    /// The paths this receiver advertised, kept current while it receives.
+    pub network_report: Mutex<crate::transfer::network_report::NetworkReport>,
+    /// When the network report was last written, so chunk traffic does not
+    /// rewrite it for every chunk.
+    pub network_written: Mutex<std::time::Instant>,
 }

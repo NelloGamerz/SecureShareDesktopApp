@@ -16,3 +16,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/desktop", "crates/sdk", "crates/transport"]
+
+# Dev/test builds are what `tauri dev` and `cargo test` use. The transfer path
+# runs zstd, AES-GCM and SHA-256 over every chunk; unoptimized code makes a
+# local transfer look several times slower than the shipped build and hides
+# real throughput regressions. Optimize both this workspace and its
+# dependencies while keeping debug info and incremental rebuilds.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

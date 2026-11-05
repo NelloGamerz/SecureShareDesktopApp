@@ -53,7 +53,9 @@ use crate::transfer::{
     constants::LEGACY_CHUNK_SIZE,
     crypto,
     errors::{Result, TransferError},
-    http_client::{HttpClient, ReceiverKey, SessionStart, TransferResumeResponse},
+    http_client::{
+        HttpClient, ReceiverKey, ReceiverTimings, SessionStart, TransferResumeResponse,
+    },
     integrity::ExpectedTransfer,
 };
 
@@ -80,6 +82,8 @@ pub struct ChunkSendTimings {
     pub encrypt_cpu: std::time::Duration,
     /// The request and the wait for the receiver's acknowledgement.
     pub http: std::time::Duration,
+    /// What the receiver reported its durability step cost, when it said.
+    pub receiver: ReceiverTimings,
 }
 
 /// Everything the engine must tell a session before it can be opened.
@@ -426,6 +430,24 @@ impl ProtocolSession for LegacyV1Session {
         let (body, encoding) = match self.chunk_encoding() {
             ChunkEncoding::Identity => (plaintext, ChunkEncoding::Identity),
 
+            /*
+             * Already-compressed formats are skipped per file: the attempt costs
+             * CPU and cannot shrink the chunk. The wire format does not change —
+             * this is the existing identity frame.
+             */
+            ChunkEncoding::Zstd
+                if compression::is_precompressed(std::path::Path::new(&job.relative_path)) =>
+            {
+                tracing::debug!(
+                    transfer_id=%job.transfer_id,
+                    chunk=job.index,
+                    path=%job.relative_path,
+                    "already-compressed file; sending the chunk as it is"
+                );
+
+                (plaintext, ChunkEncoding::Identity)
+            }
+
             ChunkEncoding::Zstd => {
                 // Content decides: zstd, or identity if this chunk did not shrink.
                 let strategy = compression::strategy();
@@ -534,7 +556,8 @@ impl ProtocolSession for LegacyV1Session {
          */
         let http_started = std::time::Instant::now();
 
-        self.client
+        let receiver = self
+            .client
             .send(
                 &self.endpoint,
                 &self.token,
@@ -561,6 +584,7 @@ impl ProtocolSession for LegacyV1Session {
             encrypt,
             encrypt_cpu,
             http,
+            receiver,
         })
     }
 

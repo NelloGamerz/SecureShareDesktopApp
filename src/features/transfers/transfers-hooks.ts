@@ -56,15 +56,25 @@ export function useTransferAction() {
       transferId: string;
       action: TransferAction;
     }) => {
-      // Probing happens before the accept. It is an optimisation, so a failure
-      // or an older build without the command must never block accepting.
+      // Probing happens before the accept. It must never block accepting, so a
+      // failure (or an older build without the command) still sends a valid,
+      // empty manifest — the backend records "present but empty" differently
+      // from "missing".
       let transportManifest: unknown;
 
       if (action === "ACCEPT") {
         try {
           transportManifest = await invoke("build_transport_manifest");
         } catch {
-          transportManifest = undefined;
+          transportManifest = {
+            manifest_version: 1,
+            capabilities: {
+              p2p: false,
+              lan: false,
+              ble: false,
+              preferred_order: [],
+            },
+          };
         }
       }
 

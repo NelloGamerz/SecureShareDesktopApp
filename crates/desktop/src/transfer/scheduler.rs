@@ -244,6 +244,9 @@ pub async fn run(
 
             in_flight.spawn(async move {
                 let _permit = permit;
+                // Counted while this task is alive, so the timeseries'
+                // `inflight_now` is dispatch depth rather than queue depth.
+                let _inflight = state.report.begin_chunk();
 
                 while state.paused.load(std::sync::atomic::Ordering::Relaxed) {
                     if state.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -289,9 +292,35 @@ pub async fn run(
                         timings.http,
                     );
 
+                    state.report.chunk_receiver_phases(
+                        timings.recv_lock_wait,
+                        timings.recv_part_write,
+                        timings.recv_journal,
+                        timings.recv_accept,
+                        timings.recv_timed,
+                    );
+
                     state
                         .report
                         .chunk_bytes(timings.plaintext_bytes, timings.body_bytes);
+
+                    state
+                        .report
+                        .observe_receiver(crate::transfer::report::ReceiverSnapshot {
+                            inflight: timings.recv_inflight,
+                            journal_pending: timings.recv_journal_pending,
+                            part_files: timings.recv_part_files,
+                            incoming_bytes: timings.recv_incoming_bytes,
+                            compactions: timings.recv_compactions,
+                            journal_flushes: timings.recv_journal_flushes,
+                            journal_entries: timings.recv_journal_entries,
+                            compaction_ms: timings.recv_compaction_ms,
+                            compaction_under_lock_ms: timings.recv_compaction_under_lock_ms,
+                            manifest_chunks: timings.recv_manifest_chunks,
+                            manifest_lookup_p50_us: timings.recv_manifest_lookup_p50_us,
+                            manifest_lookup_p95_us: timings.recv_manifest_lookup_p95_us,
+                            manifest_memory_bytes: timings.recv_manifest_memory_bytes,
+                        });
 
                     /*
                      * The receiver answers the last chunk of a file only after it
@@ -563,6 +592,14 @@ mod tests {
             plan_stamps: std::sync::Mutex::new(std::collections::HashMap::new()),
             report: crate::transfer::report::Telemetry::new(crate::transfer::report::Role::Sender),
             phases: std::sync::Mutex::new(crate::transfer::report::PhaseTimings::default()),
+            network_report: std::sync::Mutex::new(
+                crate::transfer::network_report::NetworkReport::new(
+                    crate::transfer::report::Role::Sender,
+                    "t-scheduler",
+                    Vec::new(),
+                    None,
+                ),
+            ),
         })
     }
 

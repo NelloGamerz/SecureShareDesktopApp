@@ -39,7 +39,7 @@ use vilsend_core::DomainEvent;
 use crate::models::{file_info::modified_nanos, progress, transfer::TransferStatus};
 use crate::transfer::{
     manager::DESCRIBE_DIGESTS,
-    manifest,
+    manifest, network_report,
     state::DownloadState,
     writer::{assemble_and_publish, Assembly, ReceiverState},
 };
@@ -52,6 +52,18 @@ pub(crate) enum Accepted {
     /// The receiver already had this exact chunk, verified against its own
     /// record. Nothing was written, and nothing needed to be.
     AlreadyPresent,
+}
+
+/// What the durability step cost, returned to the caller so a v1 receiver can
+/// put it on the response and the sender can attribute its `http` time.
+///
+/// Measured from locals [`accept`] already computes; no extra clock reads.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SinkTimings {
+    pub lock_wait: std::time::Duration,
+    pub part_write: std::time::Duration,
+    pub journal: std::time::Duration,
+    pub accepted_for: std::time::Duration,
 }
 
 /// A failure, classified so a caller can map it to its own protocol's error
@@ -137,8 +149,9 @@ pub(crate) async fn accept(
     transfer_id: &str,
     file_id: &str,
     chunk_index: u64,
+    total_chunks: u64,
     plaintext: Vec<u8>,
-) -> Result<Accepted, SinkError> {
+) -> Result<(Accepted, SinkTimings), SinkError> {
     /*
      * Cancellation is checked before any lock is taken, and the pause wait
      * before it. Neither belongs under a lock: a paused transfer has nothing to
@@ -196,145 +209,321 @@ pub(crate) async fn accept(
 
     let hash = hash_started.elapsed();
 
-    let lock_started = std::time::Instant::now();
-
     let lock = state.transfer_lock(transfer_id).await;
-    let _held = lock.lock().await;
+    let key = (transfer_id.to_owned(), file_id.to_owned(), chunk_index);
+    let assembly = manifest::assembly_path(&parts);
 
     /*
-     * The manifest is read from disk the first time a transfer is touched after
-     * a restart, so the receiver's knowledge of what it holds survives the
-     * process. Only the handle is taken under the map lock; the record itself
-     * is locked for this transfer alone, so one transfer's disk work never
-     * holds up another's.
+     * Phase 1, under the transfer lock: claim this chunk, or wait for the
+     * attempt that already holds it. The lock covers the manifest check and the
+     * reservation only; the part write and the journal flush happen outside it,
+     * which is what lets distinct chunks of one transfer proceed concurrently.
+     *
+     * The in-flight check comes first: a write that has recorded its entry in
+     * memory but not yet fsynced it must not be acknowledged by a duplicate.
      */
-    let handle = state.manifest_handle(transfer_id).await;
-    let mut record = handle.lock().await;
+    let lock_wait = loop {
+        let started = std::time::Instant::now();
+        let held = lock.lock().await;
+        let lock_wait = started.elapsed();
 
-    let lock_wait = lock_started.elapsed();
+        if let Some(waited) = state.reserve_chunk(&key).await {
+            drop(held);
 
-    /*
-     * A chunk may only be skipped when the manifest has an entry for it *and*
-     * the bytes on disk still match that entry. A `.part` with no entry — left
-     * by an older build, or by a crash before the manifest was committed — is
-     * not evidence of anything and gets written again.
-     */
-    let already_complete = match record.entry(file_id, chunk_index) {
-        Some(entry) => {
-            entry.chunk_length == chunk_length
-                && entry.chunk_hash == chunk_hash
-                && manifest::part_matches(&part, entry).await
+            // Ok means it is durable now — the next pass returns
+            // AlreadyPresent. Err means it failed, and this attempt takes over.
+            let _ = waited.await;
+
+            continue;
         }
 
-        None => false,
+        /*
+         * A chunk may only be skipped when the manifest has an entry for it
+         * *and* the bytes on disk still match that entry. A `.part` with no
+         * entry — left by an older build, or by a crash before the manifest was
+         * committed — is not evidence of anything and gets written again.
+         */
+        let (candidate, placement) = {
+            let handle = state.manifest_handle(transfer_id).await;
+            let mut record = handle.lock().await;
+
+            /*
+             * Where this chunk's bytes belong is decided per file, from the
+             * sender's own layout: `offset = index * chunk_size`. The manifest
+             * remembers the decision so two chunks of one file cannot disagree.
+             * See `manifest::Manifest::place`.
+             */
+            let placement = record.place(file_id, chunk_index, total_chunks, chunk_length);
+
+            let started = std::time::Instant::now();
+            let entry = record.entry(file_id, chunk_index);
+            state.record_manifest_lookup(transfer_id, started.elapsed());
+
+            let candidate = match entry {
+                Some(entry)
+                    if entry.chunk_length == chunk_length && entry.chunk_hash == chunk_hash =>
+                {
+                    Some(entry.clone())
+                }
+
+                _ => None,
+            };
+
+            (candidate, placement)
+        };
+
+        /*
+         * The bytes are read and hashed with no manifest lock held: the entry is
+         * a snapshot, and nothing can delete this chunk meanwhile because this
+         * attempt holds its in-flight reservation.
+         */
+        let already_complete = match (&candidate, placement) {
+            (Some(entry), manifest::Placement::Direct(offset)) => {
+                manifest::chunk_matches(&assembly, offset, entry).await
+            }
+
+            (Some(entry), _) => manifest::part_matches(&part, entry).await,
+
+            (None, _) => false,
+        };
+
+        if already_complete {
+            drop(held);
+
+            state.release_chunk(&key, Ok(())).await;
+
+            tracing::debug!(
+                transfer_id,
+                chunk = chunk_index,
+                "chunk already present and matches the manifest"
+            );
+
+            return Ok((
+                Accepted::AlreadyPresent,
+                SinkTimings {
+                    lock_wait,
+                    accepted_for: accepted_started.elapsed(),
+                    ..SinkTimings::default()
+                },
+            ));
+        }
+
+        drop(held);
+
+        break (lock_wait, placement);
     };
 
-    if already_complete {
-        tracing::debug!(
-            transfer_id,
-            chunk = chunk_index,
-            "chunk already present and matches the manifest"
-        );
+    let (lock_wait, placement) = lock_wait;
 
-        return Ok(Accepted::AlreadyPresent);
-    }
+    let outcome = store_chunk(
+        state,
+        download,
+        transfer_id,
+        file_id,
+        chunk_index,
+        total_chunks,
+        &part,
+        &assembly,
+        placement,
+        accepted_started,
+        lock_wait,
+        hash,
+        plaintext,
+        chunk_length,
+        chunk_hash,
+    )
+    .await;
 
+    let signal = outcome
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+
+    state.release_chunk(&key, signal).await;
+
+    outcome
+}
+
+/// Phases 2 and 3 of [`accept`]: write the part outside the transfer lock, then
+/// re-enter only to record and journal it.
+///
+/// The journal entry is recorded in memory before the flush and taken back out
+/// if the flush fails, so a retry cannot be answered from a record that is not
+/// on disk.
+#[allow(clippy::too_many_arguments)]
+async fn store_chunk(
+    state: &ReceiverState,
+    download: &DownloadState,
+    transfer_id: &str,
+    file_id: &str,
+    chunk_index: u64,
+    total_chunks: u64,
+    part: &Path,
+    assembly: &Path,
+    placement: manifest::Placement,
+    accepted_started: std::time::Instant,
+    lock_wait: std::time::Duration,
+    hash: std::time::Duration,
+    plaintext: Vec<u8>,
+    chunk_length: u64,
+    chunk_hash: String,
+) -> Result<(Accepted, SinkTimings), SinkError> {
     /*
      * Whatever is on disk under this name is not this chunk: there was no entry
      * for it, or the entry disagreed with what arrived, or the bytes did not
      * hash to what the entry recorded. Remove it before writing the
      * replacement, so a failure part-way through leaves nothing behind that a
      * later run could read as progress.
-     */
-    manifest::discard_part(&part).await.map_err(|e| {
-        storage_failure(
-            state,
-            download,
-            transfer_id,
-            Some(chunk_index),
-            format!("could not discard an invalid chunk: {e}"),
-        )
-    })?;
-
-    /*
-     * `write_part` writes a temporary and renames it into place once its bytes
-     * are flushed and synced, so a crash mid-write cannot leave a short `.part`
-     * under the real name — and when it returns, the bytes are durably on disk.
+     *
+     * No transfer lock is held, and the in-flight reservation from phase 1
+     * guarantees no other attempt is writing this same chunk.
      */
     let write_started = std::time::Instant::now();
-
-    manifest::write_part(&part, &plaintext).await.map_err(|e| {
-        storage_failure(
-            state,
-            download,
-            transfer_id,
-            Some(chunk_index),
-            format!("could not write the chunk: {e}"),
-        )
-    })?;
-
-    let part_write = write_started.elapsed();
 
     /*
      * The stamp the written file now carries. Recording it is what lets a chunk
      * the sender offers again be recognised as already held without reading it
      * back — see `manifest::part_matches`.
+     *
+     * Only the `.part` layout has a per-chunk stamp. In the direct layout every
+     * chunk shares one file whose modification time moves with each write, so a
+     * range is always read back and hashed instead.
      */
-    let written_nanos = tokio::fs::metadata(&part)
-        .await
-        .ok()
-        .as_ref()
-        .and_then(modified_nanos);
+    let (offset, written_nanos) = match placement {
+        manifest::Placement::Direct(offset) => {
+            manifest::write_chunk_at(assembly, offset, plaintext)
+                .await
+                .map_err(|e| {
+                    storage_failure(
+                        state,
+                        download,
+                        transfer_id,
+                        Some(chunk_index),
+                        format!("could not write the chunk: {e}"),
+                    )
+                })?;
+
+            (Some(offset), None)
+        }
+
+        /*
+         * The sender's layout does not fit this chunk — a length that disagrees
+         * with the transfer's chunk size, or a tail longer than one chunk. It
+         * would be written over a neighbour's range, so it is refused instead.
+         */
+        manifest::Placement::Invalid => {
+            return Err(storage_failure(
+                state,
+                download,
+                transfer_id,
+                Some(chunk_index),
+                format!("chunk {chunk_index} does not fit the sender's chunk layout"),
+            ));
+        }
+
+        manifest::Placement::Parts => {
+            /*
+             * `write_part` writes a temporary and renames it into place once its
+             * bytes are flushed and synced, so a crash mid-write cannot leave a
+             * short `.part` under the real name — and when it returns, the bytes
+             * are durably on disk.
+             */
+            manifest::discard_part(part).await.map_err(|e| {
+                storage_failure(
+                    state,
+                    download,
+                    transfer_id,
+                    Some(chunk_index),
+                    format!("could not discard an invalid chunk: {e}"),
+                )
+            })?;
+
+            manifest::write_part(part, &plaintext).await.map_err(|e| {
+                storage_failure(
+                    state,
+                    download,
+                    transfer_id,
+                    Some(chunk_index),
+                    format!("could not write the chunk: {e}"),
+                )
+            })?;
+
+            (
+                None,
+                tokio::fs::metadata(part)
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(modified_nanos),
+            )
+        }
+    };
+
+    let part_write = write_started.elapsed();
 
     let entry = manifest::ChunkEntry {
         file_id: file_id.to_owned(),
         chunk_index,
         chunk_length,
         chunk_hash,
+        offset,
         written_nanos,
     };
 
     /*
-     * Record the chunk only now, after its bytes are durably in place, so there
-     * is no ordering in which a crash leaves a record for a chunk the receiver
-     * cannot produce.
-     *
-     * The journal line is what makes the record durable, and it is one append
-     * rather than a rewrite of every entry the transfer holds. It is folded
-     * into the manifest when it grows large enough to be worth replaying in
-     * bulk.
+     * Record the chunk in memory, then journal it. The in-memory record must
+     * be visible to a concurrent compaction before the journal is flushed —
+     * `manifest::store` takes the same record lock, and only entries already in
+     * it are written into the manifest. If the flush fails the entry is taken
+     * back out, so a retry re-writes rather than being answered from memory.
      */
-    record.record(entry.clone());
+    {
+        let handle = state.manifest_handle(transfer_id).await;
+        let mut record = handle.lock().await;
+
+        /*
+         * Reserve once for the whole file, from the chunk count the sender
+         * stated, so the map does not reallocate its way through the transfer.
+         * A no-op after the first chunk.
+         */
+        record.reserve(total_chunks);
+
+        let started = std::time::Instant::now();
+        record.record(entry.clone());
+        state.record_manifest_lookup(transfer_id, started.elapsed());
+    }
+
+    let journal = state
+        .journal_for(transfer_id, std::sync::Arc::clone(&download.report))
+        .await;
 
     let journal_started = std::time::Instant::now();
 
-    let journal_length = manifest::journal(&transfer_dir, &entry)
-        .await
-        .map_err(|e| {
-            storage_failure(
-                state,
-                download,
-                transfer_id,
-                Some(chunk_index),
-                format!("could not journal the chunk: {e}"),
-            )
-        })?;
+    let flushed = journal.append(&entry).await;
 
-    let journal = journal_started.elapsed();
+    let journal_wait = journal_started.elapsed();
 
-    if manifest::journal_is_full(journal_length) {
-        manifest::store(&transfer_dir, &record).await.map_err(|e| {
-            storage_failure(
-                state,
-                download,
-                transfer_id,
-                Some(chunk_index),
-                format!("could not compact the chunk journal: {e}"),
-            )
-        })?;
+    if let Err(error) = flushed {
+        let handle = state.manifest_handle(transfer_id).await;
+
+        handle.lock().await.forget(file_id, chunk_index);
+
+        return Err(storage_failure(
+            state,
+            download,
+            transfer_id,
+            Some(chunk_index),
+            format!("could not journal the chunk: {error}"),
+        ));
     }
 
-    drop(record);
+    /*
+     * No compaction here: the journal *is* the durable record during the
+     * transfer, and `finish` folds it into the manifest once when the transfer
+     * ends. Rewriting the manifest per chunk meant an fsync of a document that
+     * grows linearly with the transfer, under the transfer lock, which is what
+     * every other chunk queued behind.
+     */
 
     // Progress moves only after the chunk is written and recorded — the same
     // rule as everything above, one level up: the counters describe bytes the
@@ -356,6 +545,8 @@ pub(crate) async fn accept(
         progress: progress::make_download(download),
     });
 
+    write_network_report(state, download, TransferStatus::Downloading, false).await;
+
     tracing::debug!(
         transfer_id,
         chunk = chunk_index,
@@ -363,7 +554,7 @@ pub(crate) async fn accept(
         lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
         hash_ms = hash.as_secs_f64() * 1000.0,
         part_write_ms = part_write.as_secs_f64() * 1000.0,
-        journal_ms = journal.as_secs_f64() * 1000.0,
+        journal_ms = journal_wait.as_secs_f64() * 1000.0,
         total_ms = accepted_for.as_secs_f64() * 1000.0,
         "chunk persisted"
     );
@@ -375,7 +566,15 @@ pub(crate) async fn accept(
         "chunk saved"
     );
 
-    Ok(Accepted::Stored)
+    Ok((
+        Accepted::Stored,
+        SinkTimings {
+            lock_wait,
+            part_write,
+            journal: journal_wait,
+            accepted_for,
+        },
+    ))
 }
 
 /// Assemble the file once every chunk of it is recorded.
@@ -412,6 +611,12 @@ pub(crate) async fn finish(
     let transfer_dir = state.transfer_dir(transfer_id);
     let parts = transfer_dir.join(file_id);
 
+    /*
+     * A file received at its offsets is verified and published as ranges of one
+     * assembly file; anything else is the `.part` layout.
+     */
+    let assembly = manifest::assembly_path(&parts);
+
     let handle = state.manifest_handle(transfer_id).await;
 
     /*
@@ -419,9 +624,15 @@ pub(crate) async fn finish(
      * the merge. It is this transfer's lock, not the map's: another transfer's
      * completion — or its chunk writes — never waits on this.
      */
-    let mut record = handle.lock().await;
+    let record = handle.lock().await;
 
-    if !manifest::all_chunks_recorded(&record, file_id, total_chunks) {
+    let direct = record.file_uses_assembly(file_id);
+
+    let lookup_started = std::time::Instant::now();
+    let all_recorded = manifest::all_chunks_recorded(&record, file_id, total_chunks);
+    state.record_manifest_lookup(transfer_id, lookup_started.elapsed());
+
+    if !all_recorded {
         return Ok(Completion::Incomplete);
     }
 
@@ -432,25 +643,62 @@ pub(crate) async fn finish(
      * publish one that does not match, and `discard_untrusted` — reached on
      * that mismatch — is what says which chunks have to be sent again.
      *
-     * The cheap presence check keeps the old behaviour for the one case a
-     * digest cannot express: a `.part` that is *gone*. Merging an absent chunk
-     * is an I/O error, whereas the full check prunes it and answers `409` so
-     * the sender resends it. That is rare, so it is allowed to pay for the
-     * full pass; the ordinary completion is not.
+     * The verification reads disk, so it runs with the manifest lock released:
+     * the transfer lock (held above) is what serialises publication, and chunk
+     * writers only need the manifest mutex for their own one-entry update.
      */
+    let speaks_for_file = sender_speaks_for_the_whole_file(&record, file_id, total_chunks);
+
+    let expected_file = record
+        .expected
+        .as_ref()
+        .and_then(|expected| expected.file(file_id))
+        .cloned();
+
+    drop(record);
+
     let verification_started = std::time::Instant::now();
 
-    let verified_in_full = !(sender_speaks_for_the_whole_file(&record, file_id, total_chunks)
-        && all_parts_present(&parts, total_chunks).await);
+    let everything_on_disk = if direct {
+        /*
+         * Without a described size there is nothing to compare the assembly
+         * against, so the per-chunk check below is always run.
+         */
+        match expected_file.as_ref() {
+            Some(expected) => manifest::assembly_covers(&assembly, expected.size).await,
+            None => false,
+        }
+    } else {
+        all_parts_present(&parts, total_chunks).await
+    };
+
+    let verified_in_full = !(speaks_for_file && everything_on_disk);
 
     let verification = if verified_in_full {
-        manifest::verify_and_prune(&mut record, &parts, file_id, total_chunks).await
+        let entries = {
+            let record = handle.lock().await;
+
+            record.file_entries(file_id, total_chunks)
+        };
+
+        if direct {
+            manifest::verify_entries_direct(&assembly, total_chunks, &entries).await
+        } else {
+            manifest::verify_entries(&parts, file_id, total_chunks, &entries).await
+        }
     } else {
         manifest::Verification {
             complete: true,
             pruned: false,
+            prune: Vec::new(),
         }
     };
+
+    let mut record = handle.lock().await;
+
+    if verification.pruned {
+        manifest::apply_prune(&mut record, file_id, &verification.prune);
+    }
 
     {
         let mut phases = download.phases.lock().expect("phases lock poisoned");
@@ -473,15 +721,18 @@ pub(crate) async fn finish(
          * from the manifest. Persist that, or a restart would reload the old
          * entries and skip bytes we know are wrong.
          */
-        manifest::store(&transfer_dir, &record).await.map_err(|e| {
-            storage_failure(
-                state,
-                download,
-                transfer_id,
-                None,
-                format!("could not write the pruned manifest: {e}"),
-            )
-        })?;
+        state
+            .store_manifest(transfer_id, &transfer_dir, &record, true)
+            .await
+            .map_err(|e| {
+                storage_failure(
+                    state,
+                    download,
+                    transfer_id,
+                    None,
+                    format!("could not write the pruned manifest: {e}"),
+                )
+            })?;
 
         let lost = (0..total_chunks)
             .filter(|index| record.entry(file_id, *index).is_none())
@@ -557,7 +808,7 @@ pub(crate) async fn finish(
              * while a transfer was one file, made every later file's chunks be
              * answered as already delivered and never written.
              */
-            record.chunks.retain(|entry| entry.file_id != file_id);
+            record.remove_file(file_id);
 
             let transfer_complete = record.chunks.is_empty()
                 && download.received_bytes.load(Ordering::Relaxed) >= download.total_bytes;
@@ -571,8 +822,37 @@ pub(crate) async fn finish(
             download.report.file_completed(file_id);
 
             if transfer_complete {
+                /*
+                 * The journal was this transfer's durable record all along;
+                 * fold it into the manifest once, now that no chunk needs it.
+                 * The transfer lock is released first: this fsync is not on any
+                 * chunk's path and must never be something the next chunk waits
+                 * behind.
+                 *
+                 * The manifest's own lock (`record`) stays held across the
+                 * write, as `manifest::store` requires.
+                 */
+                drop(_held);
+
+                if let Err(error) = state
+                    .store_manifest(transfer_id, &transfer_dir, &record, false)
+                    .await
+                {
+                    tracing::warn!(
+                        transfer_id,
+                        %error,
+                        "could not write the final manifest; a restart will replay the journal"
+                    );
+                }
+
                 *download.status.lock().expect("download status poisoned") =
                     TransferStatus::Completed;
+
+                download.report.set_manifest_totals(
+                    record.chunk_count(),
+                    record.memory_estimate(),
+                    state.manifest_lookup_summary(transfer_id),
+                );
 
                 finalize_download(state, download, TransferStatus::Completed, None, None, None)
                     .await;
@@ -638,6 +918,20 @@ pub(crate) async fn finish(
          * written down, so a resume asks for exactly those.
          */
         Ok(Assembly::Rejected { chunks }) => {
+            /*
+             * `assemble_and_publish` wrote the pruned manifest. Its duration is
+             * inside `assemble_and_publish`, so only the count is attributed
+             * here.
+             *
+             * shortcut: the rejected-assembly store's duration is not in
+             * recv_compaction_total_seconds, only its count; upgrade if that
+             * path ever becomes common.
+             */
+            state
+                .compaction_stats(transfer_id)
+                .count
+                .fetch_add(1, Ordering::Relaxed);
+
             tracing::error!(
                 transfer_id,
                 file_id,
@@ -801,6 +1095,56 @@ pub(crate) fn is_contained(relative_path: &str) -> bool {
     }) && !relative_path.is_empty()
 }
 
+/// Keep the receiver's network report current.
+///
+/// Throttled to [`network_report::NETWORK_REPORT_INTERVAL`] on the chunk path —
+/// a write per chunk would cost more than the report is worth — and forced on
+/// the first and final write so the file always has a start and an end.
+pub(crate) async fn write_network_report(
+    state: &ReceiverState,
+    download: &DownloadState,
+    status: TransferStatus,
+    force: bool,
+) {
+    {
+        let mut last = download
+            .network_written
+            .lock()
+            .expect("network report lock poisoned");
+
+        if !force && last.elapsed() < network_report::NETWORK_REPORT_INTERVAL {
+            return;
+        }
+
+        *last = std::time::Instant::now();
+    }
+
+    let report = {
+        let mut report = download
+            .network_report
+            .lock()
+            .expect("network report lock poisoned");
+
+        report.update(
+            crate::transfer::report::status_name(status),
+            download.received_bytes.load(Ordering::Relaxed),
+            download.total_bytes,
+            download.received_chunks.load(Ordering::Relaxed),
+            0,
+        );
+
+        report.clone()
+    };
+
+    if let Err(error) = network_report::write(&state.root.join("reports"), &report).await {
+        tracing::warn!(
+            transfer_id = %download.transfer_id,
+            %error,
+            "could not write the network report"
+        );
+    }
+}
+
 /// Write the receiver's report for this transfer, once.
 ///
 /// The receiver has no transfer-wide file plan — each file arrives on its own —
@@ -813,6 +1157,22 @@ pub(crate) async fn finalize_download(
     failure_reason: Option<String>,
     cancellation_reason: Option<String>,
 ) {
+    write_network_report(state, download, status.clone(), true).await;
+
+    /*
+     * The receiver's own compaction cost, for its report. The sender gets the
+     * same numbers on the chunk headers instead.
+     */
+    {
+        let stats = state.compaction_stats(&download.transfer_id);
+
+        download.report.set_compaction_totals(
+            stats.count.load(Ordering::Relaxed),
+            stats.total_ns.load(Ordering::Relaxed),
+            stats.under_lock_ns.load(Ordering::Relaxed),
+        );
+    }
+
     let finish = crate::transfer::report::Finish {
         transfer_id: download.transfer_id.clone(),
         status,
@@ -944,8 +1304,8 @@ mod tests {
 
         for (file_id, bytes) in [("f-1", b"first".as_slice()), ("f-2", b"secnd")] {
             assert!(matches!(
-                accept(&state, &download, "t-multi", file_id, 0, bytes.to_vec()).await,
-                Ok(Accepted::Stored)
+                accept(&state, &download, "t-multi", file_id, 0, 1, bytes.to_vec()).await,
+                Ok((Accepted::Stored, _))
             ));
         }
 
@@ -967,6 +1327,120 @@ mod tests {
         );
         assert!(downloads.join("nested/first.bin").exists());
         assert!(downloads.join("nested/second.bin").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file is written at its offsets as its chunks arrive, and the assembly
+    /// file is published directly — no `.part` files and no second copy. The
+    /// sender here describes no digests, exactly as the shipped one does.
+    #[tokio::test]
+    async fn chunks_written_at_their_offsets_publish_without_a_second_copy() {
+        let root = unique_root("sink-direct");
+        let downloads = root.join("downloads");
+
+        let state = ReceiverState::new(
+            std::sync::Arc::new(TestHostWithDownloads(downloads.clone())),
+            std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
+            root.clone(),
+        );
+
+        let download = DownloadState {
+            total_bytes: 10,
+            ..download("t-direct")
+        };
+
+        let chunks: [(u64, &[u8]); 3] = [(0, b"abcd"), (1, b"efgh"), (2, b"ij")];
+
+        // The tail arrives after one middle chunk, so the chunk size is known
+        // by the time it is placed.
+        for (index, bytes) in [chunks[1], chunks[2], chunks[0]] {
+            assert!(matches!(
+                accept(
+                    &state,
+                    &download,
+                    "t-direct",
+                    "f-1",
+                    index,
+                    3,
+                    bytes.to_vec()
+                )
+                .await,
+                Ok((Accepted::Stored, _))
+            ));
+        }
+
+        let parts = state.transfer_dir("t-direct").join("f-1");
+
+        assert!(manifest::assembly_path(&parts).exists());
+        assert!(
+            !manifest::part_path(&parts, 0).exists(),
+            "the direct layout writes no parts"
+        );
+
+        let completion = finish(&state, &download, "t-direct", "f-1", 3, "a.bin").await;
+
+        assert!(matches!(completion, Ok(Completion::Published)));
+        assert_eq!(
+            std::fs::read(downloads.join("a.bin")).expect("published"),
+            b"abcdefghij"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file whose tail is the very first chunk it sees has no chunk size to be
+    /// placed by, so it keeps the `.part` layout and is merged at completion —
+    /// still delivered, still correct.
+    #[tokio::test]
+    async fn a_tail_arriving_first_falls_back_to_parts_and_still_publishes() {
+        let root = unique_root("sink-tail-first");
+        let downloads = root.join("downloads");
+
+        let state = ReceiverState::new(
+            std::sync::Arc::new(TestHostWithDownloads(downloads.clone())),
+            std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
+            root.clone(),
+        );
+
+        let download = DownloadState {
+            total_bytes: 10,
+            ..download("t-tail-first")
+        };
+
+        let chunks: [(u64, &[u8]); 3] = [(0, b"abcd"), (1, b"efgh"), (2, b"ij")];
+
+        for (index, bytes) in [chunks[2], chunks[0], chunks[1]] {
+            assert!(matches!(
+                accept(
+                    &state,
+                    &download,
+                    "t-tail-first",
+                    "f-1",
+                    index,
+                    3,
+                    bytes.to_vec()
+                )
+                .await,
+                Ok((Accepted::Stored, _))
+            ));
+        }
+
+        let parts = state.transfer_dir("t-tail-first").join("f-1");
+
+        assert!(
+            !manifest::assembly_path(&parts).exists(),
+            "no assembly file for a file that had to keep parts"
+        );
+        assert!(manifest::part_path(&parts, 0).exists());
+
+        let completion = finish(&state, &download, "t-tail-first", "f-1", 3, "a.bin").await;
+
+        assert!(matches!(completion, Ok(Completion::Published)));
+        assert_eq!(
+            std::fs::read(downloads.join("a.bin")).expect("published"),
+            b"abcdefghij"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1005,7 +1479,128 @@ mod tests {
                 crate::transfer::report::Role::Receiver,
             ),
             phases: std::sync::Mutex::new(crate::transfer::report::PhaseTimings::default()),
+            network_report: std::sync::Mutex::new(crate::transfer::network_report::NetworkReport::new(
+                crate::transfer::report::Role::Receiver,
+                transfer_id,
+                Vec::new(),
+                None,
+            )),
+            network_written: std::sync::Mutex::new(std::time::Instant::now()),
         }
+    }
+
+    /// An acknowledged chunk survives a process restart: what a fresh
+    /// `ReceiverState` reads back comes from the journal on disk, not memory.
+    ///
+    /// This is the batching invariant stated as a test. `accept` is not allowed
+    /// to return until its entry is fsynced, so even the chunk whose batch was
+    /// smallest must be in the journal by the time it is acknowledged.
+    #[tokio::test]
+    async fn an_acknowledged_chunk_is_durable_across_a_restart() {
+        let root = unique_root("sink-durable");
+
+        let state = ReceiverState::new(
+            std::sync::Arc::new(TestHost),
+            std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
+            root.clone(),
+        );
+
+        let transfer = download("t-durable");
+
+        // Two chunks of one size, the way the sender plans them.
+        for (index, bytes) in [(0u64, b"first".as_slice()), (1, b"forth")] {
+            assert!(matches!(
+                accept(
+                    &state,
+                    &transfer,
+                    "t-durable",
+                    "f-1",
+                    index,
+                    2,
+                    bytes.to_vec()
+                )
+                .await,
+                Ok((Accepted::Stored, _))
+            ));
+        }
+
+        // Chunk traffic is journal-only: no manifest write, so no fsync of a
+        // growing document behind the transfer lock.
+        assert_eq!(
+            state
+                .compaction_stats("t-durable")
+                .count
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        let restarted = ReceiverState::new(
+            std::sync::Arc::new(TestHost),
+            std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
+            root.clone(),
+        );
+
+        let handle = restarted.manifest_handle("t-durable").await;
+
+        {
+            let record = handle.lock().await;
+
+            for index in [0u64, 1] {
+                let entry = record
+                    .entry("f-1", index)
+                    .expect("an acknowledged chunk must be in the journal");
+
+                let assembly =
+                    manifest::assembly_path(&restarted.transfer_dir("t-durable").join("f-1"));
+
+                assert!(
+                    manifest::chunk_matches(
+                        &assembly,
+                        entry.offset.expect("a direct chunk records its offset"),
+                        entry,
+                    )
+                    .await
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A duplicate of a chunk that is still being written waits for the first
+    /// attempt and is then answered from the durable record, so exactly one
+    /// part write (and one part fsync) happens for the index.
+    #[tokio::test]
+    async fn a_duplicate_chunk_is_written_once() {
+        let root = unique_root("sink-duplicate");
+
+        let state = ReceiverState::new(
+            std::sync::Arc::new(TestHost),
+            std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
+            root.clone(),
+        );
+
+        let transfer = download("t-dup");
+
+        let (first, second) = tokio::join!(
+            accept(&state, &transfer, "t-dup", "f-1", 0, 1, b"payload".to_vec()),
+            accept(&state, &transfer, "t-dup", "f-1", 0, 1, b"payload".to_vec()),
+        );
+
+        let stored = [&first, &second]
+            .iter()
+            .filter(|result| matches!(result, Ok((Accepted::Stored, _))))
+            .count();
+
+        let present = [&first, &second]
+            .iter()
+            .filter(|result| matches!(result, Ok((Accepted::AlreadyPresent, _))))
+            .count();
+
+        assert_eq!(stored, 1, "one attempt owns the write");
+        assert_eq!(present, 1, "the duplicate is answered from the record");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Two transfers writing at once each reach their own record.
@@ -1035,12 +1630,12 @@ mod tests {
         let second = download("t-b");
 
         let (a, b) = tokio::join!(
-            accept(&state, &first, "t-a", "f-1", 0, b"first".to_vec()),
-            accept(&state, &second, "t-b", "f-1", 0, b"second".to_vec()),
+            accept(&state, &first, "t-a", "f-1", 0, 1, b"first".to_vec()),
+            accept(&state, &second, "t-b", "f-1", 0, 1, b"second".to_vec()),
         );
 
-        assert!(matches!(a, Ok(Accepted::Stored)));
-        assert!(matches!(b, Ok(Accepted::Stored)));
+        assert!(matches!(a, Ok((Accepted::Stored, _))));
+        assert!(matches!(b, Ok((Accepted::Stored, _))));
 
         let a = state.manifest_handle("t-a").await.lock().await.clone();
         let b = state.manifest_handle("t-b").await.lock().await.clone();
@@ -1048,7 +1643,8 @@ mod tests {
         assert_eq!(a.chunks.len(), 1);
         assert_eq!(b.chunks.len(), 1);
         assert_ne!(
-            a.chunks[0].chunk_hash, b.chunks[0].chunk_hash,
+            a.entry("f-1", 0).expect("a recorded").chunk_hash,
+            b.entry("f-1", 0).expect("b recorded").chunk_hash,
             "each transfer recorded its own bytes"
         );
 

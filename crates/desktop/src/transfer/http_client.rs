@@ -135,6 +135,124 @@ impl Default for HttpClient {
 /// it no longer holds.
 pub const MISSING_CHUNKS_HEADER: &str = "vilsend-missing-chunks";
 
+/*
+ * Where a receiver's durability step went, on the `200` to that chunk, in
+ * whole milliseconds. Additive response headers: a receiver that predates
+ * them sends none, and the sender records the chunk with no receiver timings
+ * rather than inventing zeros. Header names are lowercase here because
+ * `HeaderName::from_static` requires it; HTTP names are case-insensitive.
+ */
+pub const LOCK_WAIT_MS_HEADER: &str = "x-vilsend-lockwait-ms";
+pub const PART_WRITE_MS_HEADER: &str = "x-vilsend-partwrite-ms";
+pub const JOURNAL_MS_HEADER: &str = "x-vilsend-journal-ms";
+pub const ACCEPT_MS_HEADER: &str = "x-vilsend-accept-ms";
+
+/*
+ * The receiver's live counters, on the same `200`, for the sender's
+ * `timeseries`. Every one is optional: an installed receiver sends none, and
+ * the sender then samples only its own side.
+ */
+pub const INFLIGHT_HEADER: &str = "x-vilsend-inflight";
+pub const JOURNAL_PENDING_HEADER: &str = "x-vilsend-journalpending";
+pub const PART_FILES_HEADER: &str = "x-vilsend-partfiles";
+pub const INCOMING_BYTES_HEADER: &str = "x-vilsend-incomingbytes";
+pub const COMPACTIONS_HEADER: &str = "x-vilsend-compactions";
+pub const RECV_RSS_HEADER: &str = "x-vilsend-recv-rss";
+/// Cumulative journal flushes and journaled entries. Additive: an older
+/// receiver sends neither and the sender reports what it can.
+pub const JOURNAL_FLUSHES_HEADER: &str = "x-vilsend-journalflushes";
+pub const JOURNAL_ENTRIES_HEADER: &str = "x-vilsend-journalentries";
+/// Cumulative time the receiver spent writing its manifest, and the part of it
+/// spent holding the transfer lock.
+pub const COMPACTION_MS_HEADER: &str = "x-vilsend-compaction-ms";
+pub const COMPACTION_UNDER_LOCK_MS_HEADER: &str = "x-vilsend-compaction-underlock-ms";
+/// The receiver's in-memory manifest: size, lookup percentiles, memory.
+pub const MANIFEST_CHUNKS_HEADER: &str = "x-vilsend-manifestchunks";
+pub const MANIFEST_LOOKUP_P50_US_HEADER: &str = "x-vilsend-manifestlookup-p50us";
+pub const MANIFEST_LOOKUP_P95_US_HEADER: &str = "x-vilsend-manifestlookup-p95us";
+pub const MANIFEST_MEMORY_HEADER: &str = "x-vilsend-manifestmemory";
+
+/// The durability timings a receiver reported for one chunk.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReceiverTimings {
+    pub lock_wait: std::time::Duration,
+    pub part_write: std::time::Duration,
+    pub journal: std::time::Duration,
+    pub accept: std::time::Duration,
+    /// Whether the receiver sent any of the four timing headers. `false` is an
+    /// installed receiver, and the chunk must not count towards coverage.
+    pub present: bool,
+    /// Live receiver counters for the sender's timeseries. Each is `None` when
+    /// that header was absent, which is what an older receiver sends.
+    pub inflight: Option<u32>,
+    pub journal_pending: Option<u32>,
+    pub part_files: Option<u32>,
+    pub incoming_bytes: Option<u64>,
+    /// Cumulative; the sender reports the window delta.
+    pub compactions: Option<u64>,
+    pub recv_rss: Option<u64>,
+    /// Cumulative journal flushes and journaled entries.
+    pub journal_flushes: Option<u64>,
+    pub journal_entries: Option<u64>,
+    /// Cumulative manifest-write milliseconds, total and under the lock.
+    pub compaction_ms: Option<u64>,
+    pub compaction_under_lock_ms: Option<u64>,
+    /// The receiver's in-memory manifest at this acknowledgement.
+    pub manifest_chunks: Option<u32>,
+    pub manifest_lookup_p50_us: Option<u64>,
+    pub manifest_lookup_p95_us: Option<u64>,
+    pub manifest_memory_bytes: Option<u64>,
+}
+
+impl ReceiverTimings {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let millis = |name: &str| -> Option<u64> {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse().ok())
+        };
+
+        let number = |name: &str| -> Option<u64> {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse().ok())
+        };
+
+        let lock_wait = millis(LOCK_WAIT_MS_HEADER);
+        let part_write = millis(PART_WRITE_MS_HEADER);
+        let journal = millis(JOURNAL_MS_HEADER);
+        let accept = millis(ACCEPT_MS_HEADER);
+
+        Self {
+            lock_wait: std::time::Duration::from_millis(lock_wait.unwrap_or(0)),
+            part_write: std::time::Duration::from_millis(part_write.unwrap_or(0)),
+            journal: std::time::Duration::from_millis(journal.unwrap_or(0)),
+            accept: std::time::Duration::from_millis(accept.unwrap_or(0)),
+            present: [lock_wait, part_write, journal, accept]
+                .iter()
+                .any(Option::is_some),
+            inflight: number(INFLIGHT_HEADER).and_then(|value| u32::try_from(value).ok()),
+            journal_pending: number(JOURNAL_PENDING_HEADER)
+                .and_then(|value| u32::try_from(value).ok()),
+            part_files: number(PART_FILES_HEADER).and_then(|value| u32::try_from(value).ok()),
+            incoming_bytes: number(INCOMING_BYTES_HEADER),
+            compactions: number(COMPACTIONS_HEADER),
+            recv_rss: number(RECV_RSS_HEADER),
+            journal_flushes: number(JOURNAL_FLUSHES_HEADER),
+            journal_entries: number(JOURNAL_ENTRIES_HEADER),
+            compaction_ms: number(COMPACTION_MS_HEADER),
+            compaction_under_lock_ms: number(COMPACTION_UNDER_LOCK_MS_HEADER),
+            manifest_chunks: number(MANIFEST_CHUNKS_HEADER)
+                .and_then(|value| u32::try_from(value).ok()),
+            manifest_lookup_p50_us: number(MANIFEST_LOOKUP_P50_US_HEADER),
+            manifest_lookup_p95_us: number(MANIFEST_LOOKUP_P95_US_HEADER),
+            manifest_memory_bytes: number(MANIFEST_MEMORY_HEADER),
+        }
+    }
+}
+
 impl HttpClient {
     /// One client per session, shared by every chunk.
     ///
@@ -344,7 +462,7 @@ impl HttpClient {
         body: Vec<u8>,
         nonce: Vec<u8>,
         encoding: ChunkEncoding,
-    ) -> Result<()> {
+    ) -> Result<ReceiverTimings> {
         let base = Self::normalize_endpoint(endpoint);
         let url = format!("{base}/transfer/chunk");
 
@@ -413,7 +531,7 @@ impl HttpClient {
                 "chunk accepted by receiver"
             );
 
-            return Ok(());
+            return Ok(ReceiverTimings::from_headers(response.headers()));
         }
 
         let error_body = response

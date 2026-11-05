@@ -1,8 +1,9 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { ShieldCheck } from "lucide-react";
+import { LogOut, ShieldCheck } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ExternalLink } from "@/components/ui/external-link";
@@ -35,6 +36,7 @@ import {
   startTauriWebSocket,
 } from "@/api/tauri";
 import { useCurrentUserProfile } from "../auth/auth-hooks";
+import { useAuth } from "@/contexts/auth-context";
 
 const initialForm: OnboardingFormState = {
   organizationType: null,
@@ -51,6 +53,16 @@ export function OnboardingPage() {
   const navigate = useNavigate();
   const { data: profile, isLoading } = useCurrentUserProfile();
   const mutation = useCompleteOnboarding();
+  const { logout } = useAuth();
+
+  const handleSignOut = async () => {
+    try {
+      await logout();
+      navigate("/sign-in", { replace: true });
+    } catch {
+      toast.error("Could not sign out. Please try again.");
+    }
+  };
 
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<OnboardingFormState>(initialForm);
@@ -221,6 +233,16 @@ export function OnboardingPage() {
     ][step] ?? "";
 
   return (
+    <>
+      {/* Debug-only escape hatch: leaves onboarding without completing it. */}
+      {import.meta.env.DEV && (
+        <div className="fixed right-4 top-4 z-50">
+          <Button variant="outline" size="sm" onClick={() => void handleSignOut()}>
+            <LogOut className="h-4 w-4" />
+            Sign out
+          </Button>
+        </div>
+      )}
     <OnboardingLayout
       logo={
         <div className="flex items-center gap-2.5">
@@ -361,5 +383,6 @@ export function OnboardingPage() {
         </CardContent>
       </Card>
     </OnboardingLayout>
+    </>
   );
 }

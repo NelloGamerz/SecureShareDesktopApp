@@ -88,6 +88,12 @@ mod tests {
             plan_stamps: Mutex::new(std::collections::HashMap::new()),
             report: crate::transfer::report::Telemetry::new(crate::transfer::report::Role::Sender),
             phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
+            network_report: Mutex::new(crate::transfer::network_report::NetworkReport::new(
+                crate::transfer::report::Role::Sender,
+                "t-1",
+                Vec::new(),
+                None,
+            )),
         }
     }
 

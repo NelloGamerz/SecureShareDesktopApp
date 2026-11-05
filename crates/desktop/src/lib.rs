@@ -137,6 +137,8 @@ pub fn run() {
         .plugin(tauri_plugin_secure_storage::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            utils::crypto_backend::log_aes_backend();
+
             // tracing::info!("Executable: {:?}", app.path().executable()?);
             /*
              * Application config

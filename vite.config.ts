@@ -32,7 +32,7 @@ export default defineConfig({
   build: {
     // Tauri desktop webview prefers smaller bundles and relative asset paths.
     target: 'es2021',
-    sourcemap: !!process.env.TAURI_DEBUG,
+    sourcemap: process.env.TAURI_ENV_DEBUG === 'true',
   },
   optimizeDeps: {
     exclude: ['lucide-react'],

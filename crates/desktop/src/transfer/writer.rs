@@ -8,7 +8,7 @@ use crate::{
         errors::{Result as TransferResult, TransferError},
         http_client::StartTransferRequest,
         integrity::ExpectedTransfer,
-        manifest, merger,
+        manifest, merger, network_report,
         state::DownloadState,
     },
 };
@@ -31,7 +31,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64},
+        atomic::{AtomicBool, AtomicU32, AtomicU64},
         Arc, Mutex,
     },
     time::{Duration, SystemTime},
@@ -194,7 +194,53 @@ pub struct ReceiverState {
     /// the sender's retries are being encrypted with — so the retry fails either
     /// way, and the resume that follows asks again.
     pub refused: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// One journal batcher per transfer. Created on the first chunk and stopped
+    /// when the transfer is forgotten; it batches journal fsyncs across chunks.
+    pub journals: Arc<tokio::sync::Mutex<HashMap<String, Arc<manifest::JournalWriter>>>>,
+    /// Chunk writes in progress, so a duplicate of the same chunk waits for the
+    /// one already writing it instead of writing and fsyncing it twice.
+    ///
+    /// Keyed by (transfer, file, index); the value is the waiters a completed
+    /// attempt resolves, `Ok` for durable and `Err` for "you may try again".
+    pub in_flight: Arc<tokio::sync::Mutex<InFlightMap>>,
+    /// Requests currently inside `receive`, and manifest compactions done, per
+    /// transfer. Reported on the chunk `200` for the sender's timeseries.
+    recv_inflight: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicU32>>>>,
+    compactions: Arc<std::sync::Mutex<HashMap<String, Arc<CompactionStats>>>>,
+    /// How long this transfer's manifest lookups/inserts took, for the headers.
+    manifest_stats: Arc<std::sync::Mutex<HashMap<String, Arc<ManifestStats>>>>,
 }
+
+/// Per-transfer manifest lookup timings.
+pub(crate) struct ManifestStats {
+    pub lookups: std::sync::Mutex<crate::transfer::report::LatencyHistogram>,
+}
+
+/// What one transfer spent writing its manifest, for the report and headers.
+#[derive(Default)]
+pub(crate) struct CompactionStats {
+    pub count: AtomicU64,
+    /// Wall time in `manifest::store`, nanoseconds.
+    pub total_ns: AtomicU64,
+    /// The part of `total_ns` spent while the transfer lock was held.
+    pub under_lock_ns: AtomicU64,
+}
+
+/// Decrements a transfer's in-flight request count when a request ends.
+struct InflightGuard(Arc<AtomicU32>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// One chunk's identity within a receiver: transfer, file, index.
+pub(crate) type ChunkKey = (String, String, u64);
+
+type ChunkWaiters = Vec<tokio::sync::oneshot::Sender<Result<(), String>>>;
+
+type InFlightMap = HashMap<ChunkKey, ChunkWaiters>;
 
 impl ReceiverState {
     pub fn new(host: Arc<dyn ReceiverHost>, events: Arc<dyn EventSink>, root: PathBuf) -> Self {
@@ -207,6 +253,180 @@ impl ReceiverState {
             downloads: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             manifests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             refused: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            journals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            in_flight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            recv_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            compactions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            manifest_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The counter of requests currently inside `receive` for this transfer.
+    pub(crate) fn chunk_inflight_counter(&self, transfer_id: &str) -> Arc<AtomicU32> {
+        let mut counters = self
+            .recv_inflight
+            .lock()
+            .expect("receiver in-flight map poisoned");
+
+        Arc::clone(
+            counters
+                .entry(transfer_id.to_owned())
+                .or_insert_with(|| Arc::new(AtomicU32::new(0))),
+        )
+    }
+
+    /// This transfer's per-lookup timings.
+    pub(crate) fn manifest_stats(&self, transfer_id: &str) -> Arc<ManifestStats> {
+        let mut counters = self
+            .manifest_stats
+            .lock()
+            .expect("receiver manifest-stats map poisoned");
+
+        Arc::clone(
+            counters
+                .entry(transfer_id.to_owned())
+                .or_insert_with(|| {
+                    Arc::new(ManifestStats {
+                        lookups: std::sync::Mutex::new(
+                            crate::transfer::report::LatencyHistogram::default(),
+                        ),
+                    })
+                }),
+        )
+    }
+
+    /// Time one manifest lookup or insert. The histogram is per transfer.
+    pub(crate) fn record_manifest_lookup(
+        &self,
+        transfer_id: &str,
+        elapsed: std::time::Duration,
+    ) {
+        self.manifest_stats(transfer_id)
+            .lookups
+            .lock()
+            .expect("manifest lookup histogram poisoned")
+            .record(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+    }
+
+    pub(crate) fn manifest_lookup_summary(
+        &self,
+        transfer_id: &str,
+    ) -> crate::transfer::report::LatencySummary {
+        self.manifest_stats(transfer_id)
+            .lookups
+            .lock()
+            .expect("manifest lookup histogram poisoned")
+            .summary()
+    }
+
+    /// This transfer's cumulative manifest-write counters.
+    pub(crate) fn compaction_stats(&self, transfer_id: &str) -> Arc<CompactionStats> {
+        let mut counters = self
+            .compactions
+            .lock()
+            .expect("receiver compaction map poisoned");
+
+        Arc::clone(
+            counters
+                .entry(transfer_id.to_owned())
+                .or_insert_with(|| Arc::new(CompactionStats::default())),
+        )
+    }
+
+    /// Write the manifest, attributing its cost to this transfer.
+    ///
+    /// `under_transfer_lock` is the caller's statement about the lock it holds;
+    /// the figures are what `recv_compaction_under_lock_ms` reports.
+    pub(crate) async fn store_manifest(
+        &self,
+        transfer_id: &str,
+        transfer_dir: &Path,
+        manifest: &manifest::Manifest,
+        under_transfer_lock: bool,
+    ) -> std::io::Result<()> {
+        let stats = self.compaction_stats(transfer_id);
+        let started = std::time::Instant::now();
+
+        let result = manifest::store(transfer_dir, manifest).await;
+
+        let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
+        stats.count.fetch_add(1, Ordering::Relaxed);
+        stats.total_ns.fetch_add(nanos, Ordering::Relaxed);
+
+        if under_transfer_lock {
+            stats.under_lock_ns.fetch_add(nanos, Ordering::Relaxed);
+        }
+
+        result
+    }
+
+    /// How many journal entries are buffered for this transfer. Cheap: one
+    /// lock read, no disk.
+    pub(crate) async fn journal_pending(&self, transfer_id: &str) -> u32 {
+        let journal = {
+            self.journals
+                .lock()
+                .await
+                .get(transfer_id)
+                .map(Arc::clone)
+        };
+
+        match journal {
+            Some(journal) => journal.pending_len().await,
+            None => 0,
+        }
+    }
+
+    /// This transfer's journal batcher, started on first use.
+    pub(crate) async fn journal_for(
+        &self,
+        transfer_id: &str,
+        report: Arc<crate::transfer::report::Telemetry>,
+    ) -> Arc<manifest::JournalWriter> {
+        let mut journals = self.journals.lock().await;
+
+        if let Some(writer) = journals.get(transfer_id) {
+            return Arc::clone(writer);
+        }
+
+        let writer = manifest::JournalWriter::start(self.transfer_dir(transfer_id), report);
+
+        journals.insert(transfer_id.to_owned(), Arc::clone(&writer));
+
+        writer
+    }
+
+    /// Claim the right to write one chunk, or subscribe to the attempt already
+    /// writing it. `None` means the caller owns the chunk; `Some` means another
+    /// attempt is in progress and will wake this one when it finishes.
+    pub(crate) async fn reserve_chunk(
+        &self,
+        key: &ChunkKey,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        let mut in_flight = self.in_flight.lock().await;
+
+        if let Some(waiters) = in_flight.get_mut(key) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            waiters.push(tx);
+
+            return Some(rx);
+        }
+
+        in_flight.insert(key.clone(), Vec::new());
+
+        None
+    }
+
+    /// Finish one chunk's write and wake every waiter with the outcome.
+    pub(crate) async fn release_chunk(&self, key: &ChunkKey, outcome: Result<(), String>) {
+        let waiters = self.in_flight.lock().await.remove(key);
+
+        if let Some(waiters) = waiters {
+            for waiter in waiters {
+                let _ = waiter.send(outcome.clone());
+            }
         }
     }
 
@@ -272,6 +492,28 @@ impl ReceiverState {
     /// chunk.
     pub(crate) async fn forget_transfer(&self, transfer_id: &str) {
         self.writers.lock().await.remove(transfer_id);
+
+        // Flush anything still buffered and stop the batcher. At this point the
+        // transfer is delivered or cancelled, so there are no unacknowledged
+        // chunks whose flush is still owed.
+        let journal = { self.journals.lock().await.remove(transfer_id) };
+
+        if let Some(journal) = journal {
+            journal.shutdown().await;
+        }
+
+        self.recv_inflight
+            .lock()
+            .expect("receiver in-flight map poisoned")
+            .remove(transfer_id);
+        self.compactions
+            .lock()
+            .expect("receiver compaction map poisoned")
+            .remove(transfer_id);
+        self.manifest_stats
+            .lock()
+            .expect("receiver manifest-stats map poisoned")
+            .remove(transfer_id);
     }
 
     /// The directory a transfer's parts and manifest live in.
@@ -378,7 +620,15 @@ async fn absorb_expected(
      * Stored under the record's own lock: `store` empties the journal, so it
      * must not interleave with an append from an arriving chunk.
      */
-    if let Err(error) = manifest::store(&state.transfer_dir(transfer_id), &known).await {
+    if let Err(error) = state
+        .store_manifest(
+            transfer_id,
+            &state.transfer_dir(transfer_id),
+            &known,
+            false,
+        )
+        .await
+    {
         tracing::warn!(
             transfer_id,
             %error,
@@ -489,6 +739,13 @@ pub async fn start_transfer(
                 crate::transfer::report::Role::Receiver,
             ),
             phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
+            network_report: Mutex::new(network_report::NetworkReport::new(
+                crate::transfer::report::Role::Receiver,
+                &request.transfer_id,
+                network_report::paths(None, None),
+                None,
+            )),
+            network_written: Mutex::new(std::time::Instant::now()),
         });
 
         state.events.emit(DomainEvent::TransferFailed {
@@ -542,6 +799,13 @@ pub async fn start_transfer(
                 crate::transfer::report::Role::Receiver,
             ),
             phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
+            network_report: Mutex::new(network_report::NetworkReport::new(
+                crate::transfer::report::Role::Receiver,
+                &request.transfer_id,
+                network_report::paths(None, None),
+                None,
+            )),
+            network_written: Mutex::new(std::time::Instant::now()),
         });
 
         state.events.emit(DomainEvent::TransferFailed {
@@ -692,7 +956,10 @@ pub async fn start_transfer(
              */
             let transfer_dir = state.transfer_dir(&request.transfer_id);
 
-            if let Err(error) = manifest::store(&transfer_dir, &known).await {
+            if let Err(error) = state
+                .store_manifest(&request.transfer_id, &transfer_dir, &known, false)
+                .await
+            {
                 tracing::warn!(
                     transfer_id = %request.transfer_id,
                     %error,
@@ -715,6 +982,9 @@ pub async fn start_transfer(
     let (received_bytes, received_chunks) =
         recovered_progress(&recovered, &state.transfer_dir(&request.transfer_id)).await;
 
+    // What this receiver advertised when it accepted, for its network report.
+    let network_manifest = crate::transfer::transport_manifest::probe().await;
+
     let download = Arc::new(DownloadState {
         transfer_id: request.transfer_id.clone(),
 
@@ -734,6 +1004,13 @@ pub async fn start_transfer(
             initialization_seconds: Some(initialization_started.elapsed().as_secs_f64()),
             ..crate::transfer::report::PhaseTimings::default()
         }),
+        network_report: Mutex::new(network_report::NetworkReport::new(
+            crate::transfer::report::Role::Receiver,
+            &request.transfer_id,
+            network_report::paths(Some(&network_manifest), None),
+            None,
+        )),
+        network_written: Mutex::new(std::time::Instant::now()),
     });
 
     /*
@@ -744,6 +1021,8 @@ pub async fn start_transfer(
         .write()
         .await
         .insert(request.transfer_id.clone(), download.clone());
+
+    chunk_sink::write_network_report(&state, &download, TransferStatus::Pending, true).await;
 
     tracing::info!(
         transfer_id = %request.transfer_id,
@@ -818,6 +1097,12 @@ pub async fn receive(
         tracing::warn!(error=?e, "missing Transfer-Id");
         e
     })?;
+
+    // Counted from here to the end of the response, which is what the sender's
+    // `recv_inflight_map_len` reports. Dropped on every return path.
+    let inflight_counter = state.chunk_inflight_counter(&transfer);
+    inflight_counter.fetch_add(1, Ordering::Relaxed);
+    let _inflight = InflightGuard(inflight_counter);
 
     let file = header(&headers, "File-Id").map_err(|e| {
         tracing::warn!(
@@ -1175,8 +1460,21 @@ pub async fn receive(
      * only once its bytes are fsynced, and its manifest entry is written only
      * after them.
      */
-    match chunk_sink::accept(&state, &download, &transfer, &file, index, plaintext).await {
-        Ok(chunk_sink::Accepted::Stored | chunk_sink::Accepted::AlreadyPresent) => {}
+    let sink_timings = match chunk_sink::accept(
+        &state,
+        &download,
+        &transfer,
+        &file,
+        index,
+        total,
+        plaintext,
+    )
+    .await
+    {
+        Ok((
+            chunk_sink::Accepted::Stored | chunk_sink::Accepted::AlreadyPresent,
+            timings,
+        )) => timings,
 
         Err(chunk_sink::SinkError::Cancelled(_)) => {
             return Err((StatusCode::CONFLICT, "transfer cancelled".into()));
@@ -1195,7 +1493,7 @@ pub async fn receive(
 
             return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
         }
-    }
+    };
 
     match chunk_sink::finish(&state, &download, &transfer, &file, total, &relative).await {
         Ok(chunk_sink::Completion::Incomplete | chunk_sink::Completion::Published) => {}
@@ -1272,7 +1570,129 @@ pub async fn receive(
         "chunk processing complete"
     );
 
-    Ok((StatusCode::OK, HeaderMap::new()))
+    /*
+     * Additive response headers: where the durability step went, in whole
+     * milliseconds. An installed sender ignores them; this build's sender
+     * turns them into `chunk_breakdown.recv_*` and says how much of its `http`
+     * time they explain.
+     */
+    let mut response_headers = HeaderMap::new();
+
+    /*
+     * The receiver's live counters, for the sender's `timeseries`. Each is a
+     * counter read or an in-memory value — no disk walk and no new timer — so
+     * the per-chunk cost is a handful of headers.
+     */
+    let (journal_flushes, journal_entries) = download.report.journal_totals();
+
+    let compaction = state.compaction_stats(&transfer);
+
+    /*
+     * The in-memory manifest, as the sender's time series sees it: how many
+     * chunks it holds, what it costs, and how fast a lookup is.
+     */
+    let (manifest_chunks, manifest_memory) = {
+        let handle = state.manifest_handle(&transfer).await;
+        let record = handle.lock().await;
+
+        (record.chunk_count(), record.memory_estimate())
+    };
+
+    let lookups = state.manifest_lookup_summary(&transfer);
+    let microseconds = |millis: Option<f64>| millis.map(|ms| (ms * 1000.0).round() as u64);
+
+    let recv_counters = [
+        (
+            crate::transfer::http_client::MANIFEST_CHUNKS_HEADER,
+            manifest_chunks.to_string(),
+        ),
+        (
+            crate::transfer::http_client::MANIFEST_LOOKUP_P50_US_HEADER,
+            microseconds(lookups.p50_ms).unwrap_or(0).to_string(),
+        ),
+        (
+            crate::transfer::http_client::MANIFEST_LOOKUP_P95_US_HEADER,
+            microseconds(lookups.p95_ms).unwrap_or(0).to_string(),
+        ),
+        (
+            crate::transfer::http_client::MANIFEST_MEMORY_HEADER,
+            manifest_memory.to_string(),
+        ),
+        (
+            crate::transfer::http_client::COMPACTION_MS_HEADER,
+            (compaction.total_ns.load(Ordering::Relaxed) / 1_000_000).to_string(),
+        ),
+        (
+            crate::transfer::http_client::COMPACTION_UNDER_LOCK_MS_HEADER,
+            (compaction.under_lock_ns.load(Ordering::Relaxed) / 1_000_000).to_string(),
+        ),
+        (
+            crate::transfer::http_client::JOURNAL_FLUSHES_HEADER,
+            journal_flushes.to_string(),
+        ),
+        (
+            crate::transfer::http_client::JOURNAL_ENTRIES_HEADER,
+            journal_entries.to_string(),
+        ),
+        (
+            crate::transfer::http_client::INFLIGHT_HEADER,
+            state
+                .chunk_inflight_counter(&transfer)
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            crate::transfer::http_client::JOURNAL_PENDING_HEADER,
+            state.journal_pending(&transfer).await.to_string(),
+        ),
+        (
+            crate::transfer::http_client::PART_FILES_HEADER,
+            u32::try_from(download.received_chunks.load(Ordering::Relaxed))
+                .unwrap_or(u32::MAX)
+                .to_string(),
+        ),
+        (
+            crate::transfer::http_client::INCOMING_BYTES_HEADER,
+            download.received_bytes.load(Ordering::Relaxed).to_string(),
+        ),
+        (
+            crate::transfer::http_client::COMPACTIONS_HEADER,
+            compaction.count.load(Ordering::Relaxed).to_string(),
+        ),
+    ];
+
+    for (name, value) in recv_counters {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            response_headers.insert(HeaderName::from_static(name), value);
+        }
+    }
+
+    for (name, elapsed) in [
+        (
+            crate::transfer::http_client::LOCK_WAIT_MS_HEADER,
+            sink_timings.lock_wait,
+        ),
+        (
+            crate::transfer::http_client::PART_WRITE_MS_HEADER,
+            sink_timings.part_write,
+        ),
+        (
+            crate::transfer::http_client::JOURNAL_MS_HEADER,
+            sink_timings.journal,
+        ),
+        (
+            crate::transfer::http_client::ACCEPT_MS_HEADER,
+            sink_timings.accepted_for,
+        ),
+    ] {
+        let millis = elapsed.as_millis().min(u32::MAX as u128);
+
+        if let Ok(value) = HeaderValue::from_str(&millis.to_string()) {
+            response_headers.insert(HeaderName::from_static(name), value);
+        }
+    }
+
+    Ok((StatusCode::OK, response_headers))
 }
 
 pub async fn get_public_key(
@@ -1378,6 +1798,7 @@ pub async fn assemble_and_publish(
     destination: &Path,
 ) -> TransferResult<Assembly> {
     let parts = transfer_dir.join(file_id);
+    let assembly = manifest::assembly_path(&parts);
 
     let expected = record
         .expected
@@ -1387,7 +1808,20 @@ pub async fn assemble_and_publish(
 
     let digest = expected.as_ref().map(|file| file.sha256.as_str());
 
-    match merger::merge(&parts, destination, total, digest).await {
+    /*
+     * A file received at its offsets has no parts to assemble: the assembly file
+     * is the output, and publishing it is only the whole-file check and the move.
+     * Everything else still concatenates its `.part` files.
+     */
+    let direct = record.file_uses_assembly(file_id);
+
+    let merged = if direct {
+        merger::publish(&assembly, destination, digest).await
+    } else {
+        merger::merge(&parts, destination, total, digest).await
+    };
+
+    match merged {
         Ok(()) => Ok(Assembly::Published),
 
         Err(TransferError::IntegrityMismatch {
@@ -1402,9 +1836,18 @@ pub async fn assemble_and_publish(
                 "the assembled file is not the one the sender described"
             );
 
-            let chunks =
-                manifest::discard_untrusted(record, &parts, file_id, total, expected.as_ref())
-                    .await;
+            let chunks = if direct {
+                manifest::discard_untrusted_direct(
+                    record,
+                    &assembly,
+                    file_id,
+                    total,
+                    expected.as_ref(),
+                )
+                .await
+            } else {
+                manifest::discard_untrusted(record, &parts, file_id, total, expected.as_ref()).await
+            };
 
             manifest::store(transfer_dir, record)
                 .await
@@ -1706,6 +2149,12 @@ pub async fn run_cleanup(state: ReceiverState, ttl: Duration, interval: Duration
 
         if !removed.is_empty() {
             tracing::info!(transfers = ?removed, "removed transfers nobody came back for");
+
+            // Stop their journal batchers too, or every swept transfer would
+            // leave a task behind for the life of the process.
+            for id in &removed {
+                state.forget_transfer(id).await;
+            }
         }
 
         tokio::time::sleep(interval).await;
@@ -1786,6 +2235,7 @@ mod tests {
                 chunk_index: *index,
                 chunk_length: bytes.len() as u64,
                 chunk_hash: manifest::sha256_hex(bytes),
+                offset: None,
                 written_nanos: None,
             });
         }
@@ -1900,6 +2350,7 @@ mod tests {
                 chunk_index: *index,
                 chunk_length: bytes.len() as u64,
                 chunk_hash: manifest::sha256_hex(bytes),
+                offset: None,
                 written_nanos: None,
             });
         }
@@ -1926,6 +2377,7 @@ mod tests {
             chunk_index: index,
             chunk_length: bytes.len() as u64,
             chunk_hash: manifest::sha256_hex(bytes),
+            offset: None,
             written_nanos: None,
         });
     }
@@ -2015,6 +2467,7 @@ mod tests {
             chunk_index: 1,
             chunk_length: 4,
             chunk_hash: manifest::sha256_hex(b"efgh"),
+            offset: None,
             written_nanos: None,
         });
 

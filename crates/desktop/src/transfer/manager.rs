@@ -3,8 +3,10 @@ use crate::services::local_transfer_file_service::LocalTransferFileService;
 use crate::transfer::http_client::SessionStart;
 use crate::transfer::integrity::{self, ExpectedTransfer};
 use crate::transfer::persist::{PersistedTransfer, TransferSecrets, TransferStore};
+use crate::transfer::network_report;
 use crate::transfer::report;
 use crate::transfer::resume;
+use crate::transfer::transport_manifest::TransportManifest;
 use crate::transfer::session::{LegacyV1Session, OpenRequest, ProtocolSession};
 use crate::{
     models::transfer::{TransferMetadata, TransferStatus, TransferStatusResponse},
@@ -381,6 +383,22 @@ impl UploadManager {
             .concurrency
             .unwrap_or(constants::DEFAULT_CONCURRENCY);
 
+        /*
+         * The paths the backend's `START_TRANSFER` named. A malformed manifest
+         * costs the report its LAN/P2P detail, never the transfer — the
+         * dispatcher has already fallen back to the tunnel in that case.
+         */
+        let manifest = metadata
+            .transport_manifest
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<TransportManifest>(value.clone()).ok());
+        let network = network_report::NetworkReport::new(
+            report::Role::Sender,
+            &metadata.transfer_id,
+            network_report::paths(manifest.as_ref(), Some(metadata.endpoint.as_str())),
+            metadata.transport.clone(),
+        );
+
         let state = Arc::new(UploadState {
             transfer_id: metadata.transfer_id.clone(),
             credentials: Mutex::new(TransferCredentials {
@@ -417,6 +435,7 @@ impl UploadManager {
                 handshake_seconds: Some(handshake_seconds),
                 ..report::PhaseTimings::default()
             }),
+            network_report: Mutex::new(network),
         });
 
         state
@@ -438,6 +457,7 @@ impl UploadManager {
 
         self.store_secrets(&state);
         self.persist(&state).await;
+        self.write_network_report(&state).await;
 
         tracing::info!(
             transfer_id = %metadata.transfer_id,
@@ -606,6 +626,10 @@ impl UploadManager {
 
         state.set_running(true);
 
+        // The sender samples the time series; once per transfer even when a
+        // resume spawns a second scheduler for the same state.
+        state.report.start_timeseries();
+
         /*
          * Published before the workers exist rather than from inside the
          * spawned task, so the transfer reads as active from the moment its
@@ -720,6 +744,40 @@ impl UploadManager {
         TransferEvent::Failed(state.transfer_id.clone(), error)
     }
 
+    /// Refresh the network report: the paths from the start request plus how
+    /// far the transfer has got.
+    ///
+    /// Best effort — it is history, not state, and a transfer must not fail
+    /// over a file it cannot write.
+    async fn write_network_report(&self, state: &Arc<UploadState>) {
+        let status = state.status.lock().expect("status lock poisoned").clone();
+
+        let report = {
+            let mut report = state
+                .network_report
+                .lock()
+                .expect("network report lock poisoned");
+
+            report.update(
+                report::status_name(status),
+                state.uploaded_bytes.load(Ordering::Relaxed),
+                state.total_bytes,
+                state.uploaded_chunks.load(Ordering::Relaxed),
+                state.total_chunks,
+            );
+
+            report.clone()
+        };
+
+        if let Err(error) = network_report::write(&self.store.reports_dir(), &report).await {
+            tracing::warn!(
+                transfer_id = %state.transfer_id,
+                %error,
+                "could not write the network report"
+            );
+        }
+    }
+
     /// Write this transfer's performance report, once.
     ///
     /// The telemetry is what makes it exactly once: whichever terminal path
@@ -735,6 +793,10 @@ impl UploadManager {
         failure_reason: Option<String>,
         recovered: bool,
     ) {
+        // The terminal status is already set by every caller, so this is the
+        // file's last word on the transfer.
+        self.write_network_report(state).await;
+
         let chunk_size = state.chunk_size.max(1) as u64;
 
         let files = state
@@ -1147,6 +1209,7 @@ impl UploadManager {
 
         tokio::spawn(async move {
             manager.persist(&state).await;
+            manager.write_network_report(&state).await;
         });
     }
 
@@ -1225,6 +1288,7 @@ impl UploadManager {
         });
 
         self.persist(&s).await;
+        self.write_network_report(&s).await;
 
         Ok(s.snapshot())
     }
@@ -1283,6 +1347,7 @@ impl UploadManager {
         });
 
         self.persist(&s).await;
+        self.write_network_report(&s).await;
 
         Ok(s.snapshot())
     }
@@ -1430,6 +1495,11 @@ fn restored_state(
                 .map(|report| report.phases.clone())
                 .unwrap_or_default(),
         ),
+        network_report: Mutex::new(network_report::NetworkReport::restored(
+            report::Role::Sender,
+            &record.transfer_id,
+            &record.endpoint,
+        )),
     };
 
     /*

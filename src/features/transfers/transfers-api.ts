@@ -97,8 +97,9 @@ export async function updateTransferStatus(
 ): Promise<void> {
   await api.patch(`/transfers/${transferId}`, {
     action,
-    // Omitted entirely when there is no manifest, so an accept is byte-for-byte
-    // the request an older build sent.
-    ...(transportManifest == null ? {} : { transport_manifest: transportManifest }),
+    // Always present on ACCEPT; `undefined` is dropped by JSON.stringify for
+    // REJECT/CANCEL, which never probe. Never omit it here — an empty-but-valid
+    // manifest is what tells the backend the receiver looked.
+    transport_manifest: transportManifest,
   });
 }

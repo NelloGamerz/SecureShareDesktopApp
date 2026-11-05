@@ -6,6 +6,11 @@
 //! is removed, and the destination is left exactly as it was. That is the whole
 //! point of assembling into a temporary — a transfer that fails verification
 //! must not leave its output looking finished.
+//!
+//! When the sender described every chunk, there is no second assembly at all:
+//! each chunk is written straight at its offset as it arrives (see
+//! [`crate::transfer::manifest::assembly_path`]), and [`publish`] only checks the
+//! whole-file digest and moves the finished file into place.
 
 use crate::transfer::errors::{Result, TransferError};
 use sha2::{Digest, Sha256};
@@ -57,6 +62,105 @@ pub async fn merge(
             Err(error)
         }
     }
+}
+
+/// Publish a file whose chunks were already written at their offsets.
+///
+/// There is nothing left to concatenate: the assembly file is the output. All
+/// that remains is the sender's whole-file digest — the one check that can catch
+/// chunks that each verified on their own — and moving the file into place.
+///
+/// The move is a rename, so a file assembled on the same volume costs no copy at
+/// all. A destination on another volume cannot be renamed onto, and falls back to
+/// a copy into a temporary beside it, published only once it is complete.
+///
+/// A digest mismatch leaves the assembly file in place: only the bad chunks are
+/// forgotten (by the caller), and the sender's resends overwrite those ranges
+/// rather than the whole file.
+pub async fn publish(assembly: &Path, destination: &Path, expected: Option<&str>) -> Result<()> {
+    if let Some(expected) = expected {
+        let actual = digest_file(assembly).await?;
+
+        if actual != expected {
+            return Err(TransferError::IntegrityMismatch {
+                path: assembly.to_string_lossy().into_owned(),
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    match fs::rename(assembly, destination).await {
+        Ok(()) => Ok(()),
+
+        // Not necessarily an error: another volume cannot be renamed across.
+        // The fallback's failure is the one worth reporting.
+        Err(_) => copy_into_place(assembly, destination).await,
+    }
+}
+
+/// Copy `assembly` next to `destination`, then rename it over.
+///
+/// The temporary is in the destination's own directory so the final rename
+/// cannot cross a filesystem boundary, the same reason [`merge`] creates one
+/// there.
+async fn copy_into_place(assembly: &Path, destination: &Path) -> Result<()> {
+    let temporary = destination.with_extension("transfer-tmp");
+
+    let source = assembly.to_path_buf();
+    let target = temporary.clone();
+
+    let copied = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::copy(&source, &target)?;
+        std::fs::File::open(&target)?.sync_all()
+    })
+    .await
+    .map_err(|error| TransferError::Invalid(format!("the file copy task failed: {error}")))?
+    .map_err(TransferError::Io);
+
+    match copied {
+        Ok(()) => fs::rename(&temporary, destination)
+            .await
+            .map_err(TransferError::Io),
+
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+
+            Err(error)
+        }
+    }
+}
+
+/// Hex SHA-256 of a whole file, read once on the blocking pool.
+async fn digest_file(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+
+    tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+
+        loop {
+            let read = file.read(&mut buffer)?;
+
+            if read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..read]);
+        }
+
+        Ok(hex::encode(hasher.finalize()))
+    })
+    .await
+    .map_err(|error| TransferError::Invalid(format!("the file digest task failed: {error}")))?
+    .map_err(TransferError::Io)
 }
 
 async fn assemble(
@@ -211,6 +315,83 @@ mod tests {
         merge(&parts, &destination, 2, None)
             .await
             .expect("an old sender gives nothing to check against");
+
+        assert_eq!(
+            fs::read(&destination).await.expect("reading the result"),
+            b"abcdefgh"
+        );
+    }
+
+    /// Lay out `chunks` at their offsets in one assembly file.
+    async fn assembled(scratch: &TempDir, chunks: &[&[u8]]) -> std::path::PathBuf {
+        let assembly = scratch.path().join("f-1").join("assembly");
+
+        let mut offset = 0u64;
+
+        for bytes in chunks {
+            manifest::write_chunk_at(&assembly, offset, bytes.to_vec())
+                .await
+                .expect("writing at an offset");
+
+            offset += bytes.len() as u64;
+        }
+
+        assembly
+    }
+
+    #[tokio::test]
+    async fn an_assembly_that_matches_its_digest_is_published() {
+        let scratch = TempDir::new();
+        let assembly = assembled(&scratch, &[b"abcd", b"efgh", b"ij"]).await;
+        let destination = destination(&scratch);
+
+        let digest = manifest::sha256_hex(b"abcdefghij");
+
+        publish(&assembly, &destination, Some(&digest))
+            .await
+            .expect("a matching file must be published");
+
+        assert_eq!(
+            fs::read(&destination).await.expect("reading the result"),
+            b"abcdefghij"
+        );
+        assert!(
+            !assembly.exists(),
+            "the assembly moves out, it is not copied"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assembly_that_does_not_match_is_never_published() {
+        let scratch = TempDir::new();
+        let assembly = assembled(&scratch, &[b"abcd", b"efgh"]).await;
+        let destination = destination(&scratch);
+
+        let error = publish(
+            &assembly,
+            &destination,
+            Some(&manifest::sha256_hex(b"something else")),
+        )
+        .await
+        .expect_err("a file that does not match must not be published");
+
+        assert!(matches!(error, TransferError::IntegrityMismatch { .. }));
+        assert!(!destination.exists(), "the destination is left as it was");
+        assert!(
+            assembly.exists(),
+            "the ranges stay for the sender to overwrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assembly_with_no_expectation_is_published_as_before() {
+        let scratch = TempDir::new();
+        let assembly = assembled(&scratch, &[b"abcd", b"efgh"]).await;
+        let destination = destination(&scratch);
+
+        publish(&assembly, &destination, None)
+            .await
+            .expect("nothing to check against");
 
         assert_eq!(
             fs::read(&destination).await.expect("reading the result"),
