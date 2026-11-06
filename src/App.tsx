@@ -20,6 +20,7 @@ import { Suspense } from "react";
 import { useRoutes } from "react-router-dom";
 
 import { LoadingScreen } from "@/components/layout/loading-screen";
+import { Toaster } from "@/components/ui/sonner";
 import { router } from "./router";
 import { useDesktopServices } from "./hooks/useDesktopServices";
 
@@ -63,6 +64,8 @@ function App() {
           </div>
         </div>
       )}
+
+      <Toaster position="bottom-right" richColors closeButton />
     </>
   );
 }

@@ -1,7 +1,6 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useForm } from 'react-hook-form';
 import { Loader2 } from 'lucide-react';
-import { toast } from 'sonner';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -57,11 +56,7 @@ export function RenameDeviceDialog({
     mutation.mutate(
       { id: device.id, name: values.name },
       {
-        onSuccess: () => {
-          toast.success(`Device renamed to "${values.name}".`);
-          onOpenChange(false);
-        },
-        onError: (err) => toast.error(err.message),
+        onSuccess: () => onOpenChange(false),
       }
     );
   };
@@ -120,11 +115,7 @@ export function RemoveDeviceDialog({
   const confirm = () => {
     if (!device) return;
     mutation.mutate(device.id, {
-      onSuccess: () => {
-        toast.success(`${device.deviceName} has been removed.`);
-        onOpenChange(false);
-      },
-      onError: (err) => toast.error(err.message),
+      onSuccess: () => onOpenChange(false),
     });
   };
 

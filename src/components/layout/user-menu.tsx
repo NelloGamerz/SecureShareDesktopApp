@@ -57,6 +57,11 @@ export function UserMenu() {
         <DropdownMenuLabel className="font-normal">
           <div className="flex flex-col">
             <span className="text-sm font-medium">{user.name}</span>
+            {user.email && (
+              <span className="truncate text-xs text-muted-foreground">
+                {user.email}
+              </span>
+            )}
           </div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />

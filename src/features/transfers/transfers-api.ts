@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { api } from "@/lib/api";
 import { getDeviceIdentifier } from "@/services/getDeviceInfo";
 
@@ -102,4 +103,30 @@ export async function updateTransferStatus(
     // manifest is what tells the backend the receiver looked.
     transport_manifest: transportManifest,
   });
+}
+
+/**
+ * Accepts a pending transfer. The transport probe must never block accepting,
+ * so a failure (or an older build without the command) still sends a valid,
+ * empty manifest — the backend records "present but empty" differently from
+ * "missing".
+ */
+export async function acceptTransfer(transferId: string): Promise<void> {
+  let transportManifest: unknown;
+
+  try {
+    transportManifest = await invoke("build_transport_manifest");
+  } catch {
+    transportManifest = {
+      manifest_version: 1,
+      capabilities: {
+        p2p: false,
+        lan: false,
+        ble: false,
+        preferred_order: [],
+      },
+    };
+  }
+
+  return updateTransferStatus(transferId, "ACCEPT", transportManifest);
 }

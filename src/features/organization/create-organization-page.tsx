@@ -3,7 +3,6 @@ import { motion } from 'framer-motion';
 import { ArrowLeft, Building2, Loader2 } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 import { Link, useNavigate } from 'react-router-dom';
-import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -46,11 +45,7 @@ export function CreateOrganizationPage() {
 
   const onSubmit = (values: OrganizationFormValues) => {
     mutation.mutate(values, {
-      onSuccess: (org) => {
-        toast.success(`${org.name} has been created.`);
-        navigate('/organization');
-      },
-      onError: (err) => toast.error(err.message),
+      onSuccess: () => navigate('/organization'),
     });
   };
 

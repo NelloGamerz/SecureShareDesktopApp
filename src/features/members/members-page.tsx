@@ -12,7 +12,6 @@ import {
   X,
 } from "lucide-react";
 import { Fragment, useState } from "react";
-import { toast } from "sonner";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -129,31 +128,12 @@ export function MembersPage() {
       m.email.toLowerCase().includes(query.toLowerCase()),
   );
 
-  // const handleCancelInvitation = (id: string) => {
-  //   // call your cancel invitation mutation here
-  //   toast.success("Invitation cancelled");
-  // };
-
-  const handleCancelInvitation = (id: string, email: string) => {
-    cancelInvitationMutation.mutate(id, {
-      onSuccess: () => {
-        toast.success(`Invitation to ${email} cancelled.`);
-      },
-      onError: (err) => {
-        toast.error(err.message);
-      },
-    });
+  const handleCancelInvitation = (id: string) => {
+    cancelInvitationMutation.mutate(id);
   };
 
   const handleQuickRoleChange = (member: Member, role: MemberRole) => {
-    changeRoleMutation.mutate(
-      { memberId: member.id, role },
-      {
-        onSuccess: () =>
-          toast.success(`${member.name}'s role updated to ${role}.`),
-        onError: (err) => toast.error(err.message),
-      },
-    );
+    changeRoleMutation.mutate({ memberId: member.id, role });
   };
 
   const toggleMemberDevices = (member: Member) => {
@@ -213,38 +193,12 @@ export function MembersPage() {
     );
   }
 
-  const handleAccept = (id: string, email: string) => {
-    respondMutation.mutate(
-      {
-        id,
-        action: "ACCEPT",
-      },
-      {
-        onSuccess: () => {
-          toast.success(`Invitation from ${email} accepted.`);
-        },
-        onError: (err) => {
-          toast.error(err.message);
-        },
-      },
-    );
+  const handleAccept = (id: string) => {
+    respondMutation.mutate({ id, action: "ACCEPT" });
   };
 
-  const handleReject = (id: string, email: string) => {
-    respondMutation.mutate(
-      {
-        id,
-        action: "REJECT",
-      },
-      {
-        onSuccess: () => {
-          toast.success(`Invitation from ${email} rejected.`);
-        },
-        onError: (err) => {
-          toast.error(err.message);
-        },
-      },
-    );
+  const handleReject = (id: string) => {
+    respondMutation.mutate({ id, action: "REJECT" });
   };
 
   return (
@@ -524,10 +478,7 @@ export function MembersPage() {
                               variant="destructive"
                               disabled={cancelInvitationMutation.isPending}
                               onClick={() =>
-                                handleCancelInvitation(
-                                  invitation.id,
-                                  invitation.email,
-                                )
+                                handleCancelInvitation(invitation.id)
                               }
                             >
                               <X className="mr-1 h-4 w-4" />
@@ -605,9 +556,7 @@ export function MembersPage() {
                               size="icon"
                               variant="ghost"
                               disabled={respondMutation.isPending}
-                              onClick={() =>
-                                handleAccept(invitation.id, invitation.email)
-                              }
+                              onClick={() => handleAccept(invitation.id)}
                             >
                               <Check className="h-4 w-4 text-green-600" />
                             </Button>
@@ -616,9 +565,7 @@ export function MembersPage() {
                               size="icon"
                               variant="ghost"
                               disabled={respondMutation.isPending}
-                              onClick={() =>
-                                handleReject(invitation.id, invitation.email)
-                              }
+                              onClick={() => handleReject(invitation.id)}
                             >
                               <X className="h-4 w-4 text-red-600" />
                             </Button>

@@ -1,9 +1,9 @@
 import { useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { UnlistenFn } from "@tauri-apps/api/event";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
+  acceptTransfer,
   createTransfer,
   getMyTransfers,
   TransferAction,
@@ -56,29 +56,11 @@ export function useTransferAction() {
       transferId: string;
       action: TransferAction;
     }) => {
-      // Probing happens before the accept. It must never block accepting, so a
-      // failure (or an older build without the command) still sends a valid,
-      // empty manifest — the backend records "present but empty" differently
-      // from "missing".
-      let transportManifest: unknown;
-
       if (action === "ACCEPT") {
-        try {
-          transportManifest = await invoke("build_transport_manifest");
-        } catch {
-          transportManifest = {
-            manifest_version: 1,
-            capabilities: {
-              p2p: false,
-              lan: false,
-              ble: false,
-              preferred_order: [],
-            },
-          };
-        }
+        return acceptTransfer(transferId);
       }
 
-      return updateTransferStatus(transferId, action, transportManifest);
+      return updateTransferStatus(transferId, action);
     },
 
     onSuccess: async () => {

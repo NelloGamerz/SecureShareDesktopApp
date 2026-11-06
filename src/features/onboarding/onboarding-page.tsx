@@ -157,26 +157,9 @@ export function OnboardingPage() {
 
         setSuccess(true);
 
-        toast.success("Workspace created. Your 14-day free trial has started.");
-
         setTimeout(() => {
           navigate("/organization", { replace: true });
         }, 2000);
-      },
-
-      onError: (err) => {
-        const status = (err as Error & { status?: number }).status;
-
-        const map: Record<number, string> = {
-          400: "Validation failed. Please check your inputs.",
-          401: "Your session has expired. Please sign in again.",
-          403: "You do not have permission to do this.",
-          404: "Endpoint not found.",
-          409: "A workspace with this name or slug already exists.",
-          500: "Something went wrong on our end. Please try again.",
-        };
-
-        toast.error(map[status ?? 500] ?? err.message);
       },
     });
   };

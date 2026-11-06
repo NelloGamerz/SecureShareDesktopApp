@@ -8,12 +8,14 @@ interface UIState {
   mobileSidebarOpen: boolean;
   commandOpen: boolean;
   theme: Theme;
+  autoAcceptTransfers: boolean;
   toggleSidebar: () => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setMobileSidebarOpen: (open: boolean) => void;
   setCommandOpen: (open: boolean) => void;
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
+  setAutoAcceptTransfers: (enabled: boolean) => void;
 }
 
 export const useUIStore = create<UIState>()(
@@ -23,6 +25,7 @@ export const useUIStore = create<UIState>()(
       mobileSidebarOpen: false,
       commandOpen: false,
       theme: "dark",
+      autoAcceptTransfers: true,
 
       toggleSidebar: () =>
         set((s) => ({
@@ -41,12 +44,16 @@ export const useUIStore = create<UIState>()(
         })),
 
       setTheme: (theme) => set({ theme }),
+
+      setAutoAcceptTransfers: (enabled) =>
+        set({ autoAcceptTransfers: enabled }),
     }),
     {
       name: "vilsend-ui",
       partialize: (s) => ({
         sidebarCollapsed: s.sidebarCollapsed,
         theme: s.theme,
+        autoAcceptTransfers: s.autoAcceptTransfers,
       }),
     },
   ),

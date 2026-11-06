@@ -52,7 +52,9 @@ export function useCurrentUser() {
   });
 
   const firstName = profile?.firstName ?? '';
-  const name = firstName || 'User';
+  const lastName = profile?.lastName ?? '';
+  const name =
+    [firstName, lastName].filter(Boolean).join(' ') || 'User';
 
   return {
     isLoaded: isLoaded && !isLoading,
@@ -60,12 +62,12 @@ export function useCurrentUser() {
     id: user?.id ?? profile?.id,
     name,
     firstName,
-    // Not returned by the profile endpoint yet; kept so display components do
-    // not have to special-case a missing field.
-    lastName: '',
-    email: '',
+    lastName,
+    email: profile?.email ?? '',
     imageUrl: '',
-    initials: firstName ? firstName.slice(0, 2).toUpperCase() : 'U',
+    initials: firstName
+      ? (firstName[0] + (lastName[0] ?? '')).toUpperCase()
+      : 'U',
   } as const;
 }
 

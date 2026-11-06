@@ -619,7 +619,6 @@ export function QrPairingPage() {
           setSession(s);
           setWsConnected(false);
         },
-        onError: (err) => toast.error(err.message),
       }
     );
   };
@@ -641,7 +640,6 @@ export function QrPairingPage() {
           setSession(s);
           if (pollRef.current) clearInterval(pollRef.current);
         },
-        onError: (err) => toast.error(err.message),
       }
     );
   };
@@ -654,7 +652,6 @@ export function QrPairingPage() {
         if (pollRef.current) clearInterval(pollRef.current);
         setWsConnected(false);
       },
-      onError: (err) => toast.error(err.message),
     });
   };
 

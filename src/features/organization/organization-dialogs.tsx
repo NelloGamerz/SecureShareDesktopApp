@@ -1,6 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useForm } from 'react-hook-form';
-import { toast } from 'sonner';
 import {
   Dialog,
   DialogContent,
@@ -102,11 +101,7 @@ export function EditOrgDialog({ open, onOpenChange, organization }: EditOrgDialo
     mutation.mutate(
       { id: organization.id, input: values },
       {
-        onSuccess: () => {
-          toast.success('Organization updated successfully.');
-          onOpenChange(false);
-        },
-        onError: (err) => toast.error(err.message),
+        onSuccess: () => onOpenChange(false),
       }
     );
   };
@@ -271,11 +266,9 @@ export function InviteMemberDialog({
       { ...values, organizationId, invitedBy },
       {
         onSuccess: () => {
-          toast.success(`Invitation sent to ${values.email}.`);
           form.reset();
           onOpenChange(false);
         },
-        onError: (err) => toast.error(err.message),
       }
     );
   };
@@ -360,11 +353,7 @@ export function ChangeRoleDialog({ open, onOpenChange, member }: ChangeRoleDialo
     mutation.mutate(
       { memberId: member.id, role: values.role },
       {
-        onSuccess: () => {
-          toast.success(`${member.name}'s role updated to ${values.role}.`);
-          onOpenChange(false);
-        },
-        onError: (err) => toast.error(err.message),
+        onSuccess: () => onOpenChange(false),
       }
     );
   };
@@ -431,11 +420,7 @@ export function RemoveMemberDialog({ open, onOpenChange, member }: RemoveMemberD
   const confirm = () => {
     if (!member) return;
     mutation.mutate(member.id, {
-      onSuccess: () => {
-        toast.success(`${member.name} has been removed.`);
-        onOpenChange(false);
-      },
-      onError: (err) => toast.error(err.message),
+      onSuccess: () => onOpenChange(false),
     });
   };
 
@@ -480,11 +465,7 @@ export function DeleteOrgDialog({
   const confirm = () => {
     if (!organization) return;
     mutation.mutate(organization.id, {
-      onSuccess: () => {
-        toast.success('Organization deleted.');
-        onOpenChange(false);
-      },
-      onError: (err) => toast.error(err.message),
+      onSuccess: () => onOpenChange(false),
     });
   };
 

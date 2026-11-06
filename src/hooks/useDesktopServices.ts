@@ -19,6 +19,8 @@ import { useCurrentUserProfile } from "@/features/auth/auth-hooks";
 import { useAuth } from "@/contexts/auth-context";
 import { registerCurrentDevice } from "@/features/devices/devices-api";
 import { useTransferRequestStore } from "@/store/transfer-request-store";
+import { useUIStore } from "@/store/ui-store";
+import { acceptTransfer } from "@/features/transfers/transfers-api";
 
 export function useDesktopServices() {
   const { isLoaded, isAuthenticated: isSignedIn, logout } = useAuth();
@@ -295,16 +297,33 @@ export function useDesktopServices() {
       unlisten = await onTransferRequest((request) => {
         console.log("Transfer event received", request);
 
-        useTransferRequestStore.getState().addRequest(request);
+        const autoAccept =
+          useUIStore.getState().autoAcceptTransfers;
+
+        if (!autoAccept) {
+          useTransferRequestStore.getState().addRequest(request);
+        }
 
         useNotificationStore.getState().addNotification({
           id: crypto.randomUUID(),
           kind: "transfer",
-          title: "Incoming transfer request",
-          description: `${request.file_name} transfer request received`,
+          title: autoAccept
+            ? "Incoming transfer accepted"
+            : "Incoming transfer request",
+          description: autoAccept
+            ? `${request.file_name} is downloading automatically`
+            : `${request.file_name} transfer request received`,
           timestamp: "Just now",
           read: false,
         });
+
+        // Auto-accept failures fall back to the manual pending list.
+        if (autoAccept) {
+          acceptTransfer(request.transfer_id).catch((error) => {
+            console.error("[Transfer Listener] Auto-accept failed:", error);
+            useTransferRequestStore.getState().addRequest(request);
+          });
+        }
       });
 
       console.log(

@@ -253,9 +253,6 @@ export function BillingPage() {
 
         if (verification.success) {
           setCheckoutStatus("success");
-          toast.success(
-            verification.message ?? "Subscription activated successfully.",
-          );
         } else {
           setCheckoutStatus("error");
           toast.error(
@@ -308,9 +305,6 @@ export function BillingPage() {
 
         if (verification.success) {
           setCheckoutStatus("success");
-          toast.success(
-            verification.message ?? "Payment verified successfully.",
-          );
         } else {
           setCheckoutStatus("error");
           toast.error(
@@ -325,7 +319,10 @@ export function BillingPage() {
         error instanceof Error
           ? error.message
           : "Unable to start the Razorpay checkout flow.";
-      toast.error(message);
+      // API failures already raise the global toast in the axios interceptor.
+      if (!(error as { isAxiosError?: boolean }).isAxiosError) {
+        toast.error(message);
+      }
     } finally {
       setIsCheckingOut(false);
     }
@@ -378,12 +375,13 @@ export function BillingPage() {
         theme: { color: "#7c3aed" },
       });
 
-      toast.success(response.message ?? "Seat checkout opened successfully.");
       setIsSeatDialogOpen(false);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unable to update seat plan.";
-      toast.error(message);
+      if (!(error as { isAxiosError?: boolean }).isAxiosError) {
+        toast.error(message);
+      }
     } finally {
       setIsUpdatingSeats(false);
     }

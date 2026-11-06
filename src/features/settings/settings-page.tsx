@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { Download, Moon, Palette, User } from 'lucide-react';
+import { Download, Moon, Palette, Settings2, User } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -9,7 +9,6 @@ import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { PageContainer, PageHeader } from '@/components/layout/page-header';
 import { useUIStore } from '@/store/ui-store';
 import { useCurrentUser } from '@/providers/auth-guard';
@@ -18,6 +17,8 @@ import { getDefaultDownloadLocation, setDefaultDownloadLocation } from '@/api/ta
 export function SettingsPage() {
   const theme = useUIStore((s) => s.theme);
   const toggleTheme = useUIStore((s) => s.toggleTheme);
+  const autoAcceptTransfers = useUIStore((s) => s.autoAcceptTransfers);
+  const setAutoAcceptTransfers = useUIStore((s) => s.setAutoAcceptTransfers);
   const user = useCurrentUser();
   const [downloadLocation, setDownloadLocation] = useState<string>('');
 
@@ -60,6 +61,10 @@ export function SettingsPage() {
             <Bell className="h-4 w-4" />
             Notifications
           </TabsTrigger> */}
+          <TabsTrigger value="settings" className="gap-2">
+            <Settings2 className="h-4 w-4" />
+            Settings
+          </TabsTrigger>
           <TabsTrigger value="appearance" className="gap-2">
             <Palette className="h-4 w-4" />
             Appearance
@@ -75,18 +80,6 @@ export function SettingsPage() {
                 <CardDescription>Update your personal information.</CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
-                <div className="flex items-center gap-4">
-                  <Avatar className="h-16 w-16">
-                    <AvatarFallback className="bg-muted text-sm font-medium">
-                      {user.initials}
-                    </AvatarFallback>
-                  </Avatar>
-                  <div className="space-y-1">
-                    <Button variant="outline" size="sm">Change avatar</Button>
-                    <p className="text-xs text-muted-foreground">PNG or JPG, max 2 MB.</p>
-                  </div>
-                </div>
-                <Separator />
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div className="space-y-2">
                     <Label htmlFor="firstName">First name</Label>
@@ -106,23 +99,47 @@ export function SettingsPage() {
                 </div> */}
               </CardContent>
             </Card>
+          </motion.div>
+        </TabsContent>
 
-            <Card className="mt-6 max-w-2xl">
+        {/* Settings */}
+        <TabsContent value="settings">
+          <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
+            <Card className="max-w-2xl">
               <CardHeader>
-                <CardTitle className="text-base">Default download location</CardTitle>
+                <CardTitle className="text-base">Downloads</CardTitle>
                 <CardDescription>
-                  Choose where transfers should be saved by default. If you leave this unset, the Windows Downloads folder is used.
+                  Choose where transfers are saved and whether they are accepted automatically.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="flex items-center gap-3 rounded-md border bg-muted/30 p-3 text-sm">
-                  <Download className="h-4 w-4 text-muted-foreground" />
-                  <span className="truncate">{downloadLocation || 'Downloads'}</span>
+                <div className="space-y-2">
+                  <Label>Default download location</Label>
+                  <div className="flex items-center gap-3 rounded-md border bg-muted/30 p-3 text-sm">
+                    <Download className="h-4 w-4 text-muted-foreground" />
+                    <span className="truncate">{downloadLocation || 'Downloads'}</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    If you leave this unset, the Windows Downloads folder is used.
+                  </p>
                 </div>
                 <div className="flex justify-end">
                   <Button variant="outline" size="sm" onClick={handleChooseDownloadLocation}>
                     Choose folder
                   </Button>
+                </div>
+                <Separator />
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium">Auto download</p>
+                    <p className="text-xs text-muted-foreground">
+                      Automatically accept incoming transfers and save them to the location above.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={autoAcceptTransfers}
+                    onCheckedChange={setAutoAcceptTransfers}
+                  />
                 </div>
               </CardContent>
             </Card>
