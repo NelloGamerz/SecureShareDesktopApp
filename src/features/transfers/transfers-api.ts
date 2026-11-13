@@ -77,18 +77,29 @@ export async function createTransfer(
   return data;
 }
 
-export async function getMyTransfers(): Promise<TransferResponse[]> {
-  const { data } = await api.get<TransferResponse[]>("/transfers");
+export interface TransfersPage {
+  items: TransferResponse[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+export async function getMyTransfers(cursor?: string): Promise<TransfersPage> {
+  const { data } = await api.get<TransfersPage>("/transfers", {
+    params: cursor ? { cursor } : undefined,
+  });
 
   const deviceIdentifier = await getDeviceIdentifier();
 
-  return data.map((transfer) => ({
-    ...transfer,
+  return {
+    ...data,
+    items: data.items.map((transfer) => ({
+      ...transfer,
 
-    // The current device is the sender only when its stored identifier
-    // matches the device the backend recorded as the sender.
-    sentByMe: transfer.senderDeviceId === deviceIdentifier,
-  }));
+      // The current device is the sender only when its stored identifier
+      // matches the device the backend recorded as the sender.
+      sentByMe: transfer.senderDeviceId === deviceIdentifier,
+    })),
+  };
 }
 
 export async function updateTransferStatus(

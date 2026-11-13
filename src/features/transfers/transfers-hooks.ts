@@ -1,6 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { UnlistenFn } from "@tauri-apps/api/event";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQueryClient,
+  type InfiniteData,
+} from "@tanstack/react-query";
 
 import {
   acceptTransfer,
@@ -10,6 +15,9 @@ import {
   updateTransferStatus,
   type CreateTransferInput,
   type TransferMetadata,
+  type TransferResponse,
+  type TransferStatus,
+  type TransfersPage,
 } from "./transfers-api";
 
 import { pauseTransfer, resumeTransfer, cancelTransfer, TransferEvent, onTransferEvent } from "@/api/tauri";
@@ -39,10 +47,51 @@ export function useCreateTransfer() {
 }
 
 export function useTransfers() {
-  return useQuery({
+  const queryClient = useQueryClient();
+
+  const query = useInfiniteQuery({
     queryKey: ["transfers"],
-    queryFn: getMyTransfers,
+    queryFn: ({ pageParam }) => getMyTransfers(pageParam),
+    initialPageParam: undefined as string | undefined,
+    // No next cursor (or hasMore === false) means stop paging.
+    getNextPageParam: (lastPage) =>
+      lastPage.hasMore && lastPage.nextCursor ? lastPage.nextCursor : undefined,
+    // A bad cursor (400) must not be retried; other failures keep the default retries.
+    retry: (failureCount, error) =>
+      (error as { status?: number }).status !== 400 && failureCount < 3,
   });
+
+  const errorStatus = (query.error as { status?: number } | null)?.status;
+
+  useEffect(() => {
+    // An expired/invalid cursor is a 400; retrying it can never succeed, so
+    // restart from the first page instead.
+    if (errorStatus === 400) {
+      void queryClient.resetQueries({ queryKey: ["transfers"] });
+    }
+  }, [errorStatus, queryClient]);
+
+  const transfers = useMemo(() => {
+    // Pages can overlap when rows change between requests; keep the first id.
+    const byId = new Map<string, TransferResponse>();
+
+    for (const page of query.data?.pages ?? []) {
+      for (const transfer of page.items) {
+        if (!byId.has(transfer.id)) byId.set(transfer.id, transfer);
+      }
+    }
+
+    return [...byId.values()];
+  }, [query.data]);
+
+  return {
+    transfers,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    hasMore: query.hasNextPage,
+    isFetchingMore: query.isFetchingNextPage,
+    fetchMore: query.fetchNextPage,
+  };
 }
 
 export function useTransferAction() {
@@ -179,30 +228,36 @@ export function useTransferProgressListener() {
         const unlisten = await onTransferEvent(event, (payload) => {
           console.log(event, payload);
 
-          queryClient.setQueryData(["transfers"], (old: any[] | undefined) => {
-            if (!old) return old;
+          queryClient.setQueryData<InfiniteData<TransfersPage>>(
+            ["transfers"],
+            (old) =>
+              old && {
+                ...old,
+                pages: old.pages.map((page) => ({
+                  ...page,
+                  items: page.items.map((transfer) => {
+                    if (transfer.id !== payload.transfer_id) return transfer;
 
-            return old.map((transfer) => {
-              if (transfer.id !== payload.transfer_id) {
-                return transfer;
-              }
+                    return {
+                      ...transfer,
 
-              return {
-                ...transfer,
+                      uploadedBytes: payload.uploaded_bytes,
+                      totalBytes: payload.total_bytes,
 
-                uploadedBytes: payload.uploaded_bytes,
-                totalBytes: payload.total_bytes,
+                      percentage: payload.percentage,
 
-                percentage: payload.percentage,
+                      speed: payload.speed,
 
-                speed: payload.speed,
+                      eta: payload.eta,
 
-                eta: payload.eta,
-
-                status: payload.status ?? transfer.status,
-              };
-            });
-          });
+                      status:
+                        (payload.status as TransferStatus | undefined) ??
+                        transfer.status,
+                    };
+                  }),
+                })),
+              },
+          );
         });
 
         unlisteners.push(unlisten);

@@ -4,6 +4,7 @@ import {
   ArrowDownToLine,
   ArrowUpFromLine,
   // Download,
+  Loader2,
   MoreHorizontal,
   Plus,
   Check,
@@ -131,7 +132,35 @@ export function TransfersPage() {
   // const removeRequest = useTransferRequestStore((state) => state.removeRequest);
   useTransferProgressListener();
 
-  const { data: transfers = [], isLoading, isError } = useTransfers();
+  const {
+    transfers,
+    isLoading,
+    isError,
+    hasMore,
+    isFetchingMore,
+    fetchMore,
+  } = useTransfers();
+
+  const loadMoreRef = React.useRef<HTMLTableRowElement | null>(null);
+
+  React.useEffect(() => {
+    const node = loadMoreRef.current;
+
+    // The sentinel unmounts once there is nothing left to fetch.
+    if (!node || !hasMore) return;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        // isFetchingMore is the duplicate-request guard.
+        if (entry.isIntersecting && !isFetchingMore) void fetchMore();
+      },
+      { rootMargin: "200px" },
+    );
+
+    observer.observe(node);
+
+    return () => observer.disconnect();
+  }, [hasMore, isFetchingMore, fetchMore]);
 
   const transferAction = useTransferAction();
   const controls = useTransferControls();
@@ -287,12 +316,12 @@ export function TransfersPage() {
               {isLoading && (
                 <TableRow>
                   <TableCell colSpan={7} className="py-10 text-center">
-                    Loading transfers...
+                    <Loader2 className="mx-auto h-5 w-5 animate-spin text-muted-foreground" />
                   </TableCell>
                 </TableRow>
               )}
 
-              {isError && (
+              {isError && transfers.length === 0 && (
                 <TableRow>
                   <TableCell
                     colSpan={7}
@@ -304,7 +333,6 @@ export function TransfersPage() {
               )}
 
               {!isLoading &&
-                !isError &&
                 transfers.map((t, i) => {
                   const progress =
                     t.totalBytes > 0
@@ -588,6 +616,20 @@ export function TransfersPage() {
                   >
                     No transfers found
                   </TableCell>
+                </TableRow>
+              )}
+
+              {isFetchingMore && (
+                <TableRow>
+                  <TableCell colSpan={7} className="py-4 text-center">
+                    <Loader2 className="mx-auto h-4 w-4 animate-spin text-muted-foreground" />
+                  </TableCell>
+                </TableRow>
+              )}
+
+              {hasMore && !isFetchingMore && (
+                <TableRow ref={loadMoreRef}>
+                  <TableCell colSpan={7} className="h-0 p-0" />
                 </TableRow>
               )}
             </TableBody>
