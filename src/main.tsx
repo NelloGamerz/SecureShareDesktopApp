@@ -5,12 +5,16 @@ import App from './App.tsx';
 import { AppProviders } from '@/providers/app-providers';
 import './index.css';
 
+const app = (
+  <AppProviders>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </AppProviders>
+);
+
+// StrictMode double-invokes effects, which starts and stops the desktop
+// websocket twice per mount. Useful in development, wrong for a release build.
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <AppProviders>
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
-    </AppProviders>
-  </StrictMode>
+  import.meta.env.DEV ? <StrictMode>{app}</StrictMode> : app
 );

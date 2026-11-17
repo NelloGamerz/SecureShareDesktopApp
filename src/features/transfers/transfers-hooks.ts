@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from "react";
 import { UnlistenFn } from "@tauri-apps/api/event";
+import type { TransferProgress } from "@/api/tauri";
 import {
   useInfiniteQuery,
   useMutation,
@@ -223,50 +224,67 @@ export function useTransferProgressListener() {
 
     const unlisteners: UnlistenFn[] = [];
 
+    // Progress arrives once per chunk; keep only the latest sample per transfer
+    // and write the cache at most twice a second instead of per chunk.
+    const pending = new Map<string, TransferProgress>();
+
+    const flush = () => {
+      if (pending.size === 0) return;
+
+      const updates = new Map(pending);
+      pending.clear();
+
+      queryClient.setQueryData<InfiniteData<TransfersPage>>(
+        ["transfers"],
+        (old) =>
+          old && {
+            ...old,
+            pages: old.pages.map((page) => ({
+              ...page,
+              items: page.items.map((transfer) => {
+                const payload = updates.get(transfer.id);
+                if (!payload) return transfer;
+
+                return {
+                  ...transfer,
+
+                  uploadedBytes: payload.uploaded_bytes,
+                  totalBytes: payload.total_bytes,
+
+                  percentage: payload.percentage,
+
+                  speed: payload.speed,
+
+                  eta: payload.eta,
+
+                  status:
+                    (payload.status as TransferStatus | undefined) ??
+                    transfer.status,
+                };
+              }),
+            })),
+          },
+      );
+    };
+
     async function setup() {
       for (const event of events) {
         const unlisten = await onTransferEvent(event, (payload) => {
-          console.log(event, payload);
+          pending.set(payload.transfer_id, payload);
 
-          queryClient.setQueryData<InfiniteData<TransfersPage>>(
-            ["transfers"],
-            (old) =>
-              old && {
-                ...old,
-                pages: old.pages.map((page) => ({
-                  ...page,
-                  items: page.items.map((transfer) => {
-                    if (transfer.id !== payload.transfer_id) return transfer;
-
-                    return {
-                      ...transfer,
-
-                      uploadedBytes: payload.uploaded_bytes,
-                      totalBytes: payload.total_bytes,
-
-                      percentage: payload.percentage,
-
-                      speed: payload.speed,
-
-                      eta: payload.eta,
-
-                      status:
-                        (payload.status as TransferStatus | undefined) ??
-                        transfer.status,
-                    };
-                  }),
-                })),
-              },
-          );
+          // Terminal/state changes are rare and must land immediately.
+          if (event !== "transfer-progress") flush();
         });
 
         unlisteners.push(unlisten);
       }
     }
 
-    setup();
+    void setup();
+    const timer = window.setInterval(flush, 500);
 
     return () => {
+      window.clearInterval(timer);
       unlisteners.forEach((unlisten) => unlisten());
     };
   }, [queryClient]);

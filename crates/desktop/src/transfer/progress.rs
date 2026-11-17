@@ -1,4 +1,4 @@
-use crate::transfer::state::UploadState;
+use crate::transfer::state::{lock_or_recover, UploadState};
 use std::sync::atomic::Ordering;
 use vilsend_core::TransferProgress;
 
@@ -26,7 +26,7 @@ pub fn make(state: &UploadState) -> TransferProgress {
         uploaded,
         total,
         elapsed_secs,
-        state.status.lock().unwrap().clone(),
+        lock_or_recover(&state.status, "status").clone(),
     )
 }
 

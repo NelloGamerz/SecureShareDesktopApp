@@ -40,7 +40,7 @@ use crate::models::{file_info::modified_nanos, progress, transfer::TransferStatu
 use crate::transfer::{
     manager::DESCRIBE_DIGESTS,
     manifest, network_report,
-    state::DownloadState,
+    state::{lock_or_recover, DownloadState},
     writer::{assemble_and_publish, Assembly, ReceiverState},
 };
 
@@ -126,7 +126,7 @@ fn storage_failure(
     chunk_index: Option<u64>,
     message: String,
 ) -> SinkError {
-    *download.status.lock().expect("download status poisoned") = TransferStatus::Failed;
+    *lock_or_recover(&download.status, "download status") = TransferStatus::Failed;
 
     state.events.emit(DomainEvent::TransferFailed {
         progress: progress::make_download(download),
@@ -539,7 +539,7 @@ async fn store_chunk(
 
     download.received_chunks.fetch_add(1, Ordering::Relaxed);
 
-    *download.status.lock().expect("download status poisoned") = TransferStatus::Downloading;
+    *lock_or_recover(&download.status, "download status") = TransferStatus::Downloading;
 
     state.events.emit(DomainEvent::TransferProgress {
         progress: progress::make_download(download),
@@ -602,7 +602,7 @@ pub(crate) async fn finish(
      * prune a file that was just delivered.
      */
     if matches!(
-        *download.status.lock().expect("download status poisoned"),
+        *lock_or_recover(&download.status, "download status"),
         TransferStatus::Completed
     ) {
         return Ok(Completion::Published);
@@ -845,8 +845,7 @@ pub(crate) async fn finish(
                     );
                 }
 
-                *download.status.lock().expect("download status poisoned") =
-                    TransferStatus::Completed;
+                *lock_or_recover(&download.status, "download status") = TransferStatus::Completed;
 
                 download.report.set_manifest_totals(
                     record.chunk_count(),
@@ -1313,7 +1312,7 @@ mod tests {
 
         assert!(matches!(first, Ok(Completion::Published)));
         assert_ne!(
-            *download.status.lock().expect("status"),
+            *lock_or_recover(&download.status, "download status"),
             TransferStatus::Completed,
             "one file of two is not the whole transfer"
         );
@@ -1322,7 +1321,7 @@ mod tests {
 
         assert!(matches!(second, Ok(Completion::Published)));
         assert_eq!(
-            *download.status.lock().expect("status"),
+            *lock_or_recover(&download.status, "download status"),
             TransferStatus::Completed
         );
         assert!(downloads.join("nested/first.bin").exists());

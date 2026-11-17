@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import axios from "axios";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { getDeviceInfo } from "@/services/getDeviceInfo";
 
@@ -23,6 +24,7 @@ import { useUIStore } from "@/store/ui-store";
 import { acceptTransfer } from "@/features/transfers/transfers-api";
 
 export function useDesktopServices() {
+  const queryClient = useQueryClient();
   const { isLoaded, isAuthenticated: isSignedIn, logout } = useAuth();
 
   const { data: profile, isLoading } = useCurrentUserProfile({
@@ -319,10 +321,16 @@ export function useDesktopServices() {
 
         // Auto-accept failures fall back to the manual pending list.
         if (autoAccept) {
-          acceptTransfer(request.transfer_id).catch((error) => {
-            console.error("[Transfer Listener] Auto-accept failed:", error);
-            useTransferRequestStore.getState().addRequest(request);
-          });
+          acceptTransfer(request.transfer_id)
+            // The backend now has the transfer; refetch so it appears in the
+            // main list without waiting for a manual action to invalidate it.
+            .then(() =>
+              queryClient.invalidateQueries({ queryKey: ["transfers"] }),
+            )
+            .catch((error) => {
+              console.error("[Transfer Listener] Auto-accept failed:", error);
+              useTransferRequestStore.getState().addRequest(request);
+            });
         }
       });
 
@@ -337,7 +345,7 @@ export function useDesktopServices() {
     return () => {
       unlisten?.();
     };
-  }, []);
+  }, [queryClient]);
 
   // =========================================================
   // RETURN STATE FOR UI

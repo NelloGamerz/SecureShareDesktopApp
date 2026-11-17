@@ -14,7 +14,7 @@ use crate::{
         chunker, constants,
         errors::{Result, TransferError},
         progress, scanner, scheduler,
-        state::{TransferCredentials, UploadState},
+        state::{lock_or_recover, TransferCredentials, UploadState},
     },
 };
 use sha2::{Digest, Sha256};
@@ -22,7 +22,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::atomic::Ordering,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use vilsend_core::{DomainEvent, EventSink};
@@ -136,7 +136,7 @@ impl UploadManager {
             let state = Arc::new(restored_state(&record, expected));
 
             {
-                let mut transfers = self.transfers.lock().expect("transfer lock poisoned");
+                let mut transfers = lock_or_recover(&self.transfers, "transfers");
 
                 if transfers.contains_key(&record.transfer_id) {
                     continue;
@@ -188,6 +188,29 @@ impl UploadManager {
             .await;
     }
 
+    /// The transfer registry, for the path that registers a new transfer.
+    ///
+    /// A poisoned registry is refused here rather than recovered: `start` is
+    /// the only path that establishes new live state, and a panic in the last
+    /// registry write means this path cannot vouch for the state it would build
+    /// on. The caller gets an error it can show; transfers already registered
+    /// stay readable through [`Self::get`], which does recover.
+    fn transfers_for_start(
+        &self,
+    ) -> std::result::Result<MutexGuard<'_, HashMap<String, Arc<UploadState>>>, TransferError> {
+        self.transfers.lock().map_err(|_| {
+            tracing::error!(
+                target: "transfer",
+                "refusing to start a transfer: the transfer registry was poisoned"
+            );
+
+            TransferError::Internal(
+                "transfer registry is poisoned; restart the application before starting another transfer"
+                    .into(),
+            )
+        })
+    }
+
     pub async fn start(&self, metadata: TransferMetadata) -> Result<TransferStatusResponse> {
         if metadata.transfer_id.trim().is_empty() || metadata.endpoint.trim().is_empty()
         // || metadata.file_paths.is_empty()
@@ -197,9 +220,7 @@ impl UploadManager {
             ));
         }
         if self
-            .transfers
-            .lock()
-            .expect("transfer lock poisoned")
+            .transfers_for_start()?
             .contains_key(&metadata.transfer_id)
         {
             return Err(TransferError::Invalid("transfer already active".into()));
@@ -443,9 +464,7 @@ impl UploadManager {
             .set_transport(metadata.transport.clone(), metadata.transport_manifest.clone());
 
         let response = state.snapshot();
-        self.transfers
-            .lock()
-            .expect("transfer lock poisoned")
+        self.transfers_for_start()?
             .insert(metadata.transfer_id.clone(), state.clone());
 
         /*
@@ -1369,10 +1388,7 @@ impl UploadManager {
             false,
         )
         .await;
-        self.transfers
-            .lock()
-            .expect("transfer lock poisoned")
-            .remove(id);
+        lock_or_recover(&self.transfers, "transfers").remove(id);
 
         /*
          * A cancelled transfer is not a transfer anybody wants continued, so
@@ -1422,9 +1438,7 @@ impl UploadManager {
         Ok(self.get(id)?.snapshot())
     }
     pub(crate) fn get(&self, id: &str) -> Result<Arc<UploadState>> {
-        self.transfers
-            .lock()
-            .expect("transfer lock poisoned")
+        lock_or_recover(&self.transfers, "transfers")
             .get(id)
             .cloned()
             .ok_or_else(|| TransferError::NotFound(id.into()))
@@ -2037,6 +2051,66 @@ mod tests {
             manager.status("t-nobody"),
             Err(TransferError::NotFound(_))
         ));
+    }
+
+    /// The registry is the one lock whose poison the engine refuses to build
+    /// on: reads recover, a new transfer does not.
+    #[tokio::test]
+    async fn a_poisoned_registry_refuses_new_transfers_and_keeps_reading() {
+        let scratch = TempDir::new();
+        let store = Arc::new(TransferStore::in_memory(scratch.path().join("state")));
+        let manager = build_manager(store).await;
+
+        let known = Arc::new(restored_state(
+            &record("t-1", TransferStatus::Uploading, 0),
+            None,
+        ));
+
+        lock_or_recover(&manager.transfers, "transfers").insert("t-1".into(), known);
+
+        // Poison the registry: a thread panics while holding it.
+        let registry = Arc::clone(&manager.transfers);
+
+        std::thread::spawn(move || {
+            let _guard = registry.lock().expect("a fresh lock");
+
+            panic!("poisoning the registry on purpose");
+        })
+        .join()
+        .expect_err("the poisoning thread panicked");
+
+        // Reading is unaffected: the map itself is still sound.
+        assert_eq!(
+            manager
+                .status("t-1")
+                .expect("a poisoned registry is still readable")
+                .transfer_id,
+            "t-1"
+        );
+
+        // Establishing a new transfer is refused, with an error the UI can show.
+        let metadata = TransferMetadata {
+            transfer_id: "t-2".into(),
+            receiver_public_key: String::new(),
+            network_type: ConnectionType::Lan,
+            endpoint: "https://receiver.example".into(),
+            auth_token: String::new(),
+            chunk_size: None,
+            concurrency: None,
+            max_retries: None,
+            transport: None,
+            transport_manifest: None,
+        };
+
+        let error = manager
+            .start(metadata)
+            .await
+            .expect_err("a poisoned registry refuses the transfer");
+
+        assert!(
+            matches!(error, TransferError::Internal(_)),
+            "unexpected error: {error:?}"
+        );
     }
 }
 

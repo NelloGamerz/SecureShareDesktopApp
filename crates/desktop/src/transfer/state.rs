@@ -6,13 +6,51 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Mutex,
+        Mutex, MutexGuard,
     },
     time::Instant,
 };
 
 /// Identifies one chunk of one file. The unit the completed set is kept in.
 pub type ChunkKey = (String, u64);
+
+/// Takes a lock, recovering the value if a previous holder panicked.
+///
+/// Only for locks whose critical section is a single fully-formed write: a
+/// value replaced wholesale (`status`, `credentials`, `expected`) or one
+/// collection mutated by one standard-library operation (`completed`,
+/// `plan_stamps`, the transfer registry). No user code runs under those
+/// guards, so a panic can only have interrupted between operations — the
+/// value behind a poisoned lock is structurally sound and safe to keep using.
+///
+/// The panic that poisoned the lock has already been reported; the first
+/// recovery logs once and later ones at debug, so a poisoned hot path cannot
+/// flood the log.
+pub(crate) fn lock_or_recover<'a, T>(lock: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+
+        Err(poisoned) => {
+            warn_poison(name);
+
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn warn_poison(name: &'static str) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(target: "transfer", mutex = name, "recovered a poisoned lock");
+    } else {
+        tracing::warn!(
+            target: "transfer",
+            mutex = name,
+            "recovered a poisoned lock; the protected value was last written by a panicking thread"
+        );
+    }
+}
 
 /// The two secrets a live transfer needs.
 ///
@@ -168,11 +206,10 @@ impl UploadState {
             return false;
         };
 
-        let inserted = self
-            .completed
-            .lock()
-            .expect("completed lock poisoned")
-            .insert((file_id.to_string(), chunk_index));
+        let inserted = lock_or_recover(&self.completed, "completed").insert((
+            file_id.to_string(),
+            chunk_index,
+        ));
 
         if inserted {
             self.uploaded_bytes.fetch_add(length, Ordering::Relaxed);
@@ -213,7 +250,7 @@ impl UploadState {
             }
         }
 
-        *self.completed.lock().expect("completed lock poisoned") = validated;
+        *lock_or_recover(&self.completed, "completed") = validated;
 
         self.uploaded_bytes.store(bytes, Ordering::Relaxed);
         self.uploaded_chunks.store(count, Ordering::Relaxed);
@@ -312,12 +349,27 @@ impl UploadState {
     }
 
     /// The acknowledged chunks, as the state file keeps them.
+    ///
+    /// Every entry is checked against the plan here as well as on the way in:
+    /// if a panic interrupted a write to the set, the record that reaches disk
+    /// must still describe only chunks the transfer can actually send, or a
+    /// resume would report bytes it could never produce.
     pub fn completed_chunks(&self) -> Vec<PersistedChunk> {
-        let mut chunks: Vec<PersistedChunk> = self
-            .completed
-            .lock()
-            .expect("completed lock poisoned")
+        let mut chunks: Vec<PersistedChunk> = lock_or_recover(&self.completed, "completed")
             .iter()
+            .filter(|(file_id, chunk_index)| {
+                let known = self.chunk_length(file_id, *chunk_index).is_some();
+
+                if !known {
+                    tracing::warn!(
+                        file_id,
+                        chunk_index,
+                        "dropping an acknowledged chunk that is not part of the transfer"
+                    );
+                }
+
+                known
+            })
             .map(|(file_id, chunk_index)| PersistedChunk {
                 file_id: file_id.clone(),
                 chunk_index: *chunk_index,
@@ -362,7 +414,7 @@ impl UploadState {
             total_bytes: self.total_bytes,
             total_chunks: self.total_chunks,
             completed_chunks: self.completed_chunks(),
-            status: self.status.lock().expect("status lock poisoned").clone(),
+            status: lock_or_recover(&self.status, "status").clone(),
             /*
              * The live telemetry, so a report written after a restart carries
              * the measurements of the run rather than starting from zero. It is
@@ -385,7 +437,7 @@ impl UploadState {
             total_chunks: self.total_chunks,
             uploaded_chunks: self.uploaded_chunks.load(Ordering::Relaxed),
             retry_count: self.retry_count.load(Ordering::Relaxed),
-            status: self.status.lock().expect("status lock poisoned").clone(),
+            status: lock_or_recover(&self.status, "status").clone(),
         }
     }
 }
@@ -416,4 +468,115 @@ pub struct DownloadState {
     /// When the network report was last written, so chunk traffic does not
     /// rewrite it for every chunk.
     pub network_written: Mutex<std::time::Instant>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::models::file_info::FileInfo;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// A one-file, four-chunk upload with nothing acknowledged.
+    fn uploading() -> Arc<UploadState> {
+        Arc::new(UploadState {
+            transfer_id: "t-1".into(),
+            credentials: Mutex::new(TransferCredentials::default()),
+            endpoint: "https://receiver.example".into(),
+            network_type: ConnectionType::Lan,
+            files: vec![FileInfo {
+                id: "f-1".into(),
+                path: PathBuf::from("a.bin"),
+                relative_path: "a.bin".into(),
+                size: 4096,
+                modified_nanos: None,
+            }],
+            chunk_size: 1024,
+            concurrency: 2,
+            total_bytes: 0,
+            uploaded_bytes: AtomicU64::new(0),
+            total_chunks: 0,
+            uploaded_chunks: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            retry_count: AtomicU32::new(0),
+            max_retries: 3,
+            status: Mutex::new(TransferStatus::Uploading),
+            started_at: Instant::now(),
+            startup_started: Instant::now(),
+            completed: Mutex::new(HashSet::new()),
+            running: AtomicBool::new(false),
+            resume_lock: tokio::sync::Mutex::new(()),
+            expected: Mutex::new(None),
+            plan_stamps: Mutex::new(std::collections::HashMap::new()),
+            report: crate::transfer::report::Telemetry::new(crate::transfer::report::Role::Sender),
+            phases: Mutex::new(crate::transfer::report::PhaseTimings::default()),
+            network_report: Mutex::new(crate::transfer::network_report::NetworkReport::new(
+                crate::transfer::report::Role::Sender,
+                "t-1",
+                Vec::new(),
+                None,
+            )),
+        })
+    }
+
+    /// Panics while holding `lock`, leaving it poisoned.
+    fn poison<T>(lock: &Mutex<T>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().expect("a fresh lock");
+
+            panic!("poisoning on purpose");
+        }));
+
+        assert!(result.is_err(), "the poisoning thread must have panicked");
+    }
+
+    #[test]
+    fn a_poisoned_status_lock_is_recovered_with_the_last_status() {
+        let state = uploading();
+
+        *state.status.lock().expect("a fresh lock") = TransferStatus::Paused;
+
+        poison(&state.status);
+
+        assert_eq!(state.snapshot().status, TransferStatus::Paused);
+        assert_eq!(state.to_persisted().status, TransferStatus::Paused);
+    }
+
+    #[test]
+    fn a_poisoned_completed_lock_keeps_the_counters_accurate() {
+        let state = uploading();
+
+        poison(&state.completed);
+
+        assert!(state.mark_completed("f-1", 0));
+        assert!(state.mark_completed("f-1", 1));
+        assert!(
+            !state.mark_completed("f-1", 1),
+            "a chunk acknowledged twice is still counted once"
+        );
+
+        assert_eq!(state.uploaded_chunks.load(Ordering::Relaxed), 2);
+        assert_eq!(state.uploaded_bytes.load(Ordering::Relaxed), 2048);
+        assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn a_poisoned_completed_set_cannot_persist_a_chunk_outside_the_plan() {
+        let state = uploading();
+
+        // What an interrupted insert could leave behind: an entry the plan
+        // cannot account for, so no chunk could ever have produced those bytes.
+        lock_or_recover(&state.completed, "completed").insert(("f-1".into(), 99));
+
+        poison(&state.completed);
+
+        assert!(state.mark_completed("f-1", 0));
+
+        let persisted = state.to_persisted();
+
+        assert_eq!(persisted.completed_chunks.len(), 1);
+        assert_eq!(persisted.completed_chunks[0].chunk_index, 0);
+    }
 }

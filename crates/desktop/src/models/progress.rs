@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use crate::transfer::state::DownloadState;
+use crate::transfer::state::{lock_or_recover, DownloadState};
 
 /// Re-exported so the rest of the shell keeps its existing import path.
 /// The type, and its wire encoding, now live in `vilsend-core`.
@@ -27,7 +27,7 @@ pub fn make_download(state: &DownloadState) -> TransferProgress {
         received,
         state.total_bytes,
         elapsed_secs,
-        state.status.lock().unwrap().clone(),
+        lock_or_recover(&state.status, "download status").clone(),
     )
 }
 

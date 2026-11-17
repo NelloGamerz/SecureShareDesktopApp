@@ -36,6 +36,12 @@ pub enum TransferError {
     /// is a session to end. Folding it into `Receiver(..)` would lose that.
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// The engine's own state is unsound, so it declined to act.
+    ///
+    /// Distinct from `Invalid`, which means the request was wrong: nothing
+    /// about this request is wrong, and the honest advice is to restart.
+    #[error("transfer engine error: {0}")]
+    Internal(String),
     /// An assembled file is not the file the sender described.
     ///
     /// Its own error rather than a `Receiver(..)` string because the receiver

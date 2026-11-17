@@ -20,6 +20,28 @@ use crate::websocket::{
     heartbeat::heartbeat_loop, reconnect::backoff_delay, WebSocketClient, WebSocketSender,
 };
 
+/// Counts live manager tasks during tests, so an orphaned task is observable.
+#[cfg(test)]
+static LIVE_TASKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+struct LiveTask;
+
+#[cfg(test)]
+impl LiveTask {
+    fn new() -> Self {
+        LIVE_TASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for LiveTask {
+    fn drop(&mut self) {
+        LIVE_TASKS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WebSocketManagerConfig {
     pub url: String,
@@ -54,6 +76,9 @@ pub struct WebSocketManager {
     pub status: Arc<RwLock<ConnectionStatus>>,
     pub reconnect_attempt: Arc<Mutex<u32>>,
     pub task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Serialises `start` and `stop`, so a concurrent pair cannot spawn two
+    /// sockets or overwrite a task handle another call still needs.
+    lifecycle: Arc<Mutex<()>>,
 }
 
 impl WebSocketManager {
@@ -73,6 +98,7 @@ impl WebSocketManager {
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             reconnect_attempt: Arc::new(Mutex::new(0)),
             task_handle: Arc::new(Mutex::new(None)),
+            lifecycle: Arc::new(Mutex::new(())),
         }
     }
 
@@ -81,6 +107,8 @@ impl WebSocketManager {
         // token: Option<String>,
         device_info: DeviceInfo,
     ) -> Result<(), AppError> {
+        let _lifecycle = self.lifecycle.lock().await;
+
         println!("WEBSOCKET MANAGER START CALLED");
 
         tracing::info!(
@@ -88,6 +116,30 @@ impl WebSocketManager {
             event = "start_requested",
             "websocket manager start requested"
         );
+
+        // Idempotent: a live task already owns the socket, so a second start
+        // must not spawn a duplicate connection.
+        {
+            let mut task_guard = self.task_handle.lock().await;
+
+            match task_guard.as_ref() {
+                Some(handle) if !handle.is_finished() => {
+                    tracing::debug!(
+                        target: "websocket",
+                        event = "already_running",
+                        "websocket manager start ignored: task already running"
+                    );
+
+                    return Ok(());
+                }
+
+                // A task that ended on its own left its handle behind; it is not
+                // the one this start is about to spawn.
+                Some(_) => *task_guard = None,
+
+                None => {}
+            }
+        }
 
         let state = self.status.clone();
         let dispatcher = self.event_dispatcher.clone();
@@ -114,6 +166,9 @@ impl WebSocketManager {
         println!("WEBSOCKET URL: {}", config.url);
 
         let handle = tokio::spawn(async move {
+            #[cfg(test)]
+            let _live = LiveTask::new();
+
             println!("WEBSOCKET TOKIO TASK STARTED");
 
             let device_info_for_loop = device_info.clone();
@@ -168,7 +223,11 @@ impl WebSocketManager {
                             "websocket connect deferred: no desktop session yet"
                         );
 
-                        sleep(std::time::Duration::from_secs(5)).await;
+                        // Wait for a session, but let `stop` interrupt the wait.
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = sleep(std::time::Duration::from_secs(5)) => {}
+                        }
 
                         continue;
                     }
@@ -385,12 +444,21 @@ impl WebSocketManager {
 
     pub async fn stop(&self) -> Result<(), AppError> {
         tracing::info!(target: "websocket", event = "stop_requested", "websocket manager stop requested");
+
+        let _lifecycle = self.lifecycle.lock().await;
+
         // self.shutdown.cancel();
         {
             let guard = self.shutdown.lock().await;
             guard.cancel();
         }
-        if let Some(handle) = self.task_handle.lock().await.take() {
+
+        // Taken before awaiting: a concurrent caller cannot see this handle,
+        // and a task that already finished returns immediately instead of
+        // blocking. The task ends once it observes the cancellation.
+        let handle = self.task_handle.lock().await.take();
+
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
         {
@@ -433,3 +501,107 @@ impl WebSocketManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        services::local_transfer_file_service::LocalTransferFileService,
+        transfer::{manager::UploadManager, persist::TransferStore},
+    };
+    use sqlx::sqlite::SqlitePoolOptions;
+    use vilsend_core::RecordingEventSink;
+
+    fn device() -> DeviceInfo {
+        DeviceInfo {
+            device_name: "test".into(),
+            device_identifier: "test-device".into(),
+            device_type: "desktop".into(),
+            operating_system: "test".into(),
+            app_version: "0".into(),
+        }
+    }
+
+    async fn make_manager() -> WebSocketManager {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("an in-memory database");
+
+        let local_files = Arc::new(LocalTransferFileService::new(pool).await);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let uploads = Arc::new(UploadManager::new(
+            Arc::new(RecordingEventSink::new()),
+            std::env::temp_dir().join("vilsend-websocket-test-uploads"),
+            local_files,
+            tx,
+            Arc::new(TransferStore::in_memory(
+                std::env::temp_dir().join("vilsend-websocket-test-state"),
+            )),
+        ));
+
+        WebSocketManager::new(
+            WebSocketManagerConfig {
+                url: "ws://127.0.0.1:9".into(),
+                heartbeat_interval_secs: 30,
+                reconnect_max_attempts: 1,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+            },
+            Arc::new(AuthState::default()),
+            Arc::new(EventDispatcher::new(uploads)),
+        )
+    }
+
+    fn live_tasks() -> usize {
+        LIVE_TASKS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn task_id(manager: &WebSocketManager) -> Option<tokio::task::Id> {
+        manager.task_handle.lock().await.as_ref().map(|h| h.id())
+    }
+
+    #[tokio::test]
+    async fn one_task_per_start_and_a_clean_restart() {
+        let manager = make_manager().await;
+        let device = device();
+
+        manager.start(device.clone()).await.expect("first start");
+        tokio::task::yield_now().await;
+
+        let first = task_id(&manager).await;
+        assert!(first.is_some());
+        assert_eq!(live_tasks(), 1);
+
+        // A repeated start is a no-op: same task, still one connection.
+        manager.start(device.clone()).await.expect("repeated start");
+        assert_eq!(task_id(&manager).await, first, "repeated start must reuse the task");
+        assert_eq!(live_tasks(), 1);
+
+        manager.stop().await.expect("stop");
+        assert!(!manager.is_running().await);
+        assert_eq!(*manager.status.read().await, ConnectionStatus::Disconnected);
+        assert_eq!(live_tasks(), 0);
+
+        // Stop followed by start reconnects with a fresh task.
+        manager.start(device.clone()).await.expect("restart");
+        tokio::task::yield_now().await;
+        assert!(manager.is_running().await);
+        assert_ne!(task_id(&manager).await, first, "a restart must spawn a fresh task");
+        assert_eq!(live_tasks(), 1);
+        manager.stop().await.expect("final stop");
+
+        // Interleaved start/stop pairs cannot leave a task running.
+        for _ in 0..5 {
+            let _ = tokio::join!(manager.start(device.clone()), manager.stop());
+        }
+        manager.stop().await.expect("settle");
+        tokio::task::yield_now().await;
+        assert_eq!(live_tasks(), 0, "concurrent start/stop must leave no task running");
+        assert!(!manager.is_running().await);
+    }
+}
+

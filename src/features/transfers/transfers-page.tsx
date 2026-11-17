@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useTransferRequestStore } from "@/store/transfer-request-store";
+import { useUIStore } from "@/store/ui-store";
 import {
   useTransferControls,
   useTransferProgressListener,
@@ -123,6 +124,10 @@ export function TransfersPage() {
 
   const removeRequest = useTransferRequestStore((state) => state.removeRequest);
 
+  // Auto-accepted transfers go straight to the main list; there is nothing to
+  // accept here.
+  const autoAccept = useUIStore((state) => state.autoAcceptTransfers);
+
   const uniqueRequests = React.useMemo(() => {
     return Array.from(
       new Map(requests.map((request) => [request.id, request])).values(),
@@ -208,7 +213,7 @@ export function TransfersPage() {
         }
       />
 
-      {uniqueRequests.length > 0 && (
+      {!autoAccept && uniqueRequests.length > 0 && (
         <Card className="mb-4">
           <CardContent className="space-y-3 p-4">
             <div className="flex items-center justify-between">
