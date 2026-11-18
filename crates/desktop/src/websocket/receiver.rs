@@ -19,7 +19,20 @@ pub async fn receive_loop(
 
                     match serde_json::from_str::<ServerCommand>(&text) {
                         Ok(command) => {
-                            dispatcher.emit_command(command).await?;
+                            /*
+                             * One command failing is not a reason to lose the
+                             * socket: a refused `START_TRANSFER` would otherwise
+                             * tear down the command channel, and the control
+                             * plane does not resend it.
+                             */
+                            if let Err(error) = dispatcher.emit_command(command).await {
+                                tracing::warn!(
+                                    target: "websocket",
+                                    event = "command_failed",
+                                    %error,
+                                    "a websocket command failed; the connection stays up"
+                                );
+                            }
                         }
 
                         Err(err) => {

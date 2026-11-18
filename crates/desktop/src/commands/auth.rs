@@ -22,7 +22,7 @@ fn default_download_dir(app: &AppHandle) -> Result<String, String> {
         .map_err(|error| format!("failed to resolve downloads folder: {error}"))
 }
 
-fn resolve_download_location(app: &AppHandle) -> Result<String, String> {
+pub(crate) fn resolve_download_location(app: &AppHandle) -> Result<String, String> {
     let store = app
         .store("settings.json")
         .map_err(|error| format!("failed to open settings store: {error}"))?;

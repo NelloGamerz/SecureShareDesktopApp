@@ -148,6 +148,12 @@ pub struct ReceiverState {
     /// through the application handle.
     pub events: Arc<dyn EventSink>,
     pub root: PathBuf,
+    /// Where partial transfers are staged.
+    ///
+    /// Inside the download folder, on the same volume as the finished file, so
+    /// publishing is a rename rather than a second full copy. Falls back to
+    /// `root` when the download location cannot be resolved at startup.
+    pub staging_root: PathBuf,
     /// One lock per transfer, for that transfer's own manifest read-modify-write.
     ///
     /// **Replaces a single process-wide guard.** The guard was held across the
@@ -244,10 +250,17 @@ type InFlightMap = HashMap<ChunkKey, ChunkWaiters>;
 
 impl ReceiverState {
     pub fn new(host: Arc<dyn ReceiverHost>, events: Arc<dyn EventSink>, root: PathBuf) -> Self {
+        let staging_root = host
+            .downloads_root()
+            .ok()
+            .map(|downloads| downloads.join(".vilsend"))
+            .unwrap_or_else(|| root.clone());
+
         Self {
             host,
             events,
             root,
+            staging_root,
             writers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             keys: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             downloads: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -517,8 +530,164 @@ impl ReceiverState {
     }
 
     /// The directory a transfer's parts and manifest live in.
+    ///
+    /// Under [`Self::staging_root`], not `root`: the chunks are written where
+    /// the finished file will land, so the final publish is a same-volume
+    /// rename instead of a copy out of app-data.
     pub(crate) fn transfer_dir(&self, transfer_id: &str) -> PathBuf {
-        self.root.join("incoming").join(transfer_id)
+        self.staging_root.join("incoming").join(transfer_id)
+    }
+
+    /// Stop receiving a transfer and remove everything held for it.
+    ///
+    /// Shared by the sender's cancellation notice over the wire and the
+    /// receiver's own UI: both mean the same thing, and only the reason
+    /// recorded in the report differs. Returns whether the receiver knew of
+    /// the transfer or found anything on disk to remove.
+    pub(crate) async fn cancel_download(
+        &self,
+        transfer_id: &str,
+        reason: &str,
+    ) -> std::io::Result<bool> {
+        let was_known = {
+            let cached = self.manifests.lock().await.contains_key(transfer_id);
+
+            cached || self.downloads.read().await.contains_key(transfer_id)
+        };
+
+        /*
+         * The abort comes before the removal. A chunk being written holds its own
+         * handle to the download rather than looking it up, so taking the entry out
+         * of the map does not stop it — the flag does, at its next check. Removing
+         * the directory underneath a writer that is already committed to a write
+         * would only half-cancel the transfer; this way the write is refused and the
+         * transfer is gone.
+         */
+        if let Some(download) = self.downloads.write().await.remove(transfer_id) {
+            download.cancelled.store(true, Ordering::Relaxed);
+            *download.status.lock().unwrap() = TransferStatus::Cancelled;
+
+            self.events.emit(DomainEvent::TransferCancelled {
+                progress: progress::make_download(&download),
+            });
+
+            chunk_sink::finalize_download(
+                self,
+                &download,
+                TransferStatus::Cancelled,
+                None,
+                None,
+                Some(reason.to_owned()),
+            )
+            .await;
+        }
+
+        self.keys.write().await.remove(transfer_id);
+
+        // The transfer is gone, so its write lock is not worth keeping. Nothing is
+        // removed from under a holder: an in-flight chunk owns an `Arc` to it and
+        // finishes on the lock it already has.
+        self.forget_transfer(transfer_id).await;
+        self.forget_manifest(transfer_id).await;
+
+        let removed = cleanup::remove_transfer(&self.staging_root, transfer_id).await?;
+
+        tracing::info!(
+            transfer_id,
+            removed_from_disk = removed,
+            "cancelled a transfer"
+        );
+
+        Ok(was_known || removed)
+    }
+
+    /// Mark downloads that have gone silent for `timeout` as interrupted.
+    ///
+    /// Returns the transfers it interrupted, so the caller can tell the
+    /// backend. Nothing on disk is removed: the chunks are still valid and a
+    /// resume sends only the missing ones. The TTL sweep removes them if
+    /// nobody comes back.
+    pub(crate) async fn interrupt_stalled(&self, timeout: std::time::Duration) -> Vec<String> {
+        let idle: Vec<Arc<DownloadState>> = {
+            let downloads = self.downloads.read().await;
+
+            downloads
+                .values()
+                .filter(|download| {
+                    !download.paused.load(Ordering::Relaxed)
+                        && !download.cancelled.load(Ordering::Relaxed)
+                        && !matches!(
+                            *download.status.lock().expect("download status poisoned"),
+                            TransferStatus::Completed | TransferStatus::Interrupted
+                        )
+                        && download
+                            .last_activity
+                            .lock()
+                            .expect("activity lock poisoned")
+                            .elapsed()
+                            >= timeout
+                })
+                .cloned()
+                .collect()
+        };
+
+        let mut interrupted = Vec::new();
+
+        for download in idle {
+            // A completion that raced the scan settles the transfer; taking the
+            // entry out is what claims it for the watchdog.
+            if self
+                .downloads
+                .write()
+                .await
+                .remove(&download.transfer_id)
+                .is_none()
+            {
+                continue;
+            }
+
+            if matches!(
+                *download.status.lock().expect("download status poisoned"),
+                TransferStatus::Completed
+            ) {
+                continue;
+            }
+
+            *download.status.lock().expect("download status poisoned") =
+                TransferStatus::Interrupted;
+
+            self.events.emit(DomainEvent::TransferInterrupted {
+                progress: progress::make_download(&download),
+            });
+
+            chunk_sink::finalize_download(
+                self,
+                &download,
+                TransferStatus::Interrupted,
+                Some("stall"),
+                Some(format!(
+                    "no chunk received for {}s",
+                    timeout.as_secs()
+                )),
+                None,
+            )
+            .await;
+
+            // A resume opens a fresh session, which derives a fresh key.
+            self.keys.write().await.remove(&download.transfer_id);
+            self.forget_transfer(&download.transfer_id).await;
+            self.forget_manifest(&download.transfer_id).await;
+
+            tracing::warn!(
+                transfer_id = %download.transfer_id,
+                timeout_secs = timeout.as_secs(),
+                "receiver interrupted a stalled transfer"
+            );
+
+            interrupted.push(download.transfer_id.clone());
+        }
+
+        interrupted
     }
 }
 
@@ -734,6 +903,7 @@ pub async fn start_transfer(
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             started_at: std::time::Instant::now(),
+            last_activity: Mutex::new(std::time::Instant::now()),
             status: Mutex::new(TransferStatus::Failed),
             report: crate::transfer::report::Telemetry::new(
                 crate::transfer::report::Role::Receiver,
@@ -794,6 +964,7 @@ pub async fn start_transfer(
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             started_at: std::time::Instant::now(),
+            last_activity: Mutex::new(std::time::Instant::now()),
             status: Mutex::new(TransferStatus::Failed),
             report: crate::transfer::report::Telemetry::new(
                 crate::transfer::report::Role::Receiver,
@@ -998,6 +1169,8 @@ pub async fn start_transfer(
 
         started_at: std::time::Instant::now(),
 
+        last_activity: Mutex::new(std::time::Instant::now()),
+
         status: Mutex::new(TransferStatus::Pending),
         report: crate::transfer::report::Telemetry::new(crate::transfer::report::Role::Receiver),
         phases: Mutex::new(crate::transfer::report::PhaseTimings {
@@ -1091,7 +1264,7 @@ pub async fn receive(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, HeaderMap), (StatusCode, String)> {
-    tracing::info!(body_size = body.len(), "chunk upload request received");
+    tracing::debug!(body_size = body.len(), "chunk upload request received");
 
     let transfer = header(&headers, "Transfer-Id").map_err(|e| {
         tracing::warn!(error=?e, "missing Transfer-Id");
@@ -1165,7 +1338,7 @@ pub async fn receive(
             )
         })?;
 
-    tracing::info!(
+    tracing::debug!(
         transfer_id=%transfer,
         file_id=%file,
         chunk=index,
@@ -1277,6 +1450,15 @@ pub async fn receive(
     };
 
     /*
+     * A chunk arriving is the proof the sender is still there; the stall
+     * watchdog reads this to tell a slow transfer from an abandoned one.
+     */
+    *download
+        .last_activity
+        .lock()
+        .expect("activity lock poisoned") = std::time::Instant::now();
+
+    /*
      * A chunk that arrives after the file was published is not needed: the
      * receiver answered the last chunk only once the file was delivered. It is
      * acknowledged and dropped rather than written into a directory that no
@@ -1291,7 +1473,7 @@ pub async fn receive(
 
     let hash = Sha256::digest(transfer_key);
 
-    tracing::info!(
+    tracing::debug!(
         transfer_key_hash=%hex::encode(hash),
         "sender transfer key fingerprint"
     );
@@ -1383,7 +1565,7 @@ pub async fn receive(
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         transfer_id=%transfer,
         chunk=index,
         decrypted_size=decrypted.len(),
@@ -1442,7 +1624,7 @@ pub async fn receive(
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         transfer_id=%transfer,
         chunk=index,
         plaintext_size=plaintext.len(),
@@ -1564,7 +1746,7 @@ pub async fn receive(
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         transfer_id=%transfer,
         chunk=index,
         "chunk processing complete"
@@ -1985,64 +2167,16 @@ pub async fn cancel_transfer(
 
     let transfer = header(&headers, "Transfer-Id")?;
 
-    let was_known = {
-        let cached = state.manifests.lock().await.contains_key(&transfer);
+    match state
+        .cancel_download(&transfer, "cancelled by the sender")
+        .await
+    {
+        Ok(true) => Ok(StatusCode::OK),
 
-        cached || state.downloads.read().await.contains_key(&transfer)
-    };
-
-    /*
-     * The abort comes before the removal. A chunk being written holds its own
-     * handle to the download rather than looking it up, so taking the entry out
-     * of the map does not stop it — the flag does, at its next check. Removing
-     * the directory underneath a writer that is already committed to a write
-     * would only half-cancel the transfer; this way the write is refused and the
-     * transfer is gone.
-     */
-    if let Some(download) = state.downloads.write().await.remove(&transfer) {
-        download.cancelled.store(true, Ordering::Relaxed);
-        *download.status.lock().unwrap() = TransferStatus::Cancelled;
-
-        state.events.emit(DomainEvent::TransferCancelled {
-            progress: progress::make_download(&download),
-        });
-
-        chunk_sink::finalize_download(
-            &state,
-            &download,
-            TransferStatus::Cancelled,
-            None,
-            None,
-            Some("cancelled by the sender".into()),
-        )
-        .await;
-    }
-
-    state.keys.write().await.remove(&transfer);
-
-    // The transfer is gone, so its write lock is not worth keeping. Nothing is
-    // removed from under a holder: an in-flight chunk owns an `Arc` to it and
-    // finishes on the lock it already has.
-    state.forget_transfer(&transfer).await;
-    state.forget_manifest(&transfer).await;
-
-    match cleanup::remove_transfer(&state.root, &transfer).await {
-        Ok(removed) => {
-            if !was_known && !removed {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    format!("no transfer {transfer} to cancel"),
-                ));
-            }
-
-            tracing::info!(
-                transfer_id = %transfer,
-                removed_from_disk = removed,
-                "cancelled a transfer"
-            );
-
-            Ok(StatusCode::OK)
-        }
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            format!("no transfer {transfer} to cancel"),
+        )),
 
         // Logged and reported, never fatal: a directory that cannot be removed
         // is left to the sweep rather than taking the receiver down.
@@ -2138,7 +2272,7 @@ pub async fn run_cleanup(state: ReceiverState, ttl: Duration, interval: Duration
         let active: HashSet<String> = state.downloads.read().await.keys().cloned().collect();
 
         let removed = sweep_abandoned(
-            &state.root,
+            &state.staging_root,
             &active,
             ttl,
             SystemTime::now(),

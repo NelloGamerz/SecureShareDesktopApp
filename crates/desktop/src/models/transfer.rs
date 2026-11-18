@@ -31,6 +31,10 @@ pub struct TransferMetadata {
     // pub receiver_id: String,
     pub network_type: ConnectionType,
     pub endpoint: String,
+    /// The tunnel endpoint the command arrived with, kept when `endpoint` was
+    /// replaced by a direct path so the session can fall back to it.
+    #[serde(default)]
+    pub fallback_endpoint: Option<String>,
     pub auth_token: String,
     // pub file_paths: Vec<String>,
     pub chunk_size: Option<usize>,

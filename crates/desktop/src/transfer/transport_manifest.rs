@@ -176,33 +176,127 @@ pub async fn probe() -> TransportManifest {
     }
 }
 
+/// Interface-name fragments whose addresses never reach a peer on the LAN:
+/// loopback pseudo-adapters, container bridges, hypervisor host-only switches
+/// and tunnel/tap devices. Matched case-insensitively.
+const UNSUITABLE_INTERFACE_MARKERS: &[&str] = &[
+    "loopback", "pseudo", "docker", "veth", "br-", "virbr", "vmnet", "vboxnet",
+    "vethernet", "hyper-v", "virtual", "wsl", "tap", "tun", "utun", "awdl",
+    "llw", "bluetooth",
+];
+
 async fn probe_lan() -> Option<LanSection> {
-    let Some(std::net::IpAddr::V4(ip)) = local_ip().await else {
-        tracing::warn!("lan probe: no non-loopback ipv4 (default-route trick failed)");
-        return None;
+    // The default-route address is the best single guess, so it stays first
+    // when enumeration finds it and remains the fallback when it finds nothing.
+    let default = match local_ip().await {
+        Some(std::net::IpAddr::V4(ip)) if is_dialable(ip) => Some(ip),
+        _ => None,
     };
 
-    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
-        tracing::warn!("lan probe: no non-loopback ipv4 (default-route trick failed)");
+    let mut ips = discover_lan_ipv4s();
+
+    match default {
+        // Nothing enumerated: keep the previous single-endpoint behaviour
+        // rather than reporting LAN unavailable.
+        Some(ip) if ips.is_empty() => ips.push(ip),
+        Some(ip) if ips.contains(&ip) => {
+            ips.retain(|candidate| *candidate != ip);
+            ips.insert(0, ip);
+        }
+        _ => {}
+    }
+
+    if ips.is_empty() {
+        tracing::warn!("lan probe: no usable private ipv4 interface");
         return None;
     }
 
+    tracing::info!(
+        endpoints = ips.len(),
+        "lan probe: advertising private interface addresses"
+    );
+
     Some(LanSection {
-        endpoints: vec![LanEndpoint {
-            ip: ip.to_string(),
-            port: RECEIVER_PORT,
-        }],
+        endpoints: ips
+            .into_iter()
+            .map(|ip| LanEndpoint {
+                ip: ip.to_string(),
+                port: RECEIVER_PORT,
+            })
+            .collect(),
         mdns_service: Some("vilsend._tcp.local".into()),
     })
+}
+
+/// Every private IPv4 a peer on the same network could dial, sorted and
+/// deduplicated. Pure, so the selection rules are tested without real NICs.
+fn lan_ipv4s(
+    interfaces: impl IntoIterator<Item = (String, std::net::IpAddr)>,
+) -> Vec<std::net::Ipv4Addr> {
+    let mut ips: Vec<std::net::Ipv4Addr> = interfaces
+        .into_iter()
+        .filter(|(name, _)| !is_unsuitable_interface(name))
+        .filter_map(|(_, address)| match address {
+            std::net::IpAddr::V4(ip) if is_private_lan(ip) => Some(ip),
+            _ => None,
+        })
+        .collect();
+
+    ips.sort_unstable();
+    ips.dedup();
+    ips
+}
+
+fn is_unsuitable_interface(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    UNSUITABLE_INTERFACE_MARKERS
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
+/// RFC1918, plus the 100.64/10 carrier-grade NAT range overlays such as
+/// Tailscale use. Public addresses are not offered as LAN endpoints.
+fn is_private_lan(ip: std::net::Ipv4Addr) -> bool {
+    if !is_dialable(ip) || ip.is_multicast() {
+        return false;
+    }
+
+    let [first, second, _, _] = ip.octets();
+
+    ip.is_private() || (first == 100 && (64..=127).contains(&second))
+}
+
+fn is_dialable(ip: std::net::Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+}
+
+fn discover_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    let networks = sysinfo::Networks::new_with_refreshed_list();
+    let interfaces: Vec<(String, std::net::IpAddr)> = networks
+        .iter()
+        .flat_map(|(name, data)| {
+            data.ip_networks()
+                .iter()
+                .map(move |network| (name.clone(), network.addr))
+        })
+        .collect();
+
+    for (name, address) in &interfaces {
+        if let std::net::IpAddr::V4(ip) = address {
+            if is_private_lan(*ip) && !is_unsuitable_interface(name) {
+                tracing::debug!(interface = %name, %ip, "lan probe: usable interface");
+            }
+        }
+    }
+
+    lan_ipv4s(interfaces)
 }
 
 /// The address of the interface the default route uses.
 ///
 /// A UDP `connect` sends no packet; it only makes the kernel choose a source
-/// address. Without a route there is no LAN address to advertise.
-///
-/// shortcut: one IPv4 address and no netmask (no `if-addrs` dependency).
-/// Upgrade when the selector must enumerate several NICs or compare subnets.
+/// address. Used to order, and if necessary replace, the enumerated
+/// interfaces when none look suitable.
 async fn local_ip() -> Option<std::net::IpAddr> {
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
     socket.connect("8.8.8.8:80").await.ok()?;
@@ -230,13 +324,39 @@ pub async fn select(manifest: &TransportManifest) -> Option<SelectedTransport> {
     let capabilities = manifest.capabilities.as_ref()?;
 
     if capabilities.lan {
-        for endpoint in manifest.lan.as_ref().map(|lan| &lan.endpoints).into_iter().flatten() {
-            if lan_reachable(&endpoint.ip, endpoint.port).await {
-                return Some(SelectedTransport {
-                    kind: TransportKind::Lan,
-                    direct_endpoint: Some(format!("http://{}:{}", endpoint.ip, endpoint.port)),
-                });
-            }
+        let endpoints: Vec<&LanEndpoint> = manifest
+            .lan
+            .as_ref()
+            .map(|lan| lan.endpoints.iter().collect())
+            .unwrap_or_default();
+
+        if endpoints.is_empty() {
+            return None;
+        }
+
+        /*
+         * Race every offered address. The receiver may advertise several
+         * interfaces, and dialling them in sequence would cost a full
+         * LAN_DIAL_TIMEOUT for each wrong one before the tunnel fallback.
+         */
+        let dials = endpoints.into_iter().map(|endpoint| {
+            let ip = endpoint.ip.clone();
+            let port = endpoint.port;
+
+            Box::pin(async move {
+                if lan_reachable(&ip, port).await {
+                    Ok(SelectedTransport {
+                        kind: TransportKind::Lan,
+                        direct_endpoint: Some(format!("http://{ip}:{port}")),
+                    })
+                } else {
+                    Err(())
+                }
+            })
+        });
+
+        if let Ok((selected, _)) = futures_util::future::select_ok(dials).await {
+            return Some(selected);
         }
     }
 
@@ -348,6 +468,57 @@ mod tests {
             "LAN is preferred exactly when it is available"
         );
         assert_eq!(manifest.lan.is_some(), capabilities.lan);
+    }
+
+    #[test]
+    fn only_private_non_virtual_ipv4s_are_advertised() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+
+        let interfaces = vec![
+            ("Wi-Fi".to_owned(), v4(192, 168, 1, 20)),
+            ("Ethernet".to_owned(), v4(10, 0, 0, 5)),
+            // The same address twice: advertised once.
+            ("Wi-Fi".to_owned(), v4(192, 168, 1, 20)),
+            ("Loopback Pseudo-Interface 1".to_owned(), v4(127, 0, 0, 1)),
+            ("vEthernet (Default Switch)".to_owned(), v4(172, 20, 0, 1)),
+            ("VMware Network Adapter VMnet8".to_owned(), v4(192, 168, 56, 1)),
+            // APIPA: no DHCP lease, nothing to reach.
+            ("Wi-Fi".to_owned(), v4(169, 254, 10, 2)),
+            // Public: not a LAN endpoint.
+            ("Ethernet 2".to_owned(), v4(203, 0, 113, 9)),
+            ("eth0".to_owned(), IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            // Overlay address a peer on the same tailnet can reach.
+            ("tailscale0".to_owned(), v4(100, 101, 2, 3)),
+        ];
+
+        assert_eq!(
+            lan_ipv4s(interfaces),
+            vec![
+                Ipv4Addr::new(10, 0, 0, 5),
+                Ipv4Addr::new(100, 101, 2, 3),
+                Ipv4Addr::new(192, 168, 1, 20),
+            ]
+        );
+    }
+
+    #[test]
+    fn virtual_interface_names_are_rejected_case_insensitively() {
+        for name in [
+            "vEthernet (LAN)",
+            "Docker0",
+            "BR-abc123",
+            "utun4",
+            "Bluetooth Network Connection",
+            "Loopback Pseudo-Interface 1",
+        ] {
+            assert!(is_unsuitable_interface(name), "{name} should be filtered");
+        }
+
+        for name in ["Wi-Fi", "Ethernet", "eth0", "wlan0", "en0", "tailscale0"] {
+            assert!(!is_unsuitable_interface(name), "{name} should be kept");
+        }
     }
 
     #[test]

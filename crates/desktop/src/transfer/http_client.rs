@@ -261,6 +261,9 @@ impl HttpClient {
     /// that a slow chunk cannot evict the connection the next one will use.
     pub fn new() -> Self {
         let mut builder = Client::builder()
+            // A dead route must fail, not hang: the session can only fall over
+            // to the next route if this request ends in an error.
+            .connect_timeout(crate::transfer::constants::CONNECT_TIMEOUT)
             // Enough idle connections for a transfer's own concurrency, and a
             // pool that outlives the gap between two chunks of a slow link.
             .pool_max_idle_per_host(crate::transfer::constants::DEFAULT_CONCURRENCY * 2)
@@ -333,6 +336,7 @@ impl HttpClient {
             .post(url)
             .header("Authorization", format!("Bearer {token}"))
             .json(&request)
+            .timeout(crate::transfer::constants::OPEN_TIMEOUT)
             .send()
             .await?;
 
@@ -487,7 +491,16 @@ impl HttpClient {
             .header("Total-Chunks", job.total)
             .header("Relative-Path", &job.relative_path)
             .header("Chunk-Nonce", nonce_encoded)
-            .header("Encryption", "AES-256-GCM");
+            .header("Encryption", "AES-256-GCM")
+            /*
+             * A chunk outstanding this long is on a medium that has stopped
+             * carrying it — a dropped direct path would otherwise hang the
+             * worker forever and the session would never see a failure to fail
+             * over on. Generous enough for a 512 KiB chunk at ~8 KiB/s. Only
+             * this request is bounded: a resume query hashes the receiver's
+             * whole transfer and may legitimately take minutes.
+             */
+            .timeout(std::time::Duration::from_secs(60));
 
         /*
          * Only present when the body is compressed. An identity chunk carries
@@ -566,6 +579,7 @@ impl HttpClient {
             .0
             .get(url)
             .header("Authorization", format!("Bearer {token}"))
+            .timeout(crate::transfer::constants::HANDSHAKE_TIMEOUT)
             .send()
             .await?;
 

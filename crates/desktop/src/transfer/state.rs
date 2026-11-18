@@ -455,6 +455,10 @@ pub struct DownloadState {
 
     pub started_at: Instant,
 
+    /// When a chunk last arrived. Silence longer than the stall timeout is how
+    /// the receiver tells a slow transfer from a sender that went away.
+    pub last_activity: Mutex<Instant>,
+
     pub status: Mutex<TransferStatus>,
 
     /// The performance report this transfer accumulates, written when it ends.

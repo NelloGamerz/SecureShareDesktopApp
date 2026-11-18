@@ -236,15 +236,19 @@ export async function localTransferExists(
 }
 
 export async function pauseTransfer(id: string) {
-  return invoke("pause_transfer", { id });
+  return invoke("pause_transfer", { transferId: id });
 }
 
 export async function resumeTransfer(id: string) {
-  return invoke("resume_transfer", { id });
+  return invoke("resume_transfer", { transferId: id });
 }
 
 export async function cancelTransfer(id: string) {
-  return invoke("cancel_transfer", { id });
+  return invoke("cancel_transfer", { transferId: id });
+}
+
+export async function cancelReceivedTransfer(id: string) {
+  return invoke("cancel_received_transfer", { transferId: id });
 }
 
 export async function detectDeviceType(): Promise<string> {

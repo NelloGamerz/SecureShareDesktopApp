@@ -115,6 +115,9 @@ fn every_event(progress: &TransferProgress) -> Vec<DomainEvent> {
         DomainEvent::TransferFailed {
             progress: progress.clone(),
         },
+        DomainEvent::TransferInterrupted {
+            progress: progress.clone(),
+        },
         DomainEvent::TransferPaused {
             progress: progress.clone(),
         },

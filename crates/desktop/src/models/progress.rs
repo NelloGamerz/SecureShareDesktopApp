@@ -49,6 +49,7 @@ mod tests {
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             started_at: std::time::Instant::now(),
+            last_activity: Mutex::new(std::time::Instant::now()),
             status: Mutex::new(TransferStatus::Downloading),
             report: crate::transfer::report::Telemetry::new(
                 crate::transfer::report::Role::Receiver,

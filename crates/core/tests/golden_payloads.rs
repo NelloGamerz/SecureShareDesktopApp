@@ -114,6 +114,7 @@ fn transfer_status_wire_format_is_unchanged() {
         ("Paused", TransferStatus::Paused),
         ("Completed", TransferStatus::Completed),
         ("Failed", TransferStatus::Failed),
+        ("Interrupted", TransferStatus::Interrupted),
         ("Cancelled", TransferStatus::Cancelled),
         ("Pending", TransferStatus::Pending),
         ("Downloading", TransferStatus::Downloading),
@@ -157,6 +158,10 @@ fn transfer_event_names_are_unchanged() {
         }
         .wire_name(),
         DomainEvent::TransferFailed {
+            progress: progress.clone(),
+        }
+        .wire_name(),
+        DomainEvent::TransferInterrupted {
             progress: progress.clone(),
         }
         .wire_name(),

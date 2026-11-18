@@ -29,6 +29,10 @@ pub enum TransferStatus {
     Paused,
     Completed,
     Failed,
+    /// The transfer stopped without finishing, but not because anything about
+    /// it was wrong: the connection dropped, the peer went away, or the app
+    /// closed. It can be resumed from the chunks already delivered.
+    Interrupted,
     Cancelled,
     Pending,
     Downloading,

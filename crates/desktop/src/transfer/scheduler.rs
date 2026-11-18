@@ -51,10 +51,18 @@ impl PlanGate {
 /// Why a dispatched chunk did not land.
 enum ChunkFailure {
     /// Nothing more can be done for this chunk.
-    Fatal(String),
+    Fatal { message: String, interrupted: bool },
     /// The receiver refused the chunk and named the chunks it no longer holds.
     /// Those are resent; this is not a failure of the transfer.
     Missing { file_id: String, indices: Vec<u64> },
+}
+
+/// Why a run stopped, and whether what stopped it was the transfer's content
+/// (a failure) or the connection to the peer (an interruption a resume fixes).
+#[derive(Debug)]
+pub struct RunError {
+    pub message: String,
+    pub interrupted: bool,
 }
 
 /// Called once per acknowledged chunk, with the job that was sent and how many
@@ -93,7 +101,7 @@ pub async fn run(
     session: Arc<dyn ProtocolSession>,
     on_success: Arc<ChunkAcknowledged>,
     gate: Option<Arc<PlanGate>>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), RunError> {
     /*
      * The transfer key is read once per run, and it is read *by the session*,
      * which is where it now lives.
@@ -138,7 +146,7 @@ pub async fn run(
 
     let mut in_flight: JoinSet<std::result::Result<(), ChunkFailure>> = JoinSet::new();
 
-    let mut first_error: Option<String> = None;
+    let mut first_error: Option<RunError> = None;
 
     /*
      * Chunks the receiver said it no longer holds. They are dispatched as soon
@@ -364,7 +372,21 @@ pub async fn run(
                     other => {
                         state.report.chunk_failed(&job.file_id);
 
-                        ChunkFailure::Fatal(other.to_string())
+                        /*
+                         * A transport or peer problem is not a fault in the
+                         * transfer: the same chunks are still valid and a
+                         * resume can send the rest. Reading the wrong bytes,
+                         * failing to encrypt or hash, is a fault.
+                         */
+                        ChunkFailure::Fatal {
+                            interrupted: matches!(
+                                other,
+                                TransferError::Http(_)
+                                    | TransferError::Receiver(_)
+                                    | TransferError::Protocol(_)
+                            ),
+                            message: other.to_string(),
+                        }
                     }
                 })
             });
@@ -413,7 +435,7 @@ async fn next_job(
     retry_queue: &mut VecDeque<ChunkJob>,
     gate: Option<&PlanGate>,
     state: &UploadState,
-    first_error: &mut Option<String>,
+    first_error: &mut Option<RunError>,
 ) -> Option<ChunkJob> {
     /*
      * A requeued chunk goes first: the receiver refused a chunk it no longer
@@ -435,11 +457,12 @@ async fn next_job(
         while !gate.is_released() {
             if gate.has_failed() {
                 if first_error.is_none() {
-                    *first_error = Some(
-                        "the transfer's digests could not be delivered, so no file could be \
-                         completed"
+                    *first_error = Some(RunError {
+                        interrupted: false,
+                        message: "the transfer's digests could not be delivered, so no file could \
+                                  be completed"
                             .into(),
-                    );
+                    });
                 }
 
                 return None;
@@ -463,7 +486,7 @@ async fn next_job(
 /// reporting them instead would hide the cause.
 fn note_outcome(
     finished: std::result::Result<std::result::Result<(), ChunkFailure>, tokio::task::JoinError>,
-    first_error: &mut Option<String>,
+    first_error: &mut Option<RunError>,
     retry_queue: &mut VecDeque<ChunkJob>,
     requeues_left: &mut usize,
     all_jobs: &[ChunkJob],
@@ -471,7 +494,10 @@ fn note_outcome(
     let error = match finished {
         Ok(Ok(())) => return,
 
-        Ok(Err(ChunkFailure::Fatal(error))) => error,
+        Ok(Err(ChunkFailure::Fatal { message, interrupted })) => RunError {
+            message,
+            interrupted,
+        },
 
         Ok(Err(ChunkFailure::Missing { file_id, indices })) => {
             for index in indices {
@@ -484,8 +510,12 @@ fn note_outcome(
 
                 if *requeues_left == 0 {
                     if first_error.is_none() {
-                        *first_error =
-                            Some("the receiver kept reporting chunks it no longer holds".into());
+                        *first_error = Some(RunError {
+                            // The peer is reachable but not progressing; a
+                            // resume asks it again what it actually holds.
+                            interrupted: true,
+                            message: "the receiver kept reporting chunks it no longer holds".into(),
+                        });
                     }
 
                     return;
@@ -498,7 +528,10 @@ fn note_outcome(
             return;
         }
 
-        Err(join) => join.to_string(),
+        Err(join) => RunError {
+            interrupted: false,
+            message: join.to_string(),
+        },
     };
 
     if first_error.is_none() {

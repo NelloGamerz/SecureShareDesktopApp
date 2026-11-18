@@ -30,6 +30,7 @@ pub enum DomainEvent {
     TransferProgress { progress: TransferProgress },
     TransferCompleted { progress: TransferProgress },
     TransferFailed { progress: TransferProgress },
+    TransferInterrupted { progress: TransferProgress },
     TransferPaused { progress: TransferProgress },
     TransferResumed { progress: TransferProgress },
     TransferCancelled { progress: TransferProgress },
@@ -53,6 +54,7 @@ impl DomainEvent {
             Self::TransferProgress { .. } => "transfer-progress",
             Self::TransferCompleted { .. } => "transfer-completed",
             Self::TransferFailed { .. } => "transfer-failed",
+            Self::TransferInterrupted { .. } => "transfer-interrupted",
             Self::TransferPaused { .. } => "transfer-paused",
             Self::TransferResumed { .. } => "transfer-resumed",
             Self::TransferCancelled { .. } => "transfer-cancelled",
@@ -65,6 +67,7 @@ impl DomainEvent {
             Self::TransferProgress { progress }
             | Self::TransferCompleted { progress }
             | Self::TransferFailed { progress }
+            | Self::TransferInterrupted { progress }
             | Self::TransferPaused { progress }
             | Self::TransferResumed { progress }
             | Self::TransferCancelled { progress } => progress,
@@ -156,6 +159,9 @@ mod tests {
             DomainEvent::TransferFailed {
                 progress: progress.clone(),
             },
+            DomainEvent::TransferInterrupted {
+                progress: progress.clone(),
+            },
             DomainEvent::TransferPaused {
                 progress: progress.clone(),
             },
@@ -176,6 +182,7 @@ mod tests {
                 "transfer-progress",
                 "transfer-completed",
                 "transfer-failed",
+                "transfer-interrupted",
                 "transfer-paused",
                 "transfer-resumed",
                 "transfer-cancelled",
@@ -190,7 +197,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
 
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
     }
 
     #[test]

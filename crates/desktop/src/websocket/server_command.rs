@@ -21,7 +21,12 @@ pub enum ServerCommand {
     },
 
     #[serde(rename = "CANCEL_TRANSFER")]
-    CancelTransfer { transfer_id: String },
+    CancelTransfer {
+        // The backend has used both spellings across commands; accept either
+        // so a cancelled download is not silently dropped on a parse error.
+        #[serde(alias = "transferId")]
+        transfer_id: String,
+    },
 
     #[serde(rename = "TRANSFER_REQUEST")]
     TransferRequest { payload: TransferRequestPayload },

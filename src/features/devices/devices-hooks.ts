@@ -6,7 +6,6 @@ import {
   connectPairing,
   createPairing,
   fetchDeviceDetail,
-  fetchDeviceHealth,
   fetchDevices,
   registerDevice,
   removeDevice,
@@ -14,12 +13,10 @@ import {
   type ConnectPairingInput,
   type CreatePairingInput,
   type Device,
-  type DeviceHealthSummary,
   type OrganizationMember,
 } from './devices-api';
 
 const DEVICES_KEY = ['devices'];
-const DEVICE_HEALTH_KEY = ['device-health'];
 const MY_DEVICES_KEY = ['my-devices'];
 const ORGANIZATION_MEMBERS_KEY = ['organization-members'];
 const deviceDetailKey = (id: string) => ['device', id];
@@ -28,14 +25,6 @@ export function useDevices() {
   return useQuery({
     queryKey: DEVICES_KEY,
     queryFn: fetchDevices,
-    staleTime: 30_000,
-  });
-}
-
-export function useDeviceHealth() {
-  return useQuery({
-    queryKey: DEVICE_HEALTH_KEY,
-    queryFn: fetchDeviceHealth,
     staleTime: 30_000,
   });
 }
@@ -74,7 +63,6 @@ export function useDeviceDetail(id: string | undefined) {
 
 function invalidateDevices(qc: ReturnType<typeof useQueryClient>) {
   qc.invalidateQueries({ queryKey: DEVICES_KEY });
-  qc.invalidateQueries({ queryKey: DEVICE_HEALTH_KEY });
   qc.invalidateQueries({ queryKey: ['device'] });
 }
 
@@ -129,4 +117,3 @@ export function useCancelPairing() {
   });
 }
 
-export type { DeviceHealthSummary };

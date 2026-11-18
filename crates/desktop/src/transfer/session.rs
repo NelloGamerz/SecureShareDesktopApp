@@ -45,6 +45,8 @@
 //! engine still needs it, for the keychain and for progress, but it is no longer
 //! the thing that computes it.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::models::chunk::ChunkJob;
@@ -414,30 +416,22 @@ impl ProtocolSession for LegacyV1Session {
     }
 
     async fn send_chunk(&self, job: &ChunkJob, plaintext: Vec<u8>) -> Result<ChunkSendTimings> {
-        /*
-         * Compress first, if the receiver said it can decode it. This runs on
-         * the blocking pool because zstd is CPU-bound and several workers share
-         * the async executor; a 16 MiB chunk compressed inline would stall every
-         * other transfer task on this runtime.
-         *
-         * The original bytes come back from the closure so an incompressible
-         * chunk — or a compressor failure — costs nothing but the attempt.
-         */
         let plaintext_bytes = plaintext.len() as u64;
 
-        let mut compress = std::time::Duration::ZERO;
-
-        let (body, encoding) = match self.chunk_encoding() {
-            ChunkEncoding::Identity => (plaintext, ChunkEncoding::Identity),
-
-            /*
-             * Already-compressed formats are skipped per file: the attempt costs
-             * CPU and cannot shrink the chunk. The wire format does not change —
-             * this is the existing identity frame.
-             */
+        /*
+         * Compression is optional: an identity peer, or an already-compressed
+         * file, sends the plaintext unchanged. When it is on, the compressor and
+         * the cipher share one blocking task — one thread-pool hop instead of
+         * two — and the order is still compress, then seal.
+         */
+        let strategy = match self.chunk_encoding() {
             ChunkEncoding::Zstd
-                if compression::is_precompressed(std::path::Path::new(&job.relative_path)) =>
+                if !compression::is_precompressed(std::path::Path::new(&job.relative_path)) =>
             {
+                Some(compression::strategy())
+            }
+
+            ChunkEncoding::Zstd => {
                 tracing::debug!(
                     transfer_id=%job.transfer_id,
                     chunk=job.index,
@@ -445,99 +439,93 @@ impl ProtocolSession for LegacyV1Session {
                     "already-compressed file; sending the chunk as it is"
                 );
 
-                (plaintext, ChunkEncoding::Identity)
+                None
             }
 
-            ChunkEncoding::Zstd => {
-                // Content decides: zstd, or identity if this chunk did not shrink.
-                let strategy = compression::strategy();
-
-                let compress_started = std::time::Instant::now();
-
-                let (original, compressed) = tokio::task::spawn_blocking(move || {
-                    let compressed = strategy.compress(&plaintext);
-
-                    (plaintext, compressed)
-                })
-                .await
-                .map_err(|error| {
-                    TransferError::Compression(format!("the compression task failed: {error}"))
-                })?;
-
-                compress = compress_started.elapsed();
-
-                match compressed {
-                    Ok(Some(compressed)) => (compressed, strategy.encoding()),
-
-                    Ok(None) => {
-                        tracing::debug!(
-                            transfer_id=%job.transfer_id,
-                            chunk=job.index,
-                            "chunk does not compress; sending it as it is"
-                        );
-
-                        (original, ChunkEncoding::Identity)
-                    }
-
-                    /*
-                     * A failed compression is not a failed transfer. The bytes
-                     * are still exactly what the receiver expects, and sending
-                     * them uncompressed is the behaviour of every peer that has
-                     * never heard of compression.
-                     */
-                    Err(error) => {
-                        tracing::warn!(
-                            transfer_id=%job.transfer_id,
-                            chunk=job.index,
-                            error=%error,
-                            "chunk compression failed; sending it uncompressed"
-                        );
-
-                        (original, ChunkEncoding::Identity)
-                    }
-                }
-            }
+            ChunkEncoding::Identity => None,
         };
 
-        let body_bytes = body.len() as u64;
-
-        /*
-         * Encrypted here, per attempt, which is how a retry draws a fresh nonce:
-         * `upload::upload_chunk`'s loop calls this again, and this seals again.
-         * Sealing outside the loop would send the same ciphertext and nonce on
-         * every attempt, which on v1 is undetectable and on v2 is a nonce reuse.
-         */
-        /*
-         * Sealed on the blocking pool, in place.
-         *
-         * AES-GCM over a 16 MiB chunk is milliseconds of pure CPU, and several
-         * workers share this runtime — doing it inline stalls every other task
-         * for that long. The in-place form turns the plaintext buffer into
-         * ciphertext, so the chunk is not copied a second time.
-         */
         let key = self.key();
+        let transfer_id = job.transfer_id.clone();
+        let chunk_index = job.index;
 
-        let encrypt_started = std::time::Instant::now();
+        let task_started = std::time::Instant::now();
 
-        /*
-         * The CPU time is measured inside the blocking task, so the difference
-         * between the two numbers is how long the work waited for a thread in
-         * the pool. A large queue and a small CPU time means the runtime was
-         * saturated; the other way round means the cipher itself was slow.
-         */
-        let (encrypted, encrypt_cpu) = tokio::task::spawn_blocking(move || {
-            let cpu_started = std::time::Instant::now();
+        let (encrypted, body_bytes, compress, encrypt_cpu, encoding) =
+            tokio::task::spawn_blocking(move || {
+                let mut compress = std::time::Duration::ZERO;
 
-            let result = crypto::encrypt_chunk_in_place(&key, body);
+                let (body, encoding) = match strategy {
+                    Some(strategy) => {
+                        let compress_started = std::time::Instant::now();
 
-            (result, cpu_started.elapsed())
-        })
-        .await
-        .map_err(|error| TransferError::Crypto(format!("the encryption task failed: {error}")))?;
+                        let compressed = strategy.compress(&plaintext);
+
+                        compress = compress_started.elapsed();
+
+                        match compressed {
+                            Ok(Some(compressed)) => (compressed, strategy.encoding()),
+
+                            /*
+                             * A chunk that does not shrink, or a compressor that
+                             * failed, is a non-fatal miss: the bytes are still
+                             * exactly what the receiver expects.
+                             */
+                            Ok(None) => {
+                                tracing::debug!(
+                                    transfer_id=%transfer_id,
+                                    chunk=chunk_index,
+                                    "chunk does not compress; sending it as it is"
+                                );
+
+                                (plaintext, ChunkEncoding::Identity)
+                            }
+
+                            Err(error) => {
+                                tracing::warn!(
+                                    transfer_id=%transfer_id,
+                                    chunk=chunk_index,
+                                    error=%error,
+                                    "chunk compression failed; sending it uncompressed"
+                                );
+
+                                (plaintext, ChunkEncoding::Identity)
+                            }
+                        }
+                    }
+
+                    None => (plaintext, ChunkEncoding::Identity),
+                };
+
+                let body_bytes = body.len() as u64;
+
+                /*
+                 * Sealed per attempt, which is how a retry draws a fresh nonce:
+                 * `upload::upload_chunk`'s loop calls this again, and this seals
+                 * again. Sealing outside the loop would reuse a nonce on v2.
+                 *
+                 * The CPU time is measured around the seal alone, so the report
+                 * can tell cipher cost from the wait for a pool thread.
+                 */
+                let cpu_started = std::time::Instant::now();
+
+                let encrypted = crypto::encrypt_chunk_in_place(&key, body);
+
+                (encrypted, body_bytes, compress, cpu_started.elapsed(), encoding)
+            })
+            .await
+            .map_err(|error| {
+                TransferError::Crypto(format!("the chunk worker task failed: {error}"))
+            })?;
 
         let encrypted = encrypted.map_err(TransferError::Crypto)?;
 
-        let encrypt = encrypt_started.elapsed();
+        /*
+         * Queue + seal. The compressor's CPU time is subtracted because both
+         * operations now share one task and its queue wait cannot be split; the
+         * remainder still means "time not spent in the cipher".
+         */
+        let encrypt = task_started.elapsed().saturating_sub(compress);
 
         tracing::debug!(
             transfer_id = %job.transfer_id,
@@ -595,6 +583,197 @@ impl ProtocolSession for LegacyV1Session {
     }
 }
 
+/// A v1 session that can move to another route when the one it is on fails.
+///
+/// The receiver is the same machine whichever path reaches it, and v1's key is
+/// agreed with the *receiver*, not with the path — so changing medium is only
+/// changing the endpoint the next request is aimed at. The transfer stays live,
+/// the key and the chunk encoding carry over, and the engine above keeps
+/// sending the same jobs.
+///
+/// A failed request moves the session on and returns its error. That is
+/// deliberate: the engine's retry loop re-reads the chunk (which is also what
+/// makes the retry draw a fresh nonce), so the retry arrives on the new route
+/// with no extra copy of the chunk made here.
+///
+/// Routes cycle, best first. With only two media that means a dead direct path
+/// fails over to the tunnel, and a tunnel that later fails is retried on the
+/// direct path instead of giving up — self-healing without a probe timer.
+pub struct FailoverV1Session {
+    /// Best first. Index 0 is the route the transfer chose to start on.
+    routes: Vec<String>,
+    token: String,
+    /// The active route and the session aimed at it, swapped together so a
+    /// caller never sees a route index and a session that disagree.
+    state: tokio::sync::RwLock<(usize, Arc<LegacyV1Session>)>,
+    /// Serialises switching, so concurrent chunk workers produce one move.
+    switching: tokio::sync::Mutex<()>,
+}
+
+impl FailoverV1Session {
+    /// A session starting on the best route. An empty list is treated as one
+    /// unusable route, which fails every request rather than panicking.
+    pub fn new(routes: Vec<String>, token: impl Into<String>) -> Self {
+        let token = token.into();
+        let first = routes.first().cloned().unwrap_or_default();
+
+        Self {
+            routes,
+            token: token.clone(),
+            state: tokio::sync::RwLock::new((0, Arc::new(LegacyV1Session::to(first, token)))),
+            switching: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The endpoint the next request will be aimed at.
+    pub async fn active_endpoint(&self) -> String {
+        self.routes[self.state.read().await.0].clone()
+    }
+
+    async fn current(&self) -> (usize, Arc<LegacyV1Session>) {
+        let state = self.state.read().await;
+
+        (state.0, Arc::clone(&state.1))
+    }
+
+    /// Move on from `failed`, unless another worker already did.
+    ///
+    /// Returns whether a retry on the current route is worth attempting.
+    async fn advance_from(&self, failed: usize) -> bool {
+        if self.routes.len() < 2 {
+            return false;
+        }
+
+        let _guard = self.switching.lock().await;
+        let mut state = self.state.write().await;
+
+        if state.0 != failed {
+            // Another worker moved the session while this one was failing;
+            // retrying now lands on the new route.
+            return true;
+        }
+
+        let next = (failed + 1) % self.routes.len();
+        let previous = Arc::clone(&state.1);
+        let replacement = LegacyV1Session::to(self.routes[next].clone(), self.token.clone());
+
+        // Agreed with the receiver, not with a route: the replacement must
+        // encrypt exactly as the failed session did.
+        replacement.set_key(previous.key());
+        replacement.set_chunk_encoding(previous.chunk_encoding());
+
+        *state = (next, Arc::new(replacement));
+
+        tracing::warn!(
+            from = %self.routes[failed],
+            to = %self.routes[next],
+            "the active transfer medium is failing; switching to the next route"
+        );
+
+        true
+    }
+}
+
+impl std::fmt::Debug for FailoverV1Session {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FailoverV1Session")
+            .field("routes", &self.routes)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether an error means the medium could not carry the request.
+///
+/// Only transport failures switch routes. A receiver that answered — with a
+/// refusal, a missing chunk list, a malformed body — was reached, and moving to
+/// another path would send the same request to the same receiver again.
+fn is_transport(error: &TransferError) -> bool {
+    matches!(error, TransferError::Http(_))
+}
+
+#[async_trait]
+impl ProtocolSession for FailoverV1Session {
+    async fn capabilities(&self) -> Result<ReceiverCapabilities> {
+        let (index, session) = self.current().await;
+
+        match session.capabilities().await {
+            Err(error) if is_transport(&error) && self.advance_from(index).await => {
+                self.current().await.1.capabilities().await
+            }
+
+            other => other,
+        }
+    }
+
+    async fn resume_state(&self, transfer_id: &str) -> Result<Option<TransferResumeResponse>> {
+        let (index, session) = self.current().await;
+
+        match session.resume_state(transfer_id).await {
+            Err(error) if is_transport(&error) && self.advance_from(index).await => {
+                self.current().await.1.resume_state(transfer_id).await
+            }
+
+            other => other,
+        }
+    }
+
+    async fn open(&self, request: OpenRequest<'_>) -> Result<OpenedSession> {
+        // Every field is `Copy`, so the request can be rebuilt once for the
+        // fallback route. It is the one call the engine must not see fail for
+        // a reason a different path would have carried.
+        let OpenRequest {
+            transfer_id,
+            file_size,
+            expected,
+            existing_key,
+        } = request;
+
+        let retry = || OpenRequest {
+            transfer_id,
+            file_size,
+            expected,
+            existing_key,
+        };
+
+        let (index, session) = self.current().await;
+
+        match session.open(retry()).await {
+            Err(error) if is_transport(&error) && self.advance_from(index).await => {
+                self.current().await.1.open(retry()).await
+            }
+
+            other => other,
+        }
+    }
+
+    async fn send_chunk(&self, job: &ChunkJob, plaintext: Vec<u8>) -> Result<ChunkSendTimings> {
+        let (index, session) = self.current().await;
+
+        match session.send_chunk(job, plaintext).await {
+            Err(error) if is_transport(&error) => {
+                self.advance_from(index).await;
+                Err(error)
+            }
+
+            other => other,
+        }
+    }
+
+    async fn cancel(&self, transfer_id: &str) -> Result<()> {
+        let (index, session) = self.current().await;
+
+        match session.cancel(transfer_id).await {
+            Err(error) if is_transport(&error) && self.advance_from(index).await => {
+                self.current().await.1.cancel(transfer_id).await
+            }
+
+            other => other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +814,50 @@ mod tests {
         let session = LegacyV1Session::to("receiver.example", "token");
 
         assert_eq!(session.key(), [0u8; 32]);
+    }
+
+    /// A route that is refused at connect moves the session, and the key the
+    /// transfer agreed on stays in force on the new route.
+    #[tokio::test]
+    async fn a_failing_route_moves_the_session_and_keeps_the_key() {
+        let session = FailoverV1Session::new(
+            vec!["http://127.0.0.1:1".into(), "http://127.0.0.1:2".into()],
+            "token",
+        );
+
+        {
+            let state = session.state.read().await;
+            state.1.set_key([7u8; 32]);
+            state.1.set_chunk_encoding(ChunkEncoding::Zstd);
+        }
+
+        assert_eq!(session.active_endpoint().await, "http://127.0.0.1:1");
+
+        // Nothing listens on either loopback port, so this is a transport
+        // failure on the first route and a transport failure on the second.
+        session
+            .capabilities()
+            .await
+            .expect_err("nothing listens on the test ports");
+
+        assert_eq!(session.active_endpoint().await, "http://127.0.0.1:2");
+        assert_eq!(session.current().await.1.key(), [7u8; 32]);
+        assert_eq!(
+            session.current().await.1.chunk_encoding(),
+            ChunkEncoding::Zstd
+        );
+    }
+
+    /// With one route there is nowhere to move, and a dead one must not loop.
+    #[tokio::test]
+    async fn a_single_route_does_not_cycle() {
+        let session = FailoverV1Session::new(vec!["http://127.0.0.1:1".into()], "token");
+
+        session
+            .capabilities()
+            .await
+            .expect_err("nothing listens on the test port");
+
+        assert_eq!(session.active_endpoint().await, "http://127.0.0.1:1");
     }
 }

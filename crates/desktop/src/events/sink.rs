@@ -11,7 +11,14 @@ use tokio::sync::mpsc;
 use vilsend_core::{DomainEvent, EventSink, TransferProgress};
 
 /// How often buffered progress samples reach the webview.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Flush one transfer early once this many samples have been buffered.
+///
+/// The ticker alone would hold the newest sample for up to
+/// [`PROGRESS_INTERVAL`]; this bounds how stale a fast transfer can look
+/// without emitting once per chunk.
+const PROGRESS_BATCH_CHUNKS: u64 = 16;
 
 /// Emits domain events as Tauri events.
 ///
@@ -38,19 +45,44 @@ impl EventSink for TauriEventSink {
     }
 }
 
+/// One transfer's newest sample and how many samples are buffered behind it.
+struct Pending {
+    progress: TransferProgress,
+    samples: u64,
+}
+
 /// Holds the newest progress sample for each running transfer.
 #[derive(Default)]
 struct ProgressBuffer {
-    pending: HashMap<String, TransferProgress>,
+    pending: HashMap<String, Pending>,
 }
 
 impl ProgressBuffer {
-    fn insert(&mut self, progress: TransferProgress) {
-        self.pending.insert(progress.transfer_id.clone(), progress);
+    /// Buffer a sample, returning it for immediate emission when that
+    /// transfer's batch is full.
+    fn insert(&mut self, progress: TransferProgress) -> Option<TransferProgress> {
+        let transfer_id = progress.transfer_id.clone();
+
+        let entry = self.pending.entry(transfer_id.clone()).or_insert_with(|| Pending {
+            progress: progress.clone(),
+            samples: 0,
+        });
+
+        entry.progress = progress;
+        entry.samples += 1;
+
+        if entry.samples >= PROGRESS_BATCH_CHUNKS {
+            return self.pending.remove(&transfer_id).map(|pending| pending.progress);
+        }
+
+        None
     }
 
     fn take(&mut self) -> Vec<TransferProgress> {
-        self.pending.drain().map(|(_, progress)| progress).collect()
+        self.pending
+            .drain()
+            .map(|(_, pending)| pending.progress)
+            .collect()
     }
 
     fn remove(&mut self, transfer_id: &str) {
@@ -73,8 +105,13 @@ async fn run(app: AppHandle, mut rx: mpsc::UnboundedReceiver<DomainEvent>) {
                 let Some(event) = event else { return };
 
                 match event {
-                    // Keep the latest sample; the tick sends it.
-                    DomainEvent::TransferProgress { progress } => buffer.insert(progress),
+                    // Keep the latest sample; the tick sends it, unless a full
+                    // batch makes this one due now.
+                    DomainEvent::TransferProgress { progress } => {
+                        if let Some(progress) = buffer.insert(progress) {
+                            emit(&app, &DomainEvent::TransferProgress { progress });
+                        }
+                    }
                     // A state change is authoritative — drop the buffered
                     // sample for that transfer so it cannot arrive after this.
                     _ => {
@@ -148,5 +185,43 @@ mod tests {
         buffer.remove("t-1");
 
         assert!(buffer.take().is_empty());
+    }
+
+    #[test]
+    fn a_full_batch_flushes_the_newest_sample_immediately() {
+        let mut buffer = ProgressBuffer::default();
+
+        for uploaded in 0..15 {
+            assert!(
+                buffer.insert(progress("t-1", uploaded)).is_none(),
+                "fewer than 16 samples wait for the tick"
+            );
+        }
+
+        let flushed = buffer
+            .insert(progress("t-1", 15))
+            .expect("the sixteenth sample makes the batch due");
+
+        assert_eq!(flushed.uploaded_bytes, 15, "the newest sample is the one sent");
+        assert!(buffer.take().is_empty(), "the flush drained that transfer");
+    }
+
+    #[test]
+    fn batches_are_per_transfer() {
+        let mut buffer = ProgressBuffer::default();
+
+        for uploaded in 0..15 {
+            buffer.insert(progress("t-1", uploaded));
+            buffer.insert(progress("t-2", uploaded));
+        }
+
+        assert!(
+            buffer.insert(progress("t-2", 15)).is_some(),
+            "t-2 filled its own batch"
+        );
+        assert!(
+            buffer.insert(progress("t-1", 15)).is_some(),
+            "and so did t-1, independently"
+        );
     }
 }

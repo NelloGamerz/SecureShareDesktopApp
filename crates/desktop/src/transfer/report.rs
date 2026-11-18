@@ -2340,6 +2340,7 @@ pub(crate) fn status_name(status: TransferStatus) -> &'static str {
     match status {
         TransferStatus::Completed => "COMPLETED",
         TransferStatus::Failed => "FAILED",
+        TransferStatus::Interrupted => "INTERRUPTED",
         TransferStatus::Cancelled => "CANCELLED",
         TransferStatus::Pending => "PENDING",
         TransferStatus::Queued => "QUEUED",

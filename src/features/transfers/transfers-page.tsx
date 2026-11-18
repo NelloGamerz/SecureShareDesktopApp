@@ -1,15 +1,18 @@
 import * as React from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { motion } from "framer-motion";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
   // Download,
+  FolderOpen,
   Loader2,
   MoreHorizontal,
   Plus,
   Check,
   X,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -66,8 +69,23 @@ const statusVariant: Record<
   DOWNLOADING: "secondary",
   COMPLETED: "success",
   FAILED: "destructive",
+  INTERRUPTED: "destructive",
   CANCELLED: "destructive",
 };
+
+// States where cancelling still stops something — a sender's upload or a
+// receiver's download. Terminal states have nothing left to stop.
+const CANCELLABLE_STATUSES = new Set<string>([
+  "ACCEPTED",
+  "UPLOADING",
+  "DOWNLOADING",
+  "PAUSED",
+  "QUEUED",
+  "IN_PROGRESS",
+  "CONNECTING",
+  "WAITING_SENDER",
+  "HANDSHAKING",
+]);
 
 function formatFileSize(size: number) {
   if (size < 1024) {
@@ -172,7 +190,7 @@ export function TransfersPage() {
 
   const handleTransferAction = (
     transferId: string,
-    action: "ACCEPT" | "REJECT" | "CANCEL",
+    action: "ACCEPT" | "REJECT" | "CANCEL" | "RESUME",
     requestId?: string,
   ) => {
     transferAction.mutate(
@@ -198,6 +216,17 @@ export function TransfersPage() {
         request.transfer_id,
       );
     });
+  };
+
+  // The Rust side resolves the download location and shows the file there.
+  // Whatever went wrong, the toast stays a plain "File not available" — the
+  // path is not something to surface.
+  const handleOpenFile = async (fileName: string) => {
+    try {
+      await invoke("open_received_file", { fileName });
+    } catch {
+      toast.error("File not available");
+    }
   };
 
   return (
@@ -554,6 +583,15 @@ export function TransfersPage() {
                                 </>
                               )}
 
+                            {!t.sentByMe && t.status === "COMPLETED" && (
+                              <DropdownMenuItem
+                                onClick={() => handleOpenFile(t.fileName)}
+                              >
+                                <FolderOpen className="mr-2 h-4 w-4" />
+                                Open file location
+                              </DropdownMenuItem>
+                            )}
+
                             {t.status === "UPLOADING" && (
                               <DropdownMenuItem
                                 onClick={() =>
@@ -580,26 +618,26 @@ export function TransfersPage() {
                               </DropdownMenuItem>
                             )}
 
-                            {/* <DropdownMenuItem
-                              className="text-destructive"
-                              onClick={() =>
-                                controls.mutate({
-                                  transferId: t.id,
-                                  action: "CANCEL",
-                                })
-                              }
-                            >
-                              Cancel
-                            </DropdownMenuItem> */}
-
-                            {t.sentByMe && t.status === "PENDING" && (
+                            {((t.sentByMe && t.status === "PENDING") ||
+                              CANCELLABLE_STATUSES.has(t.status)) && (
                               <DropdownMenuItem
                                 className="text-destructive"
                                 onClick={() =>
                                   handleTransferAction(t.id, "CANCEL")
                                 }
                               >
+                                <X className="mr-2 h-4 w-4" />
                                 Cancel
+                              </DropdownMenuItem>
+                            )}
+
+                            {!t.sentByMe && t.status === "INTERRUPTED" && (
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  handleTransferAction(t.id, "RESUME")
+                                }
+                              >
+                                Resume
                               </DropdownMenuItem>
                             )}
 

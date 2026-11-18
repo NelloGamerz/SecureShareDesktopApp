@@ -26,7 +26,7 @@ Both are negotiated, never assumed, because the v1 wire and its installed receiv
 
 ## Receiver path
 
-The receiver creates an in-memory transfer key and download state during `/transfer/start`. Each chunk is authenticated/decrypted, path-checked for absolute paths and `..`, written to `app-data/transfers/incoming/<transfer>/<file>/<index>.part`, and merged into the configured download directory after all indices exist. Merge writes a `.transfer-tmp` file and renames it into place.
+The receiver creates an in-memory transfer key and download state during `/transfer/start`. Each chunk is authenticated/decrypted, path-checked for absolute paths and `..`, written to `<download-root>/.vilsend/incoming/<transfer>/<file>/<index>.part` (or, for a described layout, directly into an `assembly` file at its offset), and merged into the configured download directory after all indices exist. Staging lives under the download root so the final rename stays on one volume. Merge writes a `.transfer-tmp` file and renames it into place.
 
 ```mermaid
 sequenceDiagram

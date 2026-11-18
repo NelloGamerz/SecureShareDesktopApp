@@ -281,7 +281,7 @@ impl Receiver {
     fn assembly_path(&self, file_id: &str) -> PathBuf {
         let parts = self
             .state
-            .root
+            .staging_root
             .join("incoming")
             .join(TRANSFER)
             .join(file_id);
@@ -333,6 +333,7 @@ impl Drop for Receiver {
 struct Sender {
     manager: UploadManager,
     endpoint: String,
+    fallback_endpoint: Option<String>,
     chunk_size: usize,
     concurrency: usize,
 }
@@ -351,6 +352,7 @@ impl Sender {
             receiver_public_key: String::new(),
             network_type: ConnectionType::Lan,
             endpoint: self.endpoint.clone(),
+            fallback_endpoint: self.fallback_endpoint.clone(),
             auth_token: TOKEN.into(),
             chunk_size: Some(self.chunk_size),
             concurrency: Some(self.concurrency),
@@ -418,7 +420,9 @@ impl Sender {
             assert!(
                 !matches!(
                     status.status,
-                    TransferStatus::Completed | TransferStatus::Failed
+                    TransferStatus::Completed
+                        | TransferStatus::Failed
+                        | TransferStatus::Interrupted
                 ),
                 "the transfer finished before it could be interrupted"
             );
@@ -443,7 +447,9 @@ impl Sender {
 
             if matches!(
                 status.status,
-                TransferStatus::Completed | TransferStatus::Failed
+                TransferStatus::Completed
+                    | TransferStatus::Failed
+                    | TransferStatus::Interrupted
             ) {
                 return status;
             }
@@ -633,6 +639,7 @@ impl Harness {
                 )),
             ),
             endpoint: receiver.endpoint.clone(),
+            fallback_endpoint: None,
             chunk_size,
             concurrency,
         }
@@ -654,7 +661,10 @@ impl Harness {
     }
 
     fn transfer_dir(&self) -> PathBuf {
-        self.root.join("incoming").join(TRANSFER)
+        self.downloads
+            .join(".vilsend")
+            .join("incoming")
+            .join(TRANSFER)
     }
 
     fn destination(&self) -> PathBuf {
@@ -795,6 +805,32 @@ async fn a_receiver_that_restarts_keeps_the_chunks_it_already_had() {
  * 7. A chunk that fails in flight
  * ----------------------------------------------------------------------
  */
+
+#[tokio::test]
+async fn a_transfer_whose_direct_path_dies_completes_over_the_fallback() {
+    let harness = Harness::new(chunks()).await;
+    let receiver = harness.receiver().await;
+
+    let mut sender = harness.sender(&receiver).await;
+
+    /*
+     * The direct path the manifest selected is gone (nothing listens there),
+     * and the tunnel route is kept as the fallback. Every phase of the
+     * transfer — capabilities, resume query, handshake, chunks — has to move
+     * to it without a restart.
+     */
+    sender.fallback_endpoint = Some(receiver.endpoint.clone());
+    sender.endpoint = "http://127.0.0.1:1".into();
+
+    sender.start().await;
+
+    assert_eq!(
+        sender.settle().await.status,
+        TransferStatus::Completed,
+        "the transfer must follow the fallback route to completion"
+    );
+    harness.assert_delivered();
+}
 
 #[tokio::test]
 async fn a_chunk_that_fails_in_flight_is_sent_again() {
@@ -999,7 +1035,7 @@ async fn a_chunk_that_goes_bad_mid_transfer_is_resent_rather_than_published() {
  */
 
 #[tokio::test]
-async fn a_chunk_the_receiver_keeps_refusing_fails_the_transfer_and_resumes_later() {
+async fn a_chunk_the_receiver_keeps_refusing_interrupts_the_transfer_and_resumes_later() {
     let harness = Harness::new(6).await;
     let receiver = harness.receiver().await;
 
@@ -1012,8 +1048,8 @@ async fn a_chunk_the_receiver_keeps_refusing_fails_the_transfer_and_resumes_late
 
     assert_eq!(
         failed.status,
-        TransferStatus::Failed,
-        "a worker that cannot deliver its chunk fails the transfer; it does not sit in Uploading"
+        TransferStatus::Interrupted,
+        "a worker that cannot deliver its chunk interrupts the transfer; it does not sit in Uploading"
     );
 
     // Whatever was wrong stops being wrong, and the transfer is picked back up.
@@ -1091,6 +1127,87 @@ async fn cancelling_a_transfer_clears_both_sides_and_stays_cleared() {
         sender.manager.restore_persisted().await,
         0,
         "and the sender does not restore it either"
+    );
+}
+
+#[tokio::test]
+async fn a_receiver_can_cancel_what_it_is_holding() {
+    let harness = Harness::new(chunks()).await;
+    harness.pace_chunks(Duration::from_millis(15));
+    let receiver = harness.receiver().await;
+
+    let sender = harness.sender(&receiver).await;
+    sender.start().await;
+    sender.stop_after(&harness, 2).await;
+
+    assert!(
+        harness.transfer_dir().exists(),
+        "the receiver is holding part of the transfer"
+    );
+
+    // What the shell does when the receiving user cancels: no sender involved.
+    assert!(
+        receiver
+            .state
+            .cancel_download(TRANSFER, "cancelled by the user")
+            .await
+            .expect("cancelling from the receiver"),
+        "the receiver knew of the transfer it was holding"
+    );
+
+    assert!(
+        !harness.transfer_dir().exists(),
+        "the receiver drops the parts and the manifest"
+    );
+    assert!(
+        !receiver.state.downloads.read().await.contains_key(TRANSFER),
+        "and stops its workers"
+    );
+}
+
+#[tokio::test]
+async fn a_silent_receiver_marks_the_transfer_interrupted_and_keeps_its_parts() {
+    let harness = Harness::new(chunks()).await;
+    harness.pace_chunks(Duration::from_millis(15));
+    let receiver = harness.receiver().await;
+
+    let sender = harness.sender(&receiver).await;
+    sender.start().await;
+    sender.stop_after(&harness, 2).await;
+
+    // The sender has gone quiet. Backdate the last chunk so the watchdog sees
+    // a stall instead of waiting out the real timeout.
+    let download = receiver
+        .state
+        .downloads
+        .read()
+        .await
+        .get(TRANSFER)
+        .cloned()
+        .expect("the receiver is holding the transfer");
+
+    *download
+        .last_activity
+        .lock()
+        .expect("activity lock poisoned") =
+        std::time::Instant::now() - Duration::from_secs(3_600);
+
+    assert_eq!(
+        receiver
+            .state
+            .interrupt_stalled(Duration::from_secs(1))
+            .await,
+        vec![TRANSFER.to_string()],
+        "the watchdog interrupts the transfer it saw go silent"
+    );
+
+    assert!(
+        harness.transfer_dir().exists(),
+        "the parts stay on disk so the transfer can be resumed"
+    );
+    assert!(
+        !receiver.state.downloads.read().await.contains_key(TRANSFER),
+        "and the receiver stops tracking it as live"
     );
 }
 
@@ -1459,5 +1576,95 @@ async fn bench_upload_matrix() {
                 );
             }
         }
+    }
+}
+
+/// Two transfers, one after the other, through the *same* manager — which
+/// is what the application does for its whole life. A resource the first
+/// transfer takes and never gives back shows up here and nowhere else,
+/// because every other test builds a fresh manager for each transfer.
+#[tokio::test]
+async fn a_second_transfer_starts_after_the_first_one_finishes() {
+    let harness = Harness::new(chunks()).await;
+    let receiver = harness.receiver().await;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("an in-memory database");
+
+    let local_files = Arc::new(LocalTransferFileService::new(pool).await);
+
+    let ids = ["t-first", "t-second"];
+
+    for id in ids {
+        local_files
+            .insert(LocalTransferFile {
+                transfer_id: id.into(),
+                file_path: harness.source.to_string_lossy().into_owned(),
+                file_name: "a.bin".into(),
+                file_size: harness.size,
+            })
+            .await
+            .expect("registering the file with the sender");
+    }
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let manager = UploadManager::new(
+        Arc::new(RecordingEventSink::new()),
+        harness.scratch.path().join("uploads"),
+        local_files,
+        tx,
+        Arc::new(TransferStore::new(
+            harness.state_dir.clone(),
+            Arc::clone(&harness.secrets),
+        )),
+    );
+
+    for id in ids {
+        manager
+            .start(TransferMetadata {
+                transfer_id: id.into(),
+                receiver_public_key: String::new(),
+                network_type: ConnectionType::Lan,
+                endpoint: receiver.endpoint.clone(),
+                fallback_endpoint: None,
+                auth_token: TOKEN.into(),
+                chunk_size: Some(CHUNK),
+                concurrency: Some(1),
+                max_retries: Some(RETRIES),
+                transport: None,
+                transport_manifest: None,
+            })
+            .await
+            .expect("the sender must accept the transfer");
+
+        let mut settled = None;
+
+        for _ in 0..5_000 {
+            let status = manager.status(id).expect("the transfer is known");
+
+            if matches!(
+                status.status,
+                TransferStatus::Completed
+                    | TransferStatus::Failed
+                    | TransferStatus::Interrupted
+            ) {
+                settled = Some(status);
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let settled = settled.unwrap_or_else(|| panic!("{id} never settled"));
+
+        assert_eq!(
+            settled.status,
+            TransferStatus::Completed,
+            "{id} did not complete: {settled:?}"
+        );
     }
 }

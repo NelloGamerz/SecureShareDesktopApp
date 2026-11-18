@@ -3,6 +3,7 @@
   "Completed": "COMPLETED",
   "Downloading": "DOWNLOADING",
   "Failed": "FAILED",
+  "Interrupted": "INTERRUPTED",
   "Paused": "PAUSED",
   "Pending": "PENDING",
   "Queued": "QUEUED",

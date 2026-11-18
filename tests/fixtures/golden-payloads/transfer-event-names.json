@@ -2,6 +2,7 @@
   "transfer-progress",
   "transfer-completed",
   "transfer-failed",
+  "transfer-interrupted",
   "transfer-paused",
   "transfer-resumed",
   "transfer-cancelled"

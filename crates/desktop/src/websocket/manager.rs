@@ -19,7 +19,7 @@ use crate::state::AuthState;
 use crate::websocket::{
     heartbeat::heartbeat_loop, reconnect::backoff_delay, WebSocketClient, WebSocketSender,
 };
-
+ 
 /// Counts live manager tasks during tests, so an orphaned task is observable.
 #[cfg(test)]
 static LIVE_TASKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

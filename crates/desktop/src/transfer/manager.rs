@@ -7,7 +7,9 @@ use crate::transfer::network_report;
 use crate::transfer::report;
 use crate::transfer::resume;
 use crate::transfer::transport_manifest::TransportManifest;
-use crate::transfer::session::{LegacyV1Session, OpenRequest, ProtocolSession};
+use crate::transfer::session::{
+    FailoverV1Session, LegacyV1Session, OpenRequest, ProtocolSession,
+};
 use crate::{
     models::transfer::{TransferMetadata, TransferStatus, TransferStatusResponse},
     transfer::{
@@ -61,6 +63,9 @@ pub(crate) const DESCRIBE_DIGESTS: bool = false;
 pub enum TransferEvent {
     Completed(String),
     Failed(String, String),
+    /// The transfer stopped without finishing — the connection or the peer
+    /// went away — and can be resumed. The reason is for the backend's log.
+    Interrupted(String, String),
 }
 
 #[derive(Clone)]
@@ -162,7 +167,10 @@ impl UploadManager {
              */
             if matches!(
                 status,
-                TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Cancelled
+                TransferStatus::Completed
+                    | TransferStatus::Failed
+                    | TransferStatus::Interrupted
+                    | TransferStatus::Cancelled
             ) {
                 self.recover_report(&state).await;
             }
@@ -275,8 +283,15 @@ impl UploadManager {
          * it here rather than reaching for an `HttpClient` at each call site is
          * what leaves room for a second session type later — a failover replaces
          * this value, and nothing downstream changes.
+         *
+         * Best route first. The dispatcher keeps the tunnel endpoint when a
+         * direct path won the selection, so a direct path that dies mid-transfer
+         * moves the session to the tunnel instead of failing the transfer.
          */
-        let session = LegacyV1Session::to(metadata.endpoint.clone(), metadata.auth_token.clone());
+        let mut routes = vec![metadata.endpoint.clone()];
+        routes.extend(metadata.fallback_endpoint.clone());
+
+        let session = FailoverV1Session::new(routes, metadata.auth_token.clone());
 
         /*
          * What the receiver will accept, asked before anything is planned.
@@ -717,7 +732,12 @@ impl UploadManager {
                         )
                         .await
                 }
-                Err(error) => manager.fail_transfer(&state, "upload", error).await,
+                Err(error) if error.interrupted => {
+                    manager
+                        .interrupt_transfer(&state, "upload", error.message)
+                        .await
+                }
+                Err(error) => manager.fail_transfer(&state, "upload", error.message).await,
             };
 
             /*
@@ -761,6 +781,38 @@ impl UploadManager {
         .await;
 
         TransferEvent::Failed(state.transfer_id.clone(), error)
+    }
+
+    /// Move a transfer to `Interrupted` and report why.
+    ///
+    /// Used for a transfer that stopped mid-flight for reasons outside its own
+    /// content — a dropped connection, an unreachable peer, a session that
+    /// ended. The chunks already delivered are kept, so resuming sends only
+    /// what is missing; marking it `Failed` would claim the transfer itself was
+    /// wrong.
+    async fn interrupt_transfer(
+        &self,
+        state: &Arc<UploadState>,
+        stage: &str,
+        error: String,
+    ) -> TransferEvent {
+        *state.status.lock().expect("status lock poisoned") = TransferStatus::Interrupted;
+        tracing::warn!(transfer_id=%state.transfer_id,error=%error,"transfer interrupted");
+        self.events.emit(DomainEvent::TransferInterrupted {
+            progress: progress::make(state),
+        });
+
+        self.finalize_report(
+            state,
+            TransferStatus::Interrupted,
+            None,
+            Some(stage.to_owned()),
+            Some(error.clone()),
+            false,
+        )
+        .await;
+
+        TransferEvent::Interrupted(state.transfer_id.clone(), error)
     }
 
     /// Refresh the network report: the paths from the start request plus how
@@ -1346,13 +1398,13 @@ impl UploadManager {
         }
 
         /*
-         * A `Failed` transfer is resumable even if its dying scheduler has not
+         * A `Failed` or `Interrupted` transfer is resumable even if its dying scheduler has not
          * quite finished clearing the running flag, which is why the status is
          * consulted as well as the flag.
          */
         let failed = matches!(
             *s.status.lock().expect("status lock poisoned"),
-            TransferStatus::Failed
+            TransferStatus::Failed | TransferStatus::Interrupted
         );
 
         if !s.is_running() || failed {
@@ -1971,6 +2023,7 @@ mod tests {
             receiver_public_key: String::new(),
             network_type: ConnectionType::Lan,
             endpoint: "https://receiver.example".into(),
+            fallback_endpoint: None,
             auth_token: "token".into(),
             chunk_size: Some(1024),
             concurrency: Some(1),
@@ -2094,6 +2147,7 @@ mod tests {
             receiver_public_key: String::new(),
             network_type: ConnectionType::Lan,
             endpoint: "https://receiver.example".into(),
+            fallback_endpoint: None,
             auth_token: String::new(),
             chunk_size: None,
             concurrency: None,
@@ -2494,6 +2548,7 @@ mod resume_tests {
             receiver_public_key: String::new(),
             network_type: crate::models::transfer::ConnectionType::Lan,
             endpoint: endpoint.to_string(),
+            fallback_endpoint: None,
             auth_token: "a-token".into(),
             chunk_size: Some(CHUNK),
             concurrency: Some(1),

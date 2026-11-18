@@ -204,7 +204,7 @@ mod chunks_serde {
 }
 
 /// A transfer's completed chunks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Manifest {
     /// Format version. See [`MANIFEST_VERSION`].
     pub version: u32,
@@ -239,6 +239,51 @@ pub struct Manifest {
     /// from the entries, each of which records its own offset.
     #[serde(skip)]
     layouts: HashMap<u64, bool>,
+    /// How many distinct chunks are recorded per file.
+    ///
+    /// Maintained by [`record`](Self::record) and
+    /// [`forget`](Self::forget), rebuilt from `chunks` on load, so
+    /// [`all_chunks_recorded`] is O(1) instead of a scan per arriving chunk.
+    /// Kept under the same manifest lock as `chunks`, so concurrent writers see
+    /// one consistent count.
+    #[serde(skip)]
+    recorded_counts: HashMap<u64, u64>,
+}
+
+/// Rebuilds the runtime-only fields, including `recorded_counts`, after a
+/// manifest is read from disk. Serde cannot derive this because the counter
+/// must be derived from `chunks`.
+impl<'de> Deserialize<'de> for Manifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            version: u32,
+            transfer_id: String,
+            #[serde(default, with = "chunks_serde")]
+            chunks: HashMap<ChunkKey, ChunkEntry>,
+            #[serde(default)]
+            expected: Option<crate::transfer::integrity::ExpectedTransfer>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+
+        let mut manifest = Manifest {
+            version: wire.version,
+            transfer_id: wire.transfer_id,
+            chunks: wire.chunks,
+            expected: wire.expected,
+            chunk_size: None,
+            layouts: HashMap::new(),
+            recorded_counts: HashMap::new(),
+        };
+
+        manifest.rebuild_recorded_counts();
+
+        Ok(manifest)
+    }
 }
 
 impl Manifest {
@@ -267,6 +312,7 @@ impl Manifest {
             expected: None,
             chunk_size: None,
             layouts: HashMap::new(),
+            recorded_counts: HashMap::new(),
         }
     }
 
@@ -310,8 +356,30 @@ impl Manifest {
     /// for the same (file, index) is overwritten whole, including its length,
     /// hash and mtime.
     pub fn record(&mut self, entry: ChunkEntry) {
-        self.chunks
-            .insert(chunk_key(&entry.file_id, entry.chunk_index), entry);
+        let key = chunk_key(&entry.file_id, entry.chunk_index);
+
+        // A retry replaces the whole entry; only a new index changes the count.
+        if self.chunks.insert(key, entry).is_none() {
+            *self.recorded_counts.entry(key.0).or_insert(0) += 1;
+        }
+    }
+
+    /// Derive the per-file counts from `chunks`. Used after a load or a journal
+    /// replay, where the map was filled without going through `record`.
+    fn rebuild_recorded_counts(&mut self) {
+        self.recorded_counts.clear();
+
+        for entry in self.chunks.values() {
+            *self.recorded_counts.entry(file_key(&entry.file_id)).or_insert(0) += 1;
+        }
+    }
+
+    /// How many distinct chunks are recorded for one file. O(1).
+    fn recorded_count(&self, file_id: &str) -> u64 {
+        self.recorded_counts
+            .get(&file_key(file_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Drop any record of one chunk, so it reads as never received.
@@ -319,7 +387,17 @@ impl Manifest {
     /// Used when a chunk's bytes are found not to match its entry: the claim
     /// has to go, or the next run would skip a chunk known to be wrong.
     pub fn forget(&mut self, file_id: &str, chunk_index: u64) {
-        self.chunks.remove(&chunk_key(file_id, chunk_index));
+        let key = chunk_key(file_id, chunk_index);
+
+        if self.chunks.remove(&key).is_some() {
+            if let Some(count) = self.recorded_counts.get_mut(&key.0) {
+                *count = count.saturating_sub(1);
+
+                if *count == 0 {
+                    self.recorded_counts.remove(&key.0);
+                }
+            }
+        }
     }
 
     /// Drop every chunk of one file, after it has been published.
@@ -327,6 +405,7 @@ impl Manifest {
         let file = file_key(file_id);
 
         self.chunks.retain(|key, _| key.0 != file);
+        self.recorded_counts.remove(&file);
     }
 
     /// Where a chunk's bytes go, decided once per file.
@@ -354,6 +433,13 @@ impl Manifest {
         total: u64,
         chunk_length: u64,
     ) -> Placement {
+        // An index outside the file is refused in every layout. The counter
+        // can only equal `total` when every recorded index is in range, so
+        // completion stays exact.
+        if total == 0 || chunk_index >= total {
+            return Placement::Invalid;
+        }
+
         let key = file_key(file_id);
 
         match self.layouts.get(&key) {
@@ -1285,7 +1371,7 @@ pub async fn chunk_complete(
 /// A gap — an index with no entry at all — is still a gap: a chunk that never
 /// arrived is one the sender still owes, and there is nothing to check.
 pub fn all_chunks_recorded(record: &Manifest, file_id: &str, total: u64) -> bool {
-    (0..total).all(|index| record.entry(file_id, index).is_some())
+    record.recorded_count(file_id) == total
 }
 
 /// The result of hashing every chunk of a file.
@@ -1846,6 +1932,75 @@ mod tests {
         let reloaded = load(&dir).await.expect("reading").expect("present");
 
         assert_eq!(reloaded.chunks.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_and_retried_chunks_keep_the_count_exact() {
+        let mut manifest = Manifest::new("t-manifest");
+
+        manifest.record(entry("f-1", 0, b"first"));
+        // The same index again is a retry, not a second chunk.
+        manifest.record(entry("f-1", 0, b"retry"));
+        manifest.record(entry("f-1", 1, b"second"));
+
+        assert!(all_chunks_recorded(&manifest, "f-1", 2));
+        assert!(!all_chunks_recorded(&manifest, "f-1", 3));
+
+        manifest.forget("f-1", 0);
+        assert!(
+            !all_chunks_recorded(&manifest, "f-1", 2),
+            "a forgotten chunk is owed again"
+        );
+
+        manifest.record(entry("f-1", 0, b"resent"));
+        assert!(all_chunks_recorded(&manifest, "f-1", 2));
+    }
+
+    #[tokio::test]
+    async fn a_restart_rebuilds_the_per_file_count() {
+        let scratch = TempDir::new();
+        let dir = scratch.transfer_dir();
+
+        let mut manifest = Manifest::new("t-manifest");
+        manifest.record(entry("f-1", 0, b"zero"));
+        manifest.record(entry("f-1", 1, b"one"));
+        store(&dir, &manifest).await.expect("storing");
+
+        let recovered = load_or_default(&dir, "t-manifest").await;
+
+        assert!(all_chunks_recorded(&recovered, "f-1", 2));
+        assert!(!all_chunks_recorded(&recovered, "f-1", 3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_retries_count_each_chunk_once() {
+        let manifest = std::sync::Arc::new(Mutex::new(Manifest::new("t-manifest")));
+        let mut tasks = Vec::new();
+
+        for index in 0..64u64 {
+            let manifest = std::sync::Arc::clone(&manifest);
+
+            tasks.push(tokio::spawn(async move {
+                // Two racing attempts per chunk: exactly one may be counted.
+                for _ in 0..2 {
+                    manifest.lock().await.record(entry("f-1", index, b"chunk"));
+                }
+            }));
+        }
+
+        for task in tasks {
+            task.await.expect("task");
+        }
+
+        assert!(all_chunks_recorded(&*manifest.lock().await, "f-1", 64));
+    }
+
+    #[test]
+    fn a_chunk_index_outside_the_file_is_invalid() {
+        let mut manifest = Manifest::new("t-manifest");
+
+        assert_eq!(manifest.place("f-1", 3, 3, 10), Placement::Invalid);
+        assert_eq!(manifest.place("f-1", 0, 0, 10), Placement::Invalid);
     }
 
     /*

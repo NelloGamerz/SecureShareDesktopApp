@@ -60,8 +60,8 @@ use commands::auth::{
 };
 
 use commands::transfer_commands::{
-    build_transport_manifest, cancel_transfer, get_transfer_status, pause_transfer,
-    resume_transfer, start_transfer,
+    build_transport_manifest, cancel_received_transfer, cancel_transfer, get_transfer_status,
+    open_received_file, pause_transfer, resume_transfer, start_transfer,
 };
 
 #[cfg(feature = "enable-updater")]
@@ -239,6 +239,10 @@ pub fn run() {
 
             let dispatcher2 = Arc::clone(&app_state.event_dispatcher);
 
+            // Held for the receiver once it exists below: a backend
+            // `CANCEL_TRANSFER` for a download has to reach it.
+            let cancel_dispatcher = Arc::clone(&app_state.event_dispatcher);
+
             /*
              * Start transfer event listener
              */
@@ -346,6 +350,17 @@ pub fn run() {
             // Held for the cleanup task below, which outlives the server's copy.
             let cleanup_state = receiver_state.clone();
 
+            // The shell cancels a transfer it is receiving through this same
+            // state, so the UI can stop a download without a sender involved.
+            app.manage(receiver_state.clone());
+
+            // The backend's `CANCEL_TRANSFER` reaches the receiver the same way.
+            cancel_dispatcher.attach_receiver(receiver_state.clone());
+
+            // Held for the stall watchdog below, which outlives the server's copy.
+            let watchdog_state = receiver_state.clone();
+            let watchdog_dispatcher = Arc::clone(&cancel_dispatcher);
+
             tauri::async_runtime::spawn(async move {
                 let address =
                     std::net::SocketAddr::from(([0, 0, 0, 0], transfer::constants::RECEIVER_PORT));
@@ -399,6 +414,41 @@ pub fn run() {
             });
 
             /*
+             * The receiver's own interruption detector.
+             *
+             * Both sides report the interruptions they see. For the receiver
+             * that is silence: the sender simply stops sending, and without
+             * this the transfer would sit in `Downloading` until the TTL sweep.
+             * Reporting it as interrupted is what lets the user resume from the
+             * backend instead of starting over.
+             */
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(transfer::constants::DOWNLOAD_STALL_CHECK_INTERVAL)
+                        .await;
+
+                    for transfer_id in watchdog_state
+                        .interrupt_stalled(transfer::constants::DOWNLOAD_STALL_TIMEOUT)
+                        .await
+                    {
+                        if let Err(error) = watchdog_dispatcher
+                            .notify_transfer_interrupted(
+                                &transfer_id,
+                                "the sender stopped sending; the transfer can be resumed",
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                %transfer_id,
+                                %error,
+                                "could not report an interrupted transfer"
+                            );
+                        }
+                    }
+                }
+            });
+
+            /*
              * Log the stored tunnel hostname so a startup can confirm what the
              * app will advertise without opening the UI. A missing hostname is
              * expected before onboarding, so it is logged as a warning.
@@ -442,7 +492,9 @@ pub fn run() {
             pause_transfer,
             resume_transfer,
             cancel_transfer,
+            cancel_received_transfer,
             get_transfer_status,
+            open_received_file,
             save_tunnel_hostname,
             get_tunnel_hostname,
             delete_tunnel_hostname,

@@ -48,14 +48,6 @@ export interface DeviceDetail extends Device {
   recentTransfers: DeviceTransfer[];
 }
 
-export interface DeviceHealthSummary {
-  total: number;
-  online: number;
-  healthy: number;
-  warning: number;
-  critical: number;
-}
-
 export interface PairingSession {
   id: string;
   pairingCode: string;
@@ -72,11 +64,6 @@ export interface PairingSession {
 
 export async function fetchDevices(): Promise<Device[]> {
   const { data } = await api.get<Device[]>("/devices");
-  return data;
-}
-
-export async function fetchDeviceHealth(): Promise<DeviceHealthSummary> {
-  const { data } = await api.get<DeviceHealthSummary>("/devices/health");
   return data;
 }
 

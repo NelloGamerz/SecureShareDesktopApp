@@ -14,7 +14,7 @@ import {
   // WifiOff,
   type LucideIcon,
 } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 // import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -29,7 +29,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PageContainer, PageHeader } from "@/components/layout/page-header";
-import { useDevices, useDeviceHealth } from "./devices-hooks";
+import { useDevices } from "./devices-hooks";
 import { RenameDeviceDialog, RemoveDeviceDialog } from "./devices-dialogs";
 import type { Device, DeviceStatus } from "./devices-api";
 import { formatRelativeTime } from "@/lib/format";
@@ -69,7 +69,21 @@ export const statusVariant: Record<DeviceStatus, "success" | "secondary" | "defa
 
 export function DevicesPage() {
   const { data: devices, isLoading, isError, error, refetch } = useDevices();
-  const { data: health } = useDeviceHealth();
+
+  // Derived from the device list already on hand, so the page makes no separate
+  // health request. Thresholds match the per-device health colouring.
+  const health = useMemo(() => {
+    const all = devices ?? [];
+
+    return {
+      total: all.length,
+      online: all.filter((device) => device.status === "online").length,
+      warning: all.filter(
+        (device) => device.health < 80 && device.health >= 50,
+      ).length,
+      critical: all.filter((device) => device.health < 50).length,
+    };
+  }, [devices]);
 
   const [renameDevice, setRenameDevice] = useState<Device | null>(null);
   const [removeDevice, setRemoveDevice] = useState<Device | null>(null);
@@ -100,7 +114,7 @@ export function DevicesPage() {
       />
 
       {/* Health summary */}
-      {health && (
+      {health.total > 0 && (
         <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
           <HealthChip label="Total" value={health.total} />
           <HealthChip

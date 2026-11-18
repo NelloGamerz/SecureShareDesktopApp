@@ -559,7 +559,7 @@ async fn store_chunk(
         "chunk persisted"
     );
 
-    tracing::info!(
+    tracing::debug!(
         transfer_id,
         chunk = chunk_index,
         path = %part.display(),
@@ -706,7 +706,7 @@ pub(crate) async fn finish(
         phases.verification_seconds = Some(verification_started.elapsed().as_secs_f64());
     }
 
-    tracing::info!(
+    tracing::debug!(
         transfer_id,
         file_id,
         total_chunks,
@@ -1444,11 +1444,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    struct TestHost;
+    struct TestHost(std::path::PathBuf);
 
     impl crate::transfer::writer::ReceiverHost for TestHost {
         fn downloads_root(&self) -> std::result::Result<std::path::PathBuf, String> {
-            Ok(std::env::temp_dir())
+            Ok(self.0.clone())
         }
 
         fn available_space(&self, _path: &std::path::Path) -> std::result::Result<u64, String> {
@@ -1473,6 +1473,7 @@ mod tests {
             paused: std::sync::atomic::AtomicBool::new(false),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             started_at: std::time::Instant::now(),
+            last_activity: std::sync::Mutex::new(std::time::Instant::now()),
             status: std::sync::Mutex::new(TransferStatus::Pending),
             report: crate::transfer::report::Telemetry::new(
                 crate::transfer::report::Role::Receiver,
@@ -1499,7 +1500,7 @@ mod tests {
         let root = unique_root("sink-durable");
 
         let state = ReceiverState::new(
-            std::sync::Arc::new(TestHost),
+            std::sync::Arc::new(TestHost(root.join("downloads"))),
             std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
             root.clone(),
         );
@@ -1534,7 +1535,7 @@ mod tests {
         );
 
         let restarted = ReceiverState::new(
-            std::sync::Arc::new(TestHost),
+            std::sync::Arc::new(TestHost(root.join("downloads"))),
             std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
             root.clone(),
         );
@@ -1574,7 +1575,7 @@ mod tests {
         let root = unique_root("sink-duplicate");
 
         let state = ReceiverState::new(
-            std::sync::Arc::new(TestHost),
+            std::sync::Arc::new(TestHost(root.join("downloads"))),
             std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
             root.clone(),
         );
@@ -1620,7 +1621,7 @@ mod tests {
         ));
 
         let state = ReceiverState::new(
-            std::sync::Arc::new(TestHost),
+            std::sync::Arc::new(TestHost(root.join("downloads"))),
             std::sync::Arc::new(vilsend_core::RecordingEventSink::new()),
             root.clone(),
         );

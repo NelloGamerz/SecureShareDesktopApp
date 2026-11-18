@@ -10,6 +10,7 @@ export type TransferStatus =
   | "IN_PROGRESS"
   | "COMPLETED"
   | "FAILED"
+  | "INTERRUPTED"
   | "CANCELLED"
   | "UPLOADING"
   | "DOWNLOADING"
@@ -18,7 +19,7 @@ export type TransferStatus =
   | "WAITING_SENDER"
   | "HANDSHAKING";
 
-export type TransferAction = "ACCEPT" | "REJECT" | "CANCEL";
+export type TransferAction = "ACCEPT" | "REJECT" | "CANCEL" | "RESUME";
 
 export type NetworkType = "LAN" | "REMOTE";
 

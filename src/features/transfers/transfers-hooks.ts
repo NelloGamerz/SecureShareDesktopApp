@@ -21,7 +21,14 @@ import {
   type TransfersPage,
 } from "./transfers-api";
 
-import { pauseTransfer, resumeTransfer, cancelTransfer, TransferEvent, onTransferEvent } from "@/api/tauri";
+import {
+  cancelReceivedTransfer,
+  pauseTransfer,
+  resumeTransfer,
+  cancelTransfer,
+  TransferEvent,
+  onTransferEvent,
+} from "@/api/tauri";
 
 // type TransferProgressPayload = {
 //   transferId: string;
@@ -108,6 +115,22 @@ export function useTransferAction() {
     }) => {
       if (action === "ACCEPT") {
         return acceptTransfer(transferId);
+      }
+
+      if (action === "CANCEL") {
+        // Stop the local half first, then record the cancellation. The upload
+        // manager owns a sender's transfer; the receiver's staged parts are the
+        // fallback. Best-effort either way — the backend call is what both
+        // sides agree on.
+        try {
+          await cancelTransfer(transferId);
+        } catch {
+          try {
+            await cancelReceivedTransfer(transferId);
+          } catch {
+            // Nothing local to stop (e.g. still PENDING).
+          }
+        }
       }
 
       return updateTransferStatus(transferId, action);
@@ -217,6 +240,7 @@ export function useTransferProgressListener() {
       "transfer-progress",
       "transfer-completed",
       "transfer-failed",
+      "transfer-interrupted",
       "transfer-paused",
       "transfer-resumed",
       "transfer-cancelled",

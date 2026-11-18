@@ -6,6 +6,7 @@ use tauri::{AppHandle, Emitter};
 use crate::models::TransferMetadata;
 use crate::transfer::manager::UploadManager;
 use crate::transfer::transport_manifest::{self, TransportManifest};
+use crate::transfer::writer::ReceiverState;
 use vilsend_core::TransportKind;
 use crate::websocket::WebSocketManager;
 use crate::{error::AppError, transfer::manager::TransferEvent};
@@ -15,6 +16,9 @@ pub use crate::websocket::{server_command::TransferRequestPayload, ServerCommand
 pub struct EventDispatcher {
     app_handle: Mutex<Option<AppHandle>>,
     upload_manager: Arc<UploadManager>,
+    /// Set once the local receiver server exists. A backend `CANCEL_TRANSFER`
+    /// can arrive for a transfer this device is receiving, not only sending.
+    receiver: Mutex<Option<ReceiverState>>,
     websocket_manager: Mutex<Option<Arc<WebSocketManager>>>,
 }
 
@@ -26,7 +30,14 @@ impl EventDispatcher {
         Self {
             app_handle: Mutex::new(None),
             upload_manager,
+            receiver: Mutex::new(None),
             websocket_manager: Mutex::new(None),
+        }
+    }
+
+    pub fn attach_receiver(&self, receiver: ReceiverState) {
+        if let Ok(mut state) = self.receiver.lock() {
+            *state = Some(receiver);
         }
     }
 
@@ -149,10 +160,14 @@ impl EventDispatcher {
                 // No manifest, or nothing in it this build can dial: keep the
                 // endpoint exactly as it arrived, which is what the sender did
                 // before manifests existed.
-                let endpoint = selected
+                let direct = selected
                     .as_ref()
-                    .and_then(|choice| choice.direct_endpoint.clone())
-                    .unwrap_or(endpoint);
+                    .and_then(|choice| choice.direct_endpoint.clone());
+
+                // Kept only when a direct path replaced it, so the session can
+                // fall back to the tunnel if the direct path dies mid-transfer.
+                let fallback_endpoint = direct.as_ref().map(|_| endpoint.clone());
+                let endpoint = direct.unwrap_or(endpoint);
 
                 if manifest_present {
                     let kind = selected
@@ -174,6 +189,7 @@ impl EventDispatcher {
                     receiver_public_key,
                     network_type: crate::models::ConnectionType::Lan,
                     endpoint,
+                    fallback_endpoint,
                     auth_token: String::new(),
                     // file_paths,
                     chunk_size,
@@ -193,11 +209,29 @@ impl EventDispatcher {
             }
 
             ServerCommand::CancelTransfer { transfer_id } => {
-                // self.upload_manager.cancel(&transfer_id).await?;
-                self.upload_manager
-                    .cancel(&transfer_id)
-                    .await
-                    .map_err(|e| AppError::internal(format!("cancel transfer failed: {e}")))?;
+                // The backend addresses this to either party. Stop whichever
+                // half this device is running: the sender's upload manager, or
+                // — when that has no such transfer — the receiver's download,
+                // which also removes its staged parts.
+                if let Err(cancel_error) = self.upload_manager.cancel(&transfer_id).await {
+                    let receiver = self
+                        .receiver
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .ok_or_else(|| {
+                            AppError::internal(format!(
+                                "cancel transfer failed: {cancel_error}"
+                            ))
+                        })?;
+
+                    receiver
+                        .cancel_download(&transfer_id, "cancelled by the backend")
+                        .await
+                        .map_err(|error| {
+                            AppError::internal(format!("cancel transfer failed: {error}"))
+                        })?;
+                }
             }
 
             ServerCommand::TransferRequest { payload } => {
@@ -252,6 +286,19 @@ impl EventDispatcher {
         .await
     }
 
+    pub async fn notify_transfer_interrupted(
+        &self,
+        transfer_id: &str,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        self.send_ws_message(serde_json::json!({
+            "type": "TRANSFER_INTERRUPTED",
+            "transferId": transfer_id,
+            "reason": reason
+        }))
+        .await
+    }
+
     pub async fn listen_transfer_events(
         self: Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<TransferEvent>,
@@ -267,6 +314,15 @@ impl EventDispatcher {
                 TransferEvent::Failed(id, reason) => {
                     if let Err(e) = self.notify_transfer_failed(&id, &reason).await {
                         tracing::error!("failed sending transfer failed websocket event: {}", e);
+                    }
+                }
+
+                TransferEvent::Interrupted(id, reason) => {
+                    if let Err(e) = self.notify_transfer_interrupted(&id, &reason).await {
+                        tracing::error!(
+                            "failed sending transfer interrupted websocket event: {}",
+                            e
+                        );
                     }
                 }
             }
