@@ -315,7 +315,9 @@ impl WebSocketManager {
                             tokio::select! {
 
                                                                                         Some(message) = rx.recv() => {
-                                                                                            println!("SENDING MESSAGE: {:?}", message);
+                                                                                            if !crate::websocket::is_heartbeat(&message) {
+                                                                                                println!("SENDING MESSAGE: {:?}", message);
+                                                                                            }
 
                                                                                             if let Err(err) = write.send(message).await {
                                                                                                 println!("SEND ERROR: {:?}", err);

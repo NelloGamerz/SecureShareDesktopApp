@@ -338,6 +338,18 @@ fn plan_path(state_dir: &Path, transfer_id: &str) -> io::Result<PathBuf> {
     Ok(state_path(state_dir, transfer_id)?.with_extension("plan"))
 }
 
+/// Where a transfer's sent-chunk journal lives.
+///
+/// Append-only, one line per acknowledged chunk. The state file is rewritten
+/// whole at each checkpoint, so between two checkpoints a crash loses up to
+/// that interval's chunks; the journal records each one as it lands, so a
+/// restore knows exactly how far the previous run got. Not `json` for the same
+/// reason as the plan file: [`TransferStore::load_all`] reads `*.json` as a
+/// record.
+fn sent_path(state_dir: &Path, transfer_id: &str) -> io::Result<PathBuf> {
+    Ok(state_path(state_dir, transfer_id)?.with_extension("sent"))
+}
+
 /// The sender's persisted transfers: clear records on disk, secrets in a
 /// [`SecretStore`].
 pub struct TransferStore {
@@ -459,6 +471,80 @@ impl TransferStore {
         Some(plan.expected)
     }
 
+    /// Record one acknowledged chunk in the transfer's sent journal.
+    ///
+    /// Appended as a single line so a crash can at worst leave a partial last
+    /// line, which [`Self::load_sent`] skips — that chunk is offered again.
+    pub async fn append_sent(
+        &self,
+        transfer_id: &str,
+        chunk: &PersistedChunk,
+    ) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        fs::create_dir_all(&self.state_dir).await?;
+
+        let mut line = serde_json::to_vec(chunk).map_err(io::Error::other)?;
+        line.push(b'\n');
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(sent_path(&self.state_dir, transfer_id)?)
+            .await?;
+
+        file.write_all(&line).await?;
+        file.flush().await
+    }
+
+    /// The chunks the sent journal records.
+    ///
+    /// A line that does not parse — a crash mid-append — is skipped rather than
+    /// failing the restore; that chunk is simply sent again.
+    pub async fn load_sent(&self, transfer_id: &str) -> Vec<PersistedChunk> {
+        let path = match sent_path(&self.state_dir, transfer_id) {
+            Ok(path) => path,
+
+            Err(error) => {
+                tracing::warn!(%error, "refusing to read a sent journal");
+                return Vec::new();
+            }
+        };
+
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+
+            Err(error) => {
+                tracing::warn!(transfer_id, %error, "could not read a sent journal");
+                return Vec::new();
+            }
+        };
+
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| match serde_json::from_slice::<PersistedChunk>(line) {
+                Ok(chunk) => Some(chunk),
+
+                Err(error) => {
+                    tracing::warn!(transfer_id, %error, "skipping an unreadable sent journal line");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Remove a transfer's sent journal. Absent is not an error.
+    pub async fn remove_sent(&self, transfer_id: &str) -> io::Result<()> {
+        match fs::remove_file(sent_path(&self.state_dir, transfer_id)?).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Remove a transfer's digest plan. Absent is not an error.
     pub async fn remove_plan(&self, transfer_id: &str) -> io::Result<()> {
         match fs::remove_file(plan_path(&self.state_dir, transfer_id)?).await {
@@ -572,15 +658,19 @@ impl TransferStore {
         records
     }
 
-    /// Forget a transfer: its record, its plan and its secrets.
+    /// Forget a transfer: its record, its plan, its sent journal and its secrets.
     ///
-    /// All three are removed even if one of them fails, so that a failure to
-    /// clear one part cannot leave the others behind forever.
+    /// All of them are removed even if one fails, so that a failure to clear one
+    /// part cannot leave the others behind forever.
     pub async fn remove(&self, transfer_id: &str) -> io::Result<()> {
         let secrets = self.secrets.delete(transfer_id);
 
         if let Err(error) = self.remove_plan(transfer_id).await {
             tracing::warn!(transfer_id, %error, "could not remove a transfer's plan file");
+        }
+
+        if let Err(error) = self.remove_sent(transfer_id).await {
+            tracing::warn!(transfer_id, %error, "could not remove a transfer's sent journal");
         }
 
         let path = state_path(&self.state_dir, transfer_id)?;

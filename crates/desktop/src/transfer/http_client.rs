@@ -84,6 +84,24 @@ pub struct ChunkResumeState {
     pub chunk_hash: String,
 }
 
+/// What the sender believes it has sent, posted for the receiver to check.
+///
+/// The receiver does not trust this list — it answers with what it can verify
+/// on disk — but comparing the two tells both sides when bytes the sender
+/// counted are not actually held.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeManifestRequest {
+    pub transfer_id: String,
+    pub sent: Vec<SentChunk>,
+}
+
+/// One chunk the sender recorded as acknowledged.
+#[derive(Debug, Clone, Serialize)]
+pub struct SentChunk {
+    pub file_id: String,
+    pub chunk_index: u64,
+}
+
 /// What happened when the sender asked the receiver to open a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStart {
@@ -362,6 +380,81 @@ impl HttpClient {
             "Handshake failed: HTTP {} - {}",
             status, body
         )))
+    }
+
+    /// Post the sender's sent-chunk manifest and get the verified report back.
+    ///
+    /// `Ok(None)` means the receiver has no `/transfer/resume` route — an
+    /// installed build — and the caller should fall back to
+    /// [`Self::transfer_status`]. Any other failure is an error, including a
+    /// `404` for the transfer itself: the route was found, so the transfer is
+    /// simply unknown and the answer is "send everything". That case is
+    /// resolved by the fallback GET, which maps it to `None`.
+    pub async fn resume_with_manifest(
+        &self,
+        endpoint: &str,
+        token: &str,
+        transfer_id: &str,
+        sent: &[(String, u64)],
+    ) -> Result<Option<TransferResumeResponse>> {
+        let base = Self::normalize_endpoint(endpoint);
+        let url = format!("{base}/transfer/resume");
+
+        let request = ResumeManifestRequest {
+            transfer_id: transfer_id.to_string(),
+            sent: sent
+                .iter()
+                .map(|(file_id, chunk_index)| SentChunk {
+                    file_id: file_id.clone(),
+                    chunk_index: *chunk_index,
+                })
+                .collect(),
+        };
+
+        tracing::debug!(
+            transfer_id,
+            sent_chunks = request.sent.len(),
+            "posting the sender resume manifest"
+        );
+
+        let response = self
+            .0
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Transfer-Id", transfer_id)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            tracing::info!(
+                transfer_id,
+                %status,
+                "receiver has no resume-manifest endpoint; falling back to the status query"
+            );
+
+            return Ok(None);
+        }
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+
+            tracing::error!(transfer_id, %status, error = %body, "receiver refused a resume manifest");
+
+            return Err(TransferError::Receiver(format!(
+                "resume manifest failed: HTTP {status} - {body}"
+            )));
+        }
+
+        response
+            .json::<TransferResumeResponse>()
+            .await
+            .map(Some)
+            .map_err(|error| TransferError::Receiver(format!("invalid resume response: {error}")))
     }
 
     /// Ask the receiver which chunks of a transfer it already holds.

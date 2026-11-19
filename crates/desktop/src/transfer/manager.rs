@@ -2,7 +2,7 @@ use crate::models::chunk::ChunkJob;
 use crate::services::local_transfer_file_service::LocalTransferFileService;
 use crate::transfer::http_client::SessionStart;
 use crate::transfer::integrity::{self, ExpectedTransfer};
-use crate::transfer::persist::{PersistedTransfer, TransferSecrets, TransferStore};
+use crate::transfer::persist::{PersistedChunk, PersistedTransfer, TransferSecrets, TransferStore};
 use crate::transfer::network_report;
 use crate::transfer::report;
 use crate::transfer::resume;
@@ -21,7 +21,7 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::atomic::Ordering,
     sync::{Arc, Mutex, MutexGuard},
@@ -84,6 +84,16 @@ pub struct UploadManager {
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// When the last checkpoint was taken, for [`CHECKPOINT_INTERVAL`].
     last_checkpoint: Arc<Mutex<Instant>>,
+    /// Transfers whose on-disk state was removed because they finished.
+    ///
+    /// A checkpoint spawned by the last chunk can still be waiting for
+    /// [`Self::persist_lock`] when the transfer ends. Without this, it writes
+    /// the record back after [`Self::forget_state`] removed it — a restored
+    /// transfer whose keychain secret is gone, which no resume can use. A
+    /// reused transfer id is cleared when it next starts.
+    finished: Arc<Mutex<HashSet<String>>>,
+    /// Serialises appends to the sent-chunk journal, one writer per line.
+    sent_lock: Arc<tokio::sync::Mutex<()>>,
 }
 impl UploadManager {
     pub fn new(
@@ -107,7 +117,38 @@ impl UploadManager {
                     .checked_sub(CHECKPOINT_INTERVAL)
                     .unwrap_or_else(Instant::now),
             )),
+            finished: Arc::new(Mutex::new(HashSet::new())),
+            sent_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Record an acknowledged chunk in the transfer's sent journal.
+    ///
+    /// Called from the scheduler's success callback, which is synchronous, so
+    /// the append is spawned. It is one line per chunk and serialised, which is
+    /// what lets a restore know the exact progress even when the last checkpoint
+    /// predates the crash.
+    fn journal(&self, transfer_id: &str, file_id: &str, chunk_index: u64) {
+        let manager = self.clone();
+        let transfer_id = transfer_id.to_string();
+
+        let chunk = PersistedChunk {
+            file_id: file_id.to_string(),
+            chunk_index,
+        };
+
+        tokio::spawn(async move {
+            let _guard = manager.sent_lock.lock().await;
+
+            if let Err(error) = manager.store.append_sent(&transfer_id, &chunk).await {
+                tracing::warn!(transfer_id = %transfer_id, %error, "could not record a sent chunk");
+            }
+        });
+    }
+
+    /// Whether a transfer has finished and had its state removed.
+    fn is_finished(&self, transfer_id: &str) -> bool {
+        lock_or_recover(&self.finished, "finished").contains(transfer_id)
     }
 
     /// Rebuild the transfers a previous run left behind.
@@ -138,7 +179,31 @@ impl UploadManager {
 
             let status = record.resumable_status();
 
+            /*
+             * The journal is newer than the checkpoint: a crash between two
+             * whole-file checkpoints leaves the acknowledged chunks the journal
+             * recorded still counted, so a restored transfer reports — and
+             * resumes from — the progress the previous run actually made.
+             */
+            let journaled = self.store.load_sent(&record.transfer_id).await;
+
             let state = Arc::new(restored_state(&record, expected));
+
+            if !journaled.is_empty() {
+                let mut chunks: HashSet<(String, u64)> = state
+                    .completed_chunks()
+                    .into_iter()
+                    .map(|chunk| (chunk.file_id, chunk.chunk_index))
+                    .collect();
+
+                chunks.extend(
+                    journaled
+                        .into_iter()
+                        .map(|chunk| (chunk.file_id, chunk.chunk_index)),
+                );
+
+                state.set_completed(chunks);
+            }
 
             {
                 let mut transfers = lock_or_recover(&self.transfers, "transfers");
@@ -232,6 +297,20 @@ impl UploadManager {
             .contains_key(&metadata.transfer_id)
         {
             return Err(TransferError::Invalid("transfer already active".into()));
+        }
+
+        // A reused id may name a transfer that recently finished; its tombstone
+        // must not stop this run's checkpoints.
+        lock_or_recover(&self.finished, "finished").remove(&metadata.transfer_id);
+
+        // A new attempt starts with an empty sent journal, whatever a previous
+        // attempt under the same id left behind.
+        if let Err(error) = self.store.remove_sent(&metadata.transfer_id).await {
+            tracing::warn!(
+                transfer_id = %metadata.transfer_id,
+                %error,
+                "could not clear a leftover sent journal"
+            );
         }
         /*
          * The phases below are timed individually. Starting a transfer of any
@@ -682,6 +761,9 @@ impl UploadManager {
                 // the set actually holds, and a chunk that arrives twice moves
                 // nothing the second time.
                 s.mark_completed(&job.file_id, job.index);
+                // The journal records the exact progress; the checkpoint is the
+                // cheaper whole-file snapshot taken on an interval.
+                checkpointing.journal(&s.transfer_id, &job.file_id, job.index);
                 events.emit(DomainEvent::TransferProgress {
                     progress: progress::make(&s),
                 });
@@ -715,8 +797,6 @@ impl UploadManager {
                         .finalize_report(&state, TransferStatus::Completed, None, None, None, false)
                         .await;
 
-                    manager.forget_plan(&state.transfer_id).await;
-
                     TransferEvent::Completed(state.transfer_id.clone())
                 }
                 Ok(()) => {
@@ -749,6 +829,19 @@ impl UploadManager {
             state.set_running(false);
 
             manager.persist(&state).await;
+
+            /*
+             * A completed or failed transfer has no resume left to serve, so
+             * its checkpoint — the record of which chunks went — its plan and
+             * its secrets are removed together. An interrupted one keeps them:
+             * that is exactly the record a resume reads.
+             */
+            if matches!(
+                outcome,
+                TransferEvent::Completed(_) | TransferEvent::Failed(..)
+            ) {
+                manager.forget_state(&state.transfer_id).await;
+            }
 
             let _ = manager.transfer_events.send(outcome);
         });
@@ -960,11 +1053,13 @@ impl UploadManager {
             )));
         }
 
-        if token.is_empty() {
-            return Err(TransferError::Invalid(format!(
-                "transfer {transfer_id} cannot be resumed: its credentials are no longer stored"
-            )));
-        }
+        /*
+         * An empty token is not a lost credential. The control plane does not
+         * put one on `START_TRANSFER`, so every transfer this app starts has an
+         * empty token from the beginning; the receiver requires the
+         * `Authorization` header to be present, not to carry a value. The key
+         * is the only part a resume cannot do without.
+         */
 
         // Adopt them, so everything downstream — the handshake, the workers —
         // sees the credentials this transfer will actually use.
@@ -1000,7 +1095,12 @@ impl UploadManager {
          * resend rather than a skip.
          */
         let status_started = Instant::now();
-        let report = session.resume_state(&transfer_id).await?;
+
+        // Tell the receiver what this sender recorded in its sent journal; it
+        // answers with what it can verify, which is the authority either way.
+        let report = session
+            .resume_state_with(&transfer_id, &state.completed_chunks())
+            .await?;
 
         tracing::info!(
             transfer_id = %transfer_id,
@@ -1213,7 +1313,7 @@ impl UploadManager {
             });
 
             self.persist(state).await;
-            self.forget_plan(&transfer_id).await;
+            self.forget_state(&transfer_id).await;
 
             tracing::info!(
                 transfer_id = %transfer_id,
@@ -1288,6 +1388,12 @@ impl UploadManager {
     async fn persist(&self, state: &Arc<UploadState>) {
         let _guard = self.persist_lock.lock().await;
 
+        // A checkpoint that lost the race with the transfer's end must not
+        // recreate the record the cleanup just removed.
+        if self.is_finished(&state.transfer_id) {
+            return;
+        }
+
         let record = state.to_persisted();
 
         let started = Instant::now();
@@ -1311,6 +1417,11 @@ impl UploadManager {
     /// written costs a resume the work of hashing the files again, and nothing
     /// else.
     async fn persist_plan(&self, transfer_id: &str, expected: &ExpectedTransfer) {
+        // The background digest pass can outlive the transfer; see `persist`.
+        if self.is_finished(transfer_id) {
+            return;
+        }
+
         if let Err(error) = self.store.save_plan(transfer_id, expected).await {
             tracing::warn!(
                 transfer_id,
@@ -1322,12 +1433,22 @@ impl UploadManager {
 
     /// Remove the digest plan of a transfer that no longer needs one.
     ///
-    /// A delivered transfer will never be resumed, and the plan is one digest
-    /// per chunk. Best-effort: a leftover plan costs disk, not correctness, and
-    /// a reused transfer id is given a fresh one before it is resumed.
-    async fn forget_plan(&self, transfer_id: &str) {
-        if let Err(error) = self.store.remove_plan(transfer_id).await {
-            tracing::warn!(transfer_id, %error, "could not remove a completed transfer's plan");
+    /// Forget everything a finished transfer left on disk.
+    ///
+    /// The record of acknowledged chunks, the digest plan and the keychain
+    /// secrets go together — a completed or failed transfer will never be
+    /// resumed. Best-effort: a leftover file costs disk, not correctness.
+    ///
+    /// The transfer is tombstoned before the removal and the persist lock is
+    /// taken first, so a checkpoint already spawned by the last chunk either
+    /// lands before the removal or skips itself after it.
+    async fn forget_state(&self, transfer_id: &str) {
+        lock_or_recover(&self.finished, "finished").insert(transfer_id.to_string());
+
+        let _guard = self.persist_lock.lock().await;
+
+        if let Err(error) = self.store.remove(transfer_id).await {
+            tracing::warn!(transfer_id, %error, "could not remove a finished transfer's state");
         }
     }
 
@@ -1362,6 +1483,43 @@ impl UploadManager {
         self.write_network_report(&s).await;
 
         Ok(s.snapshot())
+    }
+
+    /// Start a transfer, or continue one this device already owns.
+    ///
+    /// A receiver's Resume reaches the sender through the control plane as
+    /// another `START_TRANSFER`. For a transfer already tracked here that means
+    /// "continue": resuming asks the receiver what it holds and sends only the
+    /// rest. Anything else is a fresh start.
+    pub async fn start_or_resume(
+        &self,
+        metadata: TransferMetadata,
+    ) -> Result<TransferStatusResponse> {
+        let Ok(state) = self.get(&metadata.transfer_id) else {
+            return self.start(metadata).await;
+        };
+
+        /*
+         * A record restored without its keychain secret cannot decrypt a
+         * single chunk, so resuming it can only fail — and would leave the
+         * transfer permanently stuck. Drop the stale state and start over.
+         */
+        if state.transfer_key() == [0u8; 32]
+            && matches!(self.store.load_secrets(&metadata.transfer_id), Ok(None))
+        {
+            tracing::warn!(
+                transfer_id = %metadata.transfer_id,
+                "no key is stored for an existing transfer; starting it over"
+            );
+
+            state.cancelled.store(true, Ordering::Relaxed);
+            lock_or_recover(&self.transfers, "transfers").remove(&metadata.transfer_id);
+            self.forget_state(&metadata.transfer_id).await;
+
+            return self.start(metadata).await;
+        }
+
+        self.resume(&metadata.transfer_id).await
     }
 
     /// Continue a transfer.
@@ -1444,13 +1602,10 @@ impl UploadManager {
 
         /*
          * A cancelled transfer is not a transfer anybody wants continued, so
-         * its record and its secrets go with it. This is the only path that
-         * deletes them: completed and failed transfers keep theirs, so that a
-         * restart can still report what happened to them.
+         * its record and its secrets go with it. A checkpoint already in flight
+         * is tombstoned too, so it cannot put the record back.
          */
-        if let Err(error) = self.store.remove(id).await {
-            tracing::warn!(transfer_id = %id, %error, "could not remove persisted transfer state");
-        }
+        self.forget_state(id).await;
 
         /*
          * Tell the receiver, if it can be told.
@@ -1809,6 +1964,41 @@ mod tests {
             "the acknowledged chunks must come back"
         );
         assert_eq!(status.total_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn a_restart_reads_chunks_the_sent_journal_recorded_after_the_checkpoint() {
+        let scratch = TempDir::new();
+        let store = Arc::new(TransferStore::in_memory(scratch.path().join("state")));
+
+        // The checkpoint predates the last two acknowledgements.
+        store
+            .save(&record("t-1", TransferStatus::Uploading, 1))
+            .await
+            .expect("saving");
+
+        for chunk_index in [1, 2] {
+            store
+                .append_sent(
+                    "t-1",
+                    &PersistedChunk {
+                        file_id: "f-1".into(),
+                        chunk_index,
+                    },
+                )
+                .await
+                .expect("appending to the sent journal");
+        }
+
+        let manager = build_manager(Arc::clone(&store)).await;
+        assert_eq!(manager.restore_persisted().await, 1);
+
+        let status = manager.status("t-1").expect("the transfer is back");
+
+        assert_eq!(
+            status.uploaded_chunks, 3,
+            "the checkpoint and the sent journal together are the progress"
+        );
     }
 
     /// A structurally valid plan for the 4096-byte file in `record`, split into
@@ -2609,6 +2799,137 @@ mod resume_tests {
     }
 
     #[tokio::test]
+    async fn a_start_command_for_a_known_transfer_continues_it_instead_of_resending() {
+        let scratch = TempDir::new();
+        let (receiver, endpoint) = serve_stub().await;
+
+        let (manager, _store, path) = restored(&scratch, SIZE, CHUNK, &[], &endpoint).await;
+        let jobs = plan(&path, SIZE, CHUNK);
+
+        /*
+         * The receiver's user clicked Resume: the control plane forwards that as
+         * another `START_TRANSFER`. The receiver still holds chunks 0 and 2, so
+         * only chunk 1 may cross the wire.
+         */
+        *receiver.report.lock().expect("report lock") = Some(report_for(&jobs, &[0, 2]).await);
+
+        manager
+            .start_or_resume(metadata(&endpoint))
+            .await
+            .expect("continuing");
+
+        let status = settle(&manager).await;
+
+        assert_eq!(status.status, TransferStatus::Completed);
+        assert_eq!(receiver.received_indices(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_auth_token_does_not_block_a_resume() {
+        let scratch = TempDir::new();
+        let (receiver, endpoint) = serve_stub().await;
+
+        let (manager, store, path) = restored(&scratch, SIZE, CHUNK, &[], &endpoint).await;
+
+        // The control plane never puts a token on START_TRANSFER, so this is
+        // what a transfer started from it stores.
+        store
+            .save_secrets(
+                "t-1",
+                &TransferSecrets {
+                    transfer_key: [0x7F; 32],
+                    auth_token: String::new(),
+                },
+            )
+            .expect("saving a tokenless secret");
+
+        let jobs = plan(&path, SIZE, CHUNK);
+        *receiver.report.lock().expect("report lock") = Some(report_for(&jobs, &[0]).await);
+
+        manager
+            .resume("t-1")
+            .await
+            .expect("an empty token is not a missing credential");
+
+        let status = settle(&manager).await;
+
+        assert_eq!(status.status, TransferStatus::Completed);
+        assert_eq!(receiver.received_indices(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_after_a_finished_transfer_cannot_recreate_its_record() {
+        let scratch = TempDir::new();
+        let (_receiver, endpoint) = serve_stub().await;
+
+        let (manager, store, _path) = restored(&scratch, SIZE, CHUNK, &[], &endpoint).await;
+        let state = manager.get("t-1").expect("tracked");
+
+        store
+            .append_sent(
+                "t-1",
+                &PersistedChunk {
+                    file_id: "f-1".into(),
+                    chunk_index: 0,
+                },
+            )
+            .await
+            .expect("appending");
+
+        manager.forget_state("t-1").await;
+
+        // A checkpoint spawned by the last chunk, landing after the cleanup.
+        manager.persist(&state).await;
+
+        assert!(
+            store.load("t-1").await.is_none(),
+            "a late checkpoint must not resurrect a finished transfer's record"
+        );
+        assert!(
+            store.load_secrets("t-1").expect("secrets").is_none(),
+            "and the secrets stay gone"
+        );
+        assert!(
+            store.load_sent("t-1").await.is_empty(),
+            "and so does the sent journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_for_a_transfer_whose_key_is_gone_starts_it_over() {
+        let scratch = TempDir::new();
+        let (_receiver, endpoint) = serve_stub().await;
+
+        let (manager, store, _path) = restored(&scratch, SIZE, CHUNK, &[], &endpoint).await;
+
+        /*
+         * The shape the checkpoint race used to leave behind: the record
+         * survives, its keychain secret does not.
+         */
+        let record = store.load("t-1").await.expect("the record");
+        store.remove("t-1").await.expect("removing");
+        store.save(&record).await.expect("re-saving the record alone");
+
+        /*
+         * `start` is the path that runs. It fails here only because this
+         * harness registered no local file rows — not with a resume failure.
+         */
+        let error = manager
+            .start_or_resume(metadata(&endpoint))
+            .await
+            .expect_err("start cannot proceed without the file rows");
+
+        assert!(
+            error.to_string().contains("no local files"),
+            "a credential-less transfer is started over, not resumed: {error}"
+        );
+        assert!(
+            store.load("t-1").await.is_none(),
+            "and its stale record is removed"
+        );
+    }
+
+    #[tokio::test]
     async fn a_transfer_with_every_chunk_complete_sends_nothing() {
         let scratch = TempDir::new();
         let (receiver, endpoint) = serve_stub().await;
@@ -2688,7 +3009,7 @@ mod resume_tests {
 
         *receiver.session_already_active.lock().expect("active lock") = true;
 
-        let (manager, store, path) = restored(&scratch, SIZE, CHUNK, &[], &endpoint).await;
+        let (manager, _store, path) = restored(&scratch, SIZE, CHUNK, &[], &endpoint).await;
         let jobs = plan(&path, SIZE, CHUNK);
 
         *receiver.report.lock().expect("report lock") = Some(report_for(&jobs, &[0]).await);
@@ -2698,10 +3019,13 @@ mod resume_tests {
 
         assert_eq!(receiver.received_indices(), vec![1, 2]);
 
-        let secrets = store.load_secrets("t-1").expect("load").expect("present");
+        // The store's copy is removed when the transfer completes; the key in
+        // use is the in-memory one, which is what the sender sent with.
+        let state = manager.get("t-1").expect("tracked");
 
         assert_eq!(
-            secrets.transfer_key, [0x7F; 32],
+            state.transfer_key(),
+            [0x7F; 32],
             "a receiver that refused the handshake kept its key, so the sender must keep it too"
         );
     }
@@ -3260,37 +3584,33 @@ mod resume_tests {
         *receiver.report.lock().expect("report lock") = Some(report_for(&jobs, &[0]).await);
 
         manager.resume("t-1").await.expect("resuming");
-        settle(&manager).await;
+        let status = settle(&manager).await;
+
+        assert_eq!(status.status, TransferStatus::Completed);
+        assert_eq!(
+            status.uploaded_chunks, 3,
+            "every chunk the receiver confirmed counts as done, whether it was sent or skipped"
+        );
 
         /*
-         * The transfer reports itself completed just before the final write
-         * lands, so wait for the record rather than the status: what is being
-         * asserted is what a restart would read, and that is the file.
+         * The status flips before the final write and its cleanup land, so wait
+         * for the record: a finished transfer must leave nothing to resume from.
          */
-        let mut indices = Vec::new();
-
         for _ in 0..250 {
-            let persisted = store.load("t-1").await.expect("the record is there");
-
-            indices = persisted
-                .completed_chunks
-                .iter()
-                .map(|chunk| chunk.chunk_index)
-                .collect();
-
-            indices.sort_unstable();
-
-            if indices.len() == 3 {
+            if store.load("t-1").await.is_none() {
                 break;
             }
 
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        assert_eq!(
-            indices,
-            vec![0, 1, 2],
-            "every chunk ends up recorded, whether it was sent or skipped"
+        assert!(
+            store.load("t-1").await.is_none(),
+            "a completed transfer's checkpoint is removed"
+        );
+        assert!(
+            store.load_secrets("t-1").expect("secrets").is_none(),
+            "and so are its secrets"
         );
     }
 

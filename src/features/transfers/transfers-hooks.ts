@@ -24,6 +24,7 @@ import {
 import {
   cancelReceivedTransfer,
   pauseTransfer,
+  receivedChunkCount,
   resumeTransfer,
   cancelTransfer,
   TransferEvent,
@@ -133,7 +134,19 @@ export function useTransferAction() {
         }
       }
 
-      return updateTransferStatus(transferId, action);
+      // A receiver's resume tells the control plane how much it already holds,
+      // so the sender can continue from that chunk instead of the start.
+      let receivedChunks: number | undefined;
+
+      if (action === "RESUME") {
+        try {
+          receivedChunks = await receivedChunkCount(transferId);
+        } catch {
+          // The backend action is still worth sending without it.
+        }
+      }
+
+      return updateTransferStatus(transferId, action, undefined, receivedChunks);
     },
 
     onSuccess: async () => {

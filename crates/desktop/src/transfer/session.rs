@@ -59,6 +59,7 @@ use crate::transfer::{
         HttpClient, ReceiverKey, ReceiverTimings, SessionStart, TransferResumeResponse,
     },
     integrity::ExpectedTransfer,
+    persist::PersistedChunk,
 };
 
 /// Whether chunks are compressed before they are sealed.
@@ -180,6 +181,23 @@ pub trait ProtocolSession: Send + Sync {
     /// after the handshake returns `None` here and supplies it through
     /// [`OpenedSession::resume`].
     async fn resume_state(&self, transfer_id: &str) -> Result<Option<TransferResumeResponse>>;
+
+    /// Ask what the receiver holds, telling it what this sender recorded.
+    ///
+    /// The list is advisory: the receiver answers with what it can verify on
+    /// disk, and the sender still checks every returned chunk against its own
+    /// bytes before skipping it. The default drops the list and asks the plain
+    /// question, which is what a protocol with no such endpoint (or a test
+    /// double) does.
+    async fn resume_state_with(
+        &self,
+        transfer_id: &str,
+        sent: &[PersistedChunk],
+    ) -> Result<Option<TransferResumeResponse>> {
+        let _ = sent;
+
+        self.resume_state(transfer_id).await
+    }
 
     /// Open a session for a transfer, or re-open one the receiver still has.
     ///
@@ -338,6 +356,30 @@ impl ProtocolSession for LegacyV1Session {
         self.client
             .transfer_status(&self.endpoint, &self.token, transfer_id)
             .await
+    }
+
+    async fn resume_state_with(
+        &self,
+        transfer_id: &str,
+        sent: &[PersistedChunk],
+    ) -> Result<Option<TransferResumeResponse>> {
+        let claimed: Vec<(String, u64)> = sent
+            .iter()
+            .map(|chunk| (chunk.file_id.clone(), chunk.chunk_index))
+            .collect();
+
+        let report = self
+            .client
+            .resume_with_manifest(&self.endpoint, &self.token, transfer_id, &claimed)
+            .await?;
+
+        match report {
+            Some(report) => Ok(Some(report)),
+
+            // No such route on the receiver: the status query asks the same
+            // question and is what every installed build answers.
+            None => self.resume_state(transfer_id).await,
+        }
     }
 
     async fn open(&self, request: OpenRequest<'_>) -> Result<OpenedSession> {
@@ -713,6 +755,26 @@ impl ProtocolSession for FailoverV1Session {
         match session.resume_state(transfer_id).await {
             Err(error) if is_transport(&error) && self.advance_from(index).await => {
                 self.current().await.1.resume_state(transfer_id).await
+            }
+
+            other => other,
+        }
+    }
+
+    async fn resume_state_with(
+        &self,
+        transfer_id: &str,
+        sent: &[PersistedChunk],
+    ) -> Result<Option<TransferResumeResponse>> {
+        let (index, session) = self.current().await;
+
+        match session.resume_state_with(transfer_id, sent).await {
+            Err(error) if is_transport(&error) && self.advance_from(index).await => {
+                self.current()
+                    .await
+                    .1
+                    .resume_state_with(transfer_id, sent)
+                    .await
             }
 
             other => other,

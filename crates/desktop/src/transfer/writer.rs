@@ -538,6 +538,19 @@ impl ReceiverState {
         self.staging_root.join("incoming").join(transfer_id)
     }
 
+    /// How many chunks of a transfer this device already holds.
+    ///
+    /// Derived from the persisted manifest, checked against the parts on disk,
+    /// so it is the same number the sender's resume asks for — an interrupted
+    /// transfer keeps its manifest after the watchdog drops its live state.
+    /// Zero when the transfer is unknown or nothing survived.
+    pub async fn received_chunk_count(&self, transfer_id: &str) -> u64 {
+        let transfer_dir = self.transfer_dir(transfer_id);
+        let record = manifest::load_or_default(&transfer_dir, transfer_id).await;
+
+        recovered_progress(&record, &transfer_dir).await.1
+    }
+
     /// Stop receiving a transfer and remove everything held for it.
     ///
     /// Shared by the sender's cancellation notice over the wire and the
@@ -702,6 +715,10 @@ pub fn router(state: ReceiverState) -> axum::Router {
         .route("/transfer/start", axum::routing::post(start_transfer))
         .route("/transfer/chunk", axum::routing::post(receive))
         .route("/transfer/status", axum::routing::get(transfer_status))
+        .route(
+            "/transfer/resume",
+            axum::routing::post(resume_with_manifest),
+        )
         .route("/transfer/cancel", axum::routing::post(cancel_transfer))
         /*
          * A chunk body is at most `MAX_CHUNK_SIZE`, plus the AEAD tag and the
@@ -2100,6 +2117,85 @@ async fn resume_state(
         transfer_id: transfer_id.to_string(),
         files,
     })
+}
+
+/// The sender's sent-chunk manifest, posted for the receiver to check.
+///
+/// Advisory only: the receiver never skips or trusts anything because of it. It
+/// compares the list with what its own manifest verifies on disk and logs the
+/// difference, which is how a lost or unacknowledged chunk becomes visible.
+#[derive(Debug, Deserialize)]
+pub struct ResumeManifestRequest {
+    pub transfer_id: String,
+    #[serde(default)]
+    pub sent: Vec<SentChunk>,
+}
+
+/// One chunk the sender recorded as acknowledged.
+#[derive(Debug, Deserialize)]
+pub struct SentChunk {
+    pub file_id: String,
+    pub chunk_index: u64,
+}
+
+/// `POST /transfer/resume` — the sender says what it sent; the receiver answers
+/// with what it actually holds.
+///
+/// The response is exactly what `GET /transfer/status` returns, so the sender
+/// runs the same hash verification on it. What the manifest adds is a check at
+/// the receiver: chunks the sender counted that this device cannot verify are
+/// reported, because those are the bytes that would otherwise be skipped by a
+/// sender trusting its own record.
+pub async fn resume_with_manifest(
+    State(state): State<ReceiverState>,
+    headers: HeaderMap,
+    Json(request): Json<ResumeManifestRequest>,
+) -> Result<Json<TransferResumeResponse>, (StatusCode, String)> {
+    if headers.get("Authorization").is_none() {
+        tracing::warn!("resume manifest posted without authorization");
+
+        return Err((StatusCode::UNAUTHORIZED, "missing authorization".into()));
+    }
+
+    let transfer = request.transfer_id;
+    let is_live = state.downloads.read().await.contains_key(&transfer);
+
+    let report = resume_state(&transfer, is_live, &state.transfer_dir(&transfer)).await?;
+
+    let held: HashSet<(String, u64)> = report
+        .files
+        .iter()
+        .flat_map(|file| {
+            file.chunks
+                .iter()
+                .map(|chunk| (file.file_id.clone(), chunk.chunk_index))
+        })
+        .collect();
+
+    let not_held = request
+        .sent
+        .iter()
+        .filter(|chunk| !held.contains(&(chunk.file_id.clone(), chunk.chunk_index)))
+        .count();
+
+    if not_held > 0 {
+        tracing::warn!(
+            transfer_id = %transfer,
+            sender_claims = request.sent.len(),
+            verified = held.len(),
+            not_held_by_receiver = not_held,
+            "sender recorded chunks this receiver cannot verify; they will be sent again"
+        );
+    } else {
+        tracing::info!(
+            transfer_id = %transfer,
+            sender_claims = request.sent.len(),
+            verified = held.len(),
+            "sender resume manifest matches what this receiver holds"
+        );
+    }
+
+    Ok(Json(report))
 }
 
 /// Report which chunks of a transfer the receiver already holds.

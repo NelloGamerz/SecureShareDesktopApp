@@ -107,6 +107,7 @@ export async function updateTransferStatus(
   transferId: string,
   action: TransferAction,
   transportManifest?: unknown,
+  receivedChunks?: number,
 ): Promise<void> {
   await api.patch(`/transfers/${transferId}`, {
     action,
@@ -114,6 +115,9 @@ export async function updateTransferStatus(
     // REJECT/CANCEL, which never probe. Never omit it here — an empty-but-valid
     // manifest is what tells the backend the receiver looked.
     transport_manifest: transportManifest,
+    // Set on a receiver's RESUME so the sender can continue from what this
+    // device already holds. Dropped for every other action.
+    received_chunks: receivedChunks,
   });
 }
 

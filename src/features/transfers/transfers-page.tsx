@@ -118,6 +118,7 @@ function formatDuration(seconds: number) {
 }
 
 const preparingStatus: Record<string, string> = {
+  ACCEPTED: "Waiting for transfer to start...",
   CONNECTING: "Connecting...",
   WAITING_SENDER: "Waiting for sender...",
   HANDSHAKING: "Establishing secure connection...",
@@ -374,6 +375,7 @@ export function TransfersPage() {
                       : 0;
 
                   const isPreparing =
+                    t.status === "ACCEPTED" ||
                     t.status === "CONNECTING" ||
                     t.status === "WAITING_SENDER" ||
                     t.status === "HANDSHAKING";
@@ -618,7 +620,9 @@ export function TransfersPage() {
                               </DropdownMenuItem>
                             )}
 
-                            {((t.sentByMe && t.status === "PENDING") ||
+                            {((t.sentByMe &&
+                              (t.status === "PENDING" ||
+                                t.status === "INTERRUPTED")) ||
                               CANCELLABLE_STATUSES.has(t.status)) && (
                               <DropdownMenuItem
                                 className="text-destructive"

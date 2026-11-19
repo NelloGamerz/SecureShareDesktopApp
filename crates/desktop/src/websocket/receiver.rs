@@ -12,10 +12,16 @@ pub async fn receive_loop(
     while let Some(message) = incoming.next().await {
         match message {
             Ok(message) => {
-                println!("RECEIVED FRAME: {:?}", message);
+                let heartbeat = crate::websocket::is_heartbeat(&message);
+
+                if !heartbeat {
+                    println!("RECEIVED FRAME: {:?}", message);
+                }
 
                 if let Message::Text(text) = message {
-                    println!("TEXT: {}", text);
+                    if !heartbeat {
+                        println!("TEXT: {}", text);
+                    }
 
                     match serde_json::from_str::<ServerCommand>(&text) {
                         Ok(command) => {

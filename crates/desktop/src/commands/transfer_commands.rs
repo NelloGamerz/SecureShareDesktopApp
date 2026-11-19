@@ -57,6 +57,18 @@ pub async fn cancel_received_transfer(
 
     Ok(())
 }
+/// How many chunks of a transfer this device already holds.
+///
+/// The webview sends this with a receiver's `RESUME` action so the control
+/// plane can tell the sender where to continue from.
+#[tauri::command]
+pub async fn received_chunk_count(
+    receiver: State<'_, crate::transfer::writer::ReceiverState>,
+    transfer_id: String,
+) -> std::result::Result<u64, String> {
+    Ok(receiver.received_chunk_count(&transfer_id).await)
+}
+
 /// Probes this machine's transports for the accept request.
 ///
 /// Always returns a manifest, even when no transport is available: the backend

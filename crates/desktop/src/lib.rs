@@ -61,7 +61,7 @@ use commands::auth::{
 
 use commands::transfer_commands::{
     build_transport_manifest, cancel_received_transfer, cancel_transfer, get_transfer_status,
-    open_received_file, pause_transfer, resume_transfer, start_transfer,
+    open_received_file, pause_transfer, received_chunk_count, resume_transfer, start_transfer,
 };
 
 #[cfg(feature = "enable-updater")]
@@ -493,6 +493,7 @@ pub fn run() {
             resume_transfer,
             cancel_transfer,
             cancel_received_transfer,
+            received_chunk_count,
             get_transfer_status,
             open_received_file,
             save_tunnel_hostname,

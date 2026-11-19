@@ -39,7 +39,8 @@ export type TransferEvent =
   | "transfer-paused"
   | "transfer-resumed"
   | "transfer-cancelled"
-  | "transfer-request";
+  | "transfer-request"
+  | "transfer-interrupted";
 
 /** Non-sensitive view of the desktop session held by Rust. */
 export interface TauriAuthStatus {
@@ -249,6 +250,11 @@ export async function cancelTransfer(id: string) {
 
 export async function cancelReceivedTransfer(id: string) {
   return invoke("cancel_received_transfer", { transferId: id });
+}
+
+/** How many chunks this device has already received for a transfer. */
+export async function receivedChunkCount(id: string): Promise<number> {
+  return invoke<number>("received_chunk_count", { transferId: id });
 }
 
 export async function detectDeviceType(): Promise<string> {

@@ -203,7 +203,7 @@ impl EventDispatcher {
                 };
 
                 self.upload_manager
-                    .start(metadata)
+                    .start_or_resume(metadata)
                     .await
                     .map_err(|e| AppError::internal(format!("upload start failed: {e}")))?;
             }
