@@ -374,8 +374,10 @@ export function TransfersPage() {
                       ? (t.uploadedBytes / t.totalBytes) * 100
                       : 0;
 
+                  // ACCEPTED is only "in flight" for the newest transfer; older
+                  // rows keep that status as a stale artifact.
                   const isPreparing =
-                    t.status === "ACCEPTED" ||
+                    (t.status === "ACCEPTED" && i === 0) ||
                     t.status === "CONNECTING" ||
                     t.status === "WAITING_SENDER" ||
                     t.status === "HANDSHAKING";
